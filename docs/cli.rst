@@ -165,7 +165,7 @@ The `run` command supports two execution modes:
 
 **Example**:
 ```sh
-pgq run my_module:my_factory --mode drain
+pgq run my_module.my_factory --mode drain
 ```
 
 Use **continuous** for long-running workers and **drain** for batch processing.
