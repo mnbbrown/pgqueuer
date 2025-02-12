@@ -87,8 +87,6 @@ async def runit(
     restart_on_failure: bool,
     shutdown: asyncio.Event,
     mode: types.QueueExecutionMode,
-    max_concurrent_tasks: int | None,
-    shutdown_on_listener_failure: bool,
 ) -> None:
     """
     Supervise and manage the lifecycle of a queue management instance.
@@ -116,14 +114,7 @@ async def runit(
         try:
             async with factories.run_factory(factory()) as manager:
                 setup_shutdown_handlers(manager, shutdown)
-                await run_manager(
-                    manager,
-                    dequeue_timeout,
-                    batch_size,
-                    mode,
-                    max_concurrent_tasks,
-                    shutdown_on_listener_failure,
-                )
+                await run_manager(manager, dequeue_timeout, batch_size, mode)
         except Exception as exc:
             if not restart_on_failure:
                 raise
@@ -141,8 +132,6 @@ async def run_manager(
     dequeue_timeout: timedelta,
     batch_size: int,
     mode: types.QueueExecutionMode,
-    max_concurrent_tasks: int | None,
-    shutdown_on_listener_failure: bool,
 ) -> None:
     """
     Run a queue management instance.
@@ -161,8 +150,6 @@ async def run_manager(
             dequeue_timeout=dequeue_timeout,
             batch_size=batch_size,
             mode=mode,
-            max_concurrent_tasks=max_concurrent_tasks,
-            shutdown_on_listener_failure=shutdown_on_listener_failure,
         )
     elif isinstance(manager, sm.SchedulerManager):
         await manager.run()
@@ -171,8 +158,6 @@ async def run_manager(
             dequeue_timeout=dequeue_timeout,
             batch_size=batch_size,
             mode=mode,
-            max_concurrent_tasks=max_concurrent_tasks,
-            shutdown_on_listener_failure=shutdown_on_listener_failure,
         )
     else:
         raise NotImplementedError(f"Unsupported instance type: {type(manager)}")
