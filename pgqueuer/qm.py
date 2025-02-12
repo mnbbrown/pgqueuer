@@ -563,7 +563,6 @@ class QueueManager:
                 ):
                     self.shutdown.set()
                     await periodic_health_check_task
-
                 event_task = helpers.wait_for_notice_event(
                     notice_event_listener,
                     dequeue_timeout,
