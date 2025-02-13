@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Literal, NewType
 
 
@@ -24,14 +24,14 @@ EVENT_TYPES = Literal[
 
 ###### Jobs ######
 JobId = NewType("JobId", int)
-JOB_STATUS = Literal[
-    "queued",
-    "picked",
-    "successful",
-    "canceled",
-    "deleted",
-    "exception",
-]
+
+class JOB_STATUS(StrEnum):
+    QUEUED = "queued"
+    PICKED = "picked"
+    SUCCESSFUL = "successful"
+    CANCELED = "canceled"
+    DELETED = "deleted"
+    EXCEPTION = "exception"
 
 
 ###### Schedules ######

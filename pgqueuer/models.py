@@ -149,6 +149,7 @@ class Job(BaseModel):
         dict[str, Any] | None,
         BeforeValidator(lambda x: None if x is None else from_json(x)),
     ]
+    attempts: int = 1
 
     def logfire_headers(self) -> dict[str, Any] | None:
         """
@@ -161,6 +162,19 @@ class Job(BaseModel):
         Extracts sentry headers from the job headers if available.
         """
         return None if self.headers is None else self.headers.get("sentry")
+
+
+class UpdateJobStatus(BaseModel):
+    """
+    Represents a request to update the job status.
+    If retryable is set to False the job is considered "terminal"
+    and will not be retried.
+    """
+
+    job_id: JobId
+    status: JOB_STATUS
+    retryable: bool
+    reschedule_for: datetime | None
 
 
 ###### Log ######
