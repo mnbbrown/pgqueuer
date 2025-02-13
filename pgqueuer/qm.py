@@ -23,7 +23,6 @@ from typing import AsyncGenerator, Callable
 import anyio
 
 from pgqueuer.errors import MaxRetriesExceeded, MaxTimeExceeded, RetryableException
-from pgqueuer.types import JOB_STATUS
 
 from . import (
     buffers,
@@ -397,6 +396,10 @@ class QueueManager:
             )
 
     async def handle_job_status(self, events: list[models.UpdateJobStatus]) -> None:
+        logconfig.logger.debug(
+            "Handling %s job updates",
+            len(events)
+        )
         # terminal = delete from jobs table, move to statistics table
         # retryable = set job status in jobs table, optionally reschedule
         terminal, retryable = [], []
@@ -654,6 +657,7 @@ class QueueManager:
                     reschedule_for=e.schedule_for
                 ))
             except (MaxRetriesExceeded, MaxTimeExceeded, Exception):
+                # backwards compatibility
                 logconfig.logger.exception(
                     "Exception while processing entrypoint/job-id: %s/%s",
                     job.entrypoint,
@@ -674,7 +678,7 @@ class QueueManager:
                 canceled = ctx.cancellation.cancel_called
                 await jbuff.add(models.UpdateJobStatus(
                     job_id=job.id,
-                    status=JOB_STATUS.CANCELED if canceled else JOB_STATUS.SUCCESSFUL,
+                    status="canceled" if canceled else "successful",
                     retryable=False,
                     reschedule_for=None
                 ))
