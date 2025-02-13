@@ -649,7 +649,7 @@ class QueueManager:
                 )
                 await jbuff.add(models.UpdateJobStatus(
                     job_id=job.id,
-                    status=JOB_STATUS.EXCEPTION if e.schedule_for is None else JOB_STATUS.QUEUED,
+                    status="exception" if e.schedule_for is None else "queued",
                     retryable=True,
                     reschedule_for=e.schedule_for
                 ))
@@ -661,7 +661,7 @@ class QueueManager:
                 )
                 await jbuff.add(models.UpdateJobStatus(
                     job_id=job.id,
-                    status=JOB_STATUS.EXCEPTION,
+                    status="exception",
                     retryable=False,
                     reschedule_for=None
                 ))
