@@ -239,6 +239,7 @@ class QueryBuilderEnvironment:
         execute_after TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
         status {self.settings.queue_status_type} NOT NULL,
         entrypoint TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
         dedupe_key TEXT,
         payload BYTEA,
         headers JSONB
