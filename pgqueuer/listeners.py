@@ -120,6 +120,10 @@ async def initialize_notice_event_listener(
 
     def _process_payload(payload: str | bytes | bytearray) -> None:
         try:
+            logconfig.logger.debug(
+                "received event with payload: %s",
+                payload,
+            )
             parsed = models.AnyEvent.model_validate_json(payload)
         except Exception as exc:
             logconfig.logger.critical(
