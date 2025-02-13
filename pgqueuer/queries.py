@@ -404,8 +404,7 @@ class Queries:
         ]
 
     async def mark_jobs_as_retryable(
-        self,
-        updates: list[tuple[models.JobId, models.JOB_STATUS, datetime | None]]
+        self, updates: list[tuple[models.JobId, models.JOB_STATUS, datetime | None]]
     ) -> None:
         """
         Reschedule jobs

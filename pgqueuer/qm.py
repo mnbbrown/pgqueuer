@@ -390,10 +390,7 @@ class QueueManager:
             )
 
     async def handle_job_status(self, events: list[models.UpdateJobStatus]) -> None:
-        logconfig.logger.debug(
-            "Handling %s job updates",
-            len(events)
-        )
+        logconfig.logger.debug("Handling %s job updates", len(events))
         # terminal = delete from jobs table, move to statistics table
         # retryable = set job status in jobs table, optionally reschedule
         terminal, retryable = [], []
@@ -404,10 +401,8 @@ class QueueManager:
                 terminal.append((event.job_id, event.status))
 
         await asyncio.gather(
-            self.queries.mark_jobs_as_retryable(retryable),
-            self.queries.log_jobs(terminal)
+            self.queries.mark_jobs_as_retryable(retryable), self.queries.log_jobs(terminal)
         )
-
 
     async def verify_structure(self) -> None:
         """
@@ -643,12 +638,14 @@ class QueueManager:
                     job.entrypoint,
                     job.id,
                 )
-                await jbuff.add(models.UpdateJobStatus(
-                    job_id=job.id,
-                    status="exception" if e.schedule_for is None else "queued",
-                    retryable=True,
-                    reschedule_for=e.schedule_for
-                ))
+                await jbuff.add(
+                    models.UpdateJobStatus(
+                        job_id=job.id,
+                        status="exception" if e.schedule_for is None else "queued",
+                        retryable=True,
+                        reschedule_for=e.schedule_for,
+                    )
+                )
             except (MaxRetriesExceeded, MaxTimeExceeded, Exception):
                 # backwards compatibility
                 logconfig.logger.exception(
@@ -656,12 +653,11 @@ class QueueManager:
                     job.entrypoint,
                     job.id,
                 )
-                await jbuff.add(models.UpdateJobStatus(
-                    job_id=job.id,
-                    status="exception",
-                    retryable=False,
-                    reschedule_for=None
-                ))
+                await jbuff.add(
+                    models.UpdateJobStatus(
+                        job_id=job.id, status="exception", retryable=False, reschedule_for=None
+                    )
+                )
             else:
                 logconfig.logger.debug(
                     "Dispatching entrypoint/id: %s/%s - successful",
@@ -669,11 +665,13 @@ class QueueManager:
                     job.id,
                 )
                 canceled = ctx.cancellation.cancel_called
-                await jbuff.add(models.UpdateJobStatus(
-                    job_id=job.id,
-                    status="canceled" if canceled else "successful",
-                    retryable=False,
-                    reschedule_for=None
-                ))
+                await jbuff.add(
+                    models.UpdateJobStatus(
+                        job_id=job.id,
+                        status="canceled" if canceled else "successful",
+                        retryable=False,
+                        reschedule_for=None,
+                    )
+                )
             finally:
                 self.job_context.pop(job.id, None)
