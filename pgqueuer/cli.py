@@ -470,11 +470,6 @@ def run(
         "--shutdown-on-listener-failure",
         help="Shutdown the manager if the listener fails.",
     ),
-    mode: types.QueueExecutionMode = typer.Option(
-        types.QueueExecutionMode.continuous.name,
-        "--mode",
-        help="Queue execution mode.",
-    ),
 ) -> None:
     """
     Run the job manager, pulling tasks from the queue and handling them with workers.
@@ -490,6 +485,8 @@ def run(
             restart_on_failure=restart_on_failure,
             shutdown=asyncio.Event(),
             mode=mode,
+            max_concurrent_tasks=max_concurrent_tasks,
+            shutdown_on_listener_failure=shutdown_on_listener_failure,
         )
     )
 

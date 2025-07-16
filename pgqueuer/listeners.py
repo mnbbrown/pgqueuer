@@ -120,11 +120,12 @@ async def initialize_notice_event_listener(
 
     def _process_payload(payload: str | bytes | bytearray) -> None:
         try:
+            parsed = models.AnyEvent.model_validate_json(payload)
             logconfig.logger.debug(
                 "received event with payload: %s",
                 payload,
+                extra={"parsed": parsed.model_dump(mode="json")}
             )
-            parsed = models.AnyEvent.model_validate_json(payload)
         except Exception as exc:
             logconfig.logger.critical(
                 "Error parsing notification payload: %s", payload, exc_info=exc
