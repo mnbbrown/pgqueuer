@@ -457,6 +457,13 @@ class QueryBuilderEnvironment:
         yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS headers JSONB;"  # noqa: E501
         yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;"  # noqa: E501
 
+        yield f"""
+        DROP TRIGGER IF EXISTS {self.settings.trigger} ON {self.settings.queue_table};
+        CREATE TRIGGER {self.settings.trigger}
+        AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON {self.settings.queue_table}
+        EXECUTE FUNCTION {self.settings.function}();
+        """
+
     def build_table_has_column_query(self) -> str:
         """
         A query to check if a specific column exists in a table.
