@@ -502,7 +502,7 @@ class QueueManager:
         job_status_log_buffer_timeout = helpers.retry_timer_buffer_timeout(
             [x.parameters.retry_timer for x in self.entrypoint_registry.values()]
         )
-        
+
         async with (
             buffers.JobStatusLogBuffer(
                 max_size=batch_size,

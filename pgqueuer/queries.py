@@ -410,7 +410,8 @@ class Queries:
         Reschedule jobs
 
         Args:
-            updates (list[tuple[models.JobId, models.JOB_STATUS, datetime | None]]): A list of tuples
+            updates (list[tuple[models.JobId, models.JOB_STATUS, datetime | None]]):
+                A list of tuples
                 containing job IDs, their corresponding statuses, and optional reschedule times.
         """
         await self.driver.execute(

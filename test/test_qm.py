@@ -7,7 +7,7 @@ import async_timeout
 import pytest
 
 from pgqueuer import db
-from pgqueuer.models import Job, Log
+from pgqueuer.models import Job
 from pgqueuer.qm import QueueManager
 from pgqueuer.queries import Queries
 from pgqueuer.types import QueueExecutionMode

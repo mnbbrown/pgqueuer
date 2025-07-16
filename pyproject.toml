@@ -94,9 +94,6 @@ docs = [
     "sphinxcontrib-mermaid"
 ]
 
-[tool.uv]
-default-groups = ["dev", "docs"]
-
 [tool.ruff]
 line-length = 100
 
