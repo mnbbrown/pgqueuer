@@ -7,7 +7,6 @@ import pytest
 from helpers import mocked_job
 
 from pgqueuer.buffers import JobStatusLogBuffer
-from pgqueuer.helpers import utc_now
 from pgqueuer.models import Job, UpdateJobStatus
 
 
@@ -115,7 +114,6 @@ async def test_job_buffer_multiple_flushes(max_size: int, flushes: int) -> None:
         for _ in range(flushes):
             for _ in range(max_size):
                 await buffer.add(UpdateJobStatus(job_id=job_faker().id, status="successful"))
-            buffer.next_flush = utc_now()
             await buffer.flush()
 
     # Verify that the buffer flushed three times
@@ -243,7 +241,6 @@ async def test_job_buffer_reuse_after_flush(max_size: int) -> None:
         # First flush
         for _ in range(max_size):
             await buffer.add(UpdateJobStatus(job_id=job_faker().id, status="successful"))
-        buffer.next_flush = utc_now()
         await buffer.flush()
         assert len(helper_buffer) == max_size
 
@@ -253,7 +250,6 @@ async def test_job_buffer_reuse_after_flush(max_size: int) -> None:
         # Second flush
         for _ in range(max_size):
             await buffer.add(UpdateJobStatus(job_id=job_faker().id, status="successful"))
-        buffer.next_flush = utc_now()
         await buffer.flush()
         assert len(helper_buffer) == max_size
 
