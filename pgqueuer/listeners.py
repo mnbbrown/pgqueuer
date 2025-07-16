@@ -124,7 +124,7 @@ async def initialize_notice_event_listener(
             logconfig.logger.debug(
                 "received event with payload: %s",
                 payload,
-                extra={"parsed": parsed.model_dump(mode="json")}
+                extra={"parsed": parsed.model_dump(mode="json")},
             )
         except Exception as exc:
             logconfig.logger.critical(

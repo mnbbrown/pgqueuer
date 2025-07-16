@@ -116,10 +116,14 @@ async def runit(
         try:
             async with factories.run_factory(factory()) as manager:
                 setup_shutdown_handlers(manager, shutdown)
-                await run_manager(manager, dequeue_timeout, batch_size, mode,
+                await run_manager(
+                    manager,
+                    dequeue_timeout,
+                    batch_size,
+                    mode,
                     max_concurrent_tasks,
                     shutdown_on_listener_failure,
-                                  )
+                )
         except Exception as exc:
             if not restart_on_failure:
                 raise

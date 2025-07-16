@@ -47,7 +47,7 @@ async def test_queries_next_jobs(
             payoad = job.payload
             assert payoad is not None
             seen.append(int(payoad))
-            
+
             await q.log_jobs([(job.id, "successful")])
 
     assert seen == list(range(N))
@@ -83,7 +83,7 @@ async def test_queries_next_jobs_concurrent(
                 payload = job.payload
                 assert payload is not None
                 seen.append(int(payload))
-                
+
                 await q.log_jobs([(job.id, "successful")])
 
     await asyncio.wait_for(
@@ -128,7 +128,6 @@ async def test_move_job_log(
         global_concurrency_limit=1000,
     ):
         for job in jobs:
-            
             await q.log_jobs([(job.id, "successful")])
 
     assert sum(x.status == "successful" for x in await q.queue_log()) == N
@@ -206,7 +205,7 @@ async def test_queue_priority(
     ):
         for job in next_jobs:
             jobs.append(job)
-            
+
             await q.log_jobs([(job.id, "successful")])
 
     assert jobs == sorted(jobs, key=lambda x: x.priority, reverse=True)
@@ -300,7 +299,6 @@ async def test_queue_log_queued_picked_successful(
     assert sum(x.status == "picked" for x in await q.queue_log()) == N
 
     for job in picked_jobs:
-        
         await q.log_jobs([(job.id, "successful")])
 
     assert sum(x.status == "successful" for x in await q.queue_log()) == N
@@ -397,7 +395,6 @@ async def test_queue_log_queued_picked_exception(
     assert sum(x.status == "picked" for x in await q.queue_log()) == N
 
     for job in picked_jobs:
-        
         await q.log_jobs([(job.id, "exception")])
 
     assert sum(x.status == "exception" for x in await q.queue_log()) == N
