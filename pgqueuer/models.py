@@ -176,6 +176,7 @@ class UpdateJobStatus:
     status: JOB_STATUS
     retryable: bool = False
     reschedule_for: AwareDatetime | None = None
+    traceback: TracebackRecord | None = None
 
 
 ###### Log ######
@@ -279,7 +280,7 @@ class TracebackRecord(BaseModel):
     @classmethod
     def from_exception(
         cls,
-        exc: Exception,
+        exc: BaseException,
         job_id: JobId,
         additional_context: dict[str, Any] | None = None,
     ) -> TracebackRecord:
