@@ -423,7 +423,13 @@ class Queries:
 
     async def log_jobs(
         self,
-        job_status: list[tuple[models.JobId, models.JOB_STATUS]],
+        job_status: list[
+            tuple[
+                models.JobId,
+                models.JOB_STATUS,
+                models.TracebackRecord | None,
+            ]
+        ],
     ) -> None:
         """
         Move completed or failed jobs from the queue to the log table.
@@ -438,8 +444,9 @@ class Queries:
         """
         await self.driver.execute(
             self.qbq.build_log_job_query(),
-            [job_id for job_id, _ in job_status],
-            [status for _, status in job_status],
+            [job_id for job_id, _, _ in job_status],
+            [status for _, status, _ in job_status],
+            [tb.model_dump_json() if tb else None for _, _, tb in job_status],
         )
 
     async def clear_statistics_log(self, entrypoint: str | list[str] | None = None) -> None:
