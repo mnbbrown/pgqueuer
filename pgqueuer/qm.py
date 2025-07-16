@@ -398,7 +398,7 @@ class QueueManager:
             if event.retryable:
                 retryable.append((event.job_id, event.status, event.reschedule_for))
             else:
-                terminal.append((event.job_id, event.status))
+                terminal.append((event.job_id, event.status, event.traceback))
 
         # failure state: if either of the following tasks fails the failed task's jobs
         # will remain in 'picked' until recovered by the job timeout feature.
@@ -645,24 +645,48 @@ class QueueManager:
                     next_status,
                     exc_info=e.__cause__ or e.__context__ or e,
                 )
+                traceback_record = None
+                if next_status == "exception":
+                    exc = e.__cause__ or e.__context__ or e
+                    traceback_record = models.TracebackRecord.from_exception(
+                        exc=exc,
+                        job_id=job.id,
+                        additional_context={
+                            "entrypoint": job.entrypoint,
+                            "queue_manager_id": self.queue_manager_id,
+                        },
+                    )
                 await jbuff.add(
                     models.UpdateJobStatus(
                         job_id=job.id,
                         status=next_status,
                         retryable=True,
                         reschedule_for=e.schedule_for,
+                        traceback=traceback_record,
                     )
                 )
-            except (MaxRetriesExceeded, MaxTimeExceeded, Exception):
+            except (MaxRetriesExceeded, MaxTimeExceeded, Exception) as e:
                 # backwards compatibility
                 logconfig.logger.exception(
                     "Exception while processing entrypoint/job-id: %s/%s",
                     job.entrypoint,
                     job.id,
                 )
+                traceback_record = models.TracebackRecord.from_exception(
+                    exc=e,
+                    job_id=job.id,
+                    additional_context={
+                        "entrypoint": job.entrypoint,
+                        "queue_manager_id": self.queue_manager_id,
+                    },
+                )
                 await jbuff.add(
                     models.UpdateJobStatus(
-                        job_id=job.id, status="exception", retryable=False, reschedule_for=None
+                        job_id=job.id,
+                        status="exception",
+                        retryable=False,
+                        reschedule_for=None,
+                        traceback=traceback_record,
                     )
                 )
             else:

@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import async_timeout
 import pytest
@@ -11,7 +11,7 @@ from pgqueuer import db
 from pgqueuer.models import Job, UpdateJobStatus
 from pgqueuer.qm import QueueManager
 from pgqueuer.queries import Queries
-from pgqueuer.types import QueueExecutionMode
+from pgqueuer.types import JobId, QueueExecutionMode
 
 
 async def wait_until_empty_queue(
@@ -209,15 +209,18 @@ async def test_handle_job_status_empty_list() -> None:
     qm = QueueManager(driver)
 
     # Mock the queries methods
-    qm.queries.mark_jobs_as_retryable = AsyncMock()
-    qm.queries.log_jobs = AsyncMock()
+    with (
+        patch.object(
+            qm.queries, "mark_jobs_as_retryable", new_callable=AsyncMock
+        ) as mock_mark_retryable,
+        patch.object(qm.queries, "log_jobs", new_callable=AsyncMock) as mock_log_jobs,
+    ):
+        # Call with empty list
+        await qm.handle_job_status([])
 
-    # Call with empty list
-    await qm.handle_job_status([])
-
-    # Verify both methods were called with empty lists
-    qm.queries.mark_jobs_as_retryable.assert_called_once_with([])
-    qm.queries.log_jobs.assert_called_once_with([])
+        # Verify both methods were called with empty lists
+        mock_mark_retryable.assert_called_once_with([])
+        mock_log_jobs.assert_called_once_with([])
 
 
 @pytest.mark.asyncio
@@ -227,25 +230,28 @@ async def test_handle_job_status_only_terminal_jobs() -> None:
     qm = QueueManager(driver)
 
     # Mock the queries methods
-    qm.queries.mark_jobs_as_retryable = AsyncMock()
-    qm.queries.log_jobs = AsyncMock()
+    with (
+        patch.object(
+            qm.queries, "mark_jobs_as_retryable", new_callable=AsyncMock
+        ) as mock_mark_retryable,
+        patch.object(qm.queries, "log_jobs", new_callable=AsyncMock) as mock_log_jobs,
+    ):
+        # Create terminal job status events
+        job_id_1 = JobId(1)
+        job_id_2 = JobId(2)
+        events = [
+            UpdateJobStatus(job_id=job_id_1, status="successful", retryable=False),
+            UpdateJobStatus(job_id=job_id_2, status="exception", retryable=False),
+        ]
 
-    # Create terminal job status events
-    job_id_1 = uuid.uuid4()
-    job_id_2 = uuid.uuid4()
-    events = [
-        UpdateJobStatus(job_id=job_id_1, status="success", retryable=False),
-        UpdateJobStatus(job_id=job_id_2, status="failed", retryable=False),
-    ]
+        await qm.handle_job_status(events)
 
-    await qm.handle_job_status(events)
+        # Verify retryable was called with empty list
+        mock_mark_retryable.assert_called_once_with([])
 
-    # Verify retryable was called with empty list
-    qm.queries.mark_jobs_as_retryable.assert_called_once_with([])
-
-    # Verify terminal jobs were logged
-    expected_terminal = [(job_id_1, "success"), (job_id_2, "failed")]
-    qm.queries.log_jobs.assert_called_once_with(expected_terminal)
+        # Verify terminal jobs were logged
+        expected_terminal = [(job_id_1, "successful"), (job_id_2, "exception")]
+        mock_log_jobs.assert_called_once_with(expected_terminal)
 
 
 @pytest.mark.asyncio
@@ -255,29 +261,34 @@ async def test_handle_job_status_only_retryable_jobs() -> None:
     qm = QueueManager(driver)
 
     # Mock the queries methods
-    qm.queries.mark_jobs_as_retryable = AsyncMock()
-    qm.queries.log_jobs = AsyncMock()
+    with (
+        patch.object(
+            qm.queries, "mark_jobs_as_retryable", new_callable=AsyncMock
+        ) as mock_mark_retryable,
+        patch.object(qm.queries, "log_jobs", new_callable=AsyncMock) as mock_log_jobs,
+    ):
+        # Create retryable job status events
+        job_id_1 = JobId(1)
+        job_id_2 = JobId(2)
+        reschedule_time = datetime.now(timezone.utc) + timedelta(minutes=5)
 
-    # Create retryable job status events
-    job_id_1 = uuid.uuid4()
-    job_id_2 = uuid.uuid4()
-    reschedule_time = datetime.now(timezone.utc) + timedelta(minutes=5)
+        events = [
+            UpdateJobStatus(
+                job_id=job_id_1, status="exception", retryable=True, reschedule_for=reschedule_time
+            ),
+            UpdateJobStatus(
+                job_id=job_id_2, status="exception", retryable=True, reschedule_for=None
+            ),
+        ]
 
-    events = [
-        UpdateJobStatus(
-            job_id=job_id_1, status="failed", retryable=True, reschedule_for=reschedule_time
-        ),
-        UpdateJobStatus(job_id=job_id_2, status="failed", retryable=True, reschedule_for=None),
-    ]
+        await qm.handle_job_status(events)
 
-    await qm.handle_job_status(events)
+        # Verify retryable jobs were processed
+        expected_retryable = [(job_id_1, "failed", reschedule_time), (job_id_2, "failed", None)]
+        mock_mark_retryable.assert_called_once_with(expected_retryable)
 
-    # Verify retryable jobs were processed
-    expected_retryable = [(job_id_1, "failed", reschedule_time), (job_id_2, "failed", None)]
-    qm.queries.mark_jobs_as_retryable.assert_called_once_with(expected_retryable)
-
-    # Verify log_jobs was called with empty list
-    qm.queries.log_jobs.assert_called_once_with([])
+        # Verify log_jobs was called with empty list
+        mock_log_jobs.assert_called_once_with([])
 
 
 @pytest.mark.asyncio
@@ -287,30 +298,36 @@ async def test_handle_job_status_mixed_jobs() -> None:
     qm = QueueManager(driver)
 
     # Mock the queries methods
-    qm.queries.mark_jobs_as_retryable = AsyncMock()
-    qm.queries.log_jobs = AsyncMock()
+    with (
+        patch.object(
+            qm.queries, "mark_jobs_as_retryable", new_callable=AsyncMock
+        ) as mock_mark_retryable,
+        patch.object(qm.queries, "log_jobs", new_callable=AsyncMock) as mock_log_jobs,
+    ):
+        # Create mixed job status events
+        terminal_job_id = JobId(1)
+        retryable_job_id = JobId(2)
+        reschedule_time = datetime.now(timezone.utc) + timedelta(minutes=10)
 
-    # Create mixed job status events
-    terminal_job_id = uuid.uuid4()
-    retryable_job_id = uuid.uuid4()
-    reschedule_time = datetime.now(timezone.utc) + timedelta(minutes=10)
+        events = [
+            UpdateJobStatus(job_id=terminal_job_id, status="successful", retryable=False),
+            UpdateJobStatus(
+                job_id=retryable_job_id,
+                status="exception",
+                retryable=True,
+                reschedule_for=reschedule_time,
+            ),
+        ]
 
-    events = [
-        UpdateJobStatus(job_id=terminal_job_id, status="success", retryable=False),
-        UpdateJobStatus(
-            job_id=retryable_job_id, status="failed", retryable=True, reschedule_for=reschedule_time
-        ),
-    ]
+        await qm.handle_job_status(events)
 
-    await qm.handle_job_status(events)
+        # Verify retryable jobs were processed
+        expected_retryable = [(retryable_job_id, "failed", reschedule_time)]
+        mock_mark_retryable.assert_called_once_with(expected_retryable)
 
-    # Verify retryable jobs were processed
-    expected_retryable = [(retryable_job_id, "failed", reschedule_time)]
-    qm.queries.mark_jobs_as_retryable.assert_called_once_with(expected_retryable)
-
-    # Verify terminal jobs were logged
-    expected_terminal = [(terminal_job_id, "success")]
-    qm.queries.log_jobs.assert_called_once_with(expected_terminal)
+        # Verify terminal jobs were logged
+        expected_terminal = [(terminal_job_id, "success")]
+        mock_log_jobs.assert_called_once_with(expected_terminal)
 
 
 @pytest.mark.asyncio
@@ -320,45 +337,51 @@ async def test_handle_job_status_query_failures() -> None:
     qm = QueueManager(driver)
 
     # Mock the queries methods to raise exceptions
-    qm.queries.mark_jobs_as_retryable = AsyncMock(side_effect=Exception("Retryable query failed"))
-    qm.queries.log_jobs = AsyncMock()
+    with (
+        patch.object(
+            qm.queries, "mark_jobs_as_retryable", new_callable=AsyncMock
+        ) as mock_mark_retryable,
+        patch.object(qm.queries, "log_jobs", new_callable=AsyncMock) as mock_log_jobs,
+    ):
+        mock_mark_retryable.side_effect = Exception("Retryable query failed")
 
-    # Create events
-    job_id = uuid.uuid4()
-    events = [
-        UpdateJobStatus(job_id=job_id, status="failed", retryable=True),
-    ]
+        # Create events
+        job_id = JobId(1)
+        events = [
+            UpdateJobStatus(job_id=job_id, status="exception", retryable=True),
+        ]
 
-    # Should raise exception due to asyncio.gather behavior
-    with pytest.raises(Exception, match="Retryable query failed"):
-        await qm.handle_job_status(events)
+        # Should raise exception due to asyncio.gather behavior
+        with pytest.raises(Exception, match="Retryable query failed"):
+            await qm.handle_job_status(events)
 
-    # Verify both methods were called (due to asyncio.gather)
-    qm.queries.mark_jobs_as_retryable.assert_called_once()
-    qm.queries.log_jobs.assert_called_once()
+        # Verify both methods were called (due to asyncio.gather)
+        mock_mark_retryable.assert_called_once()
+        mock_log_jobs.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_handle_job_status_logging(caplog) -> None:
+async def test_handle_job_status_logging(caplog: pytest.LogCaptureFixture) -> None:
     """Test that handle_job_status logs the correct debug message."""
     driver = MagicMock()
     qm = QueueManager(driver)
 
     # Mock the queries methods
-    qm.queries.mark_jobs_as_retryable = AsyncMock()
-    qm.queries.log_jobs = AsyncMock()
+    with (
+        patch.object(qm.queries, "mark_jobs_as_retryable", new_callable=AsyncMock),
+        patch.object(qm.queries, "log_jobs", new_callable=AsyncMock),
+    ):
+        # Create events
+        events = [
+            UpdateJobStatus(job_id=JobId(1), status="successful", retryable=False),
+            UpdateJobStatus(job_id=JobId(2), status="exception", retryable=True),
+        ]
 
-    # Create events
-    events = [
-        UpdateJobStatus(job_id=uuid.uuid4(), status="success", retryable=False),
-        UpdateJobStatus(job_id=uuid.uuid4(), status="failed", retryable=True),
-    ]
+        with caplog.at_level("DEBUG"):
+            await qm.handle_job_status(events)
 
-    with caplog.at_level("DEBUG"):
-        await qm.handle_job_status(events)
-
-    # Check that debug message was logged
-    assert "Handling 2 job updates" in caplog.text
+        # Check that debug message was logged
+        assert "Handling 2 job updates" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -368,28 +391,31 @@ async def test_handle_job_status_various_statuses() -> None:
     qm = QueueManager(driver)
 
     # Mock the queries methods
-    qm.queries.mark_jobs_as_retryable = AsyncMock()
-    qm.queries.log_jobs = AsyncMock()
+    with (
+        patch.object(
+            qm.queries, "mark_jobs_as_retryable", new_callable=AsyncMock
+        ) as mock_mark_retryable,
+        patch.object(qm.queries, "log_jobs", new_callable=AsyncMock) as mock_log_jobs,
+    ):
+        # Create events with different statuses
+        job_ids = [JobId(i) for i in range(4)]
+        events = [
+            UpdateJobStatus(job_id=job_ids[0], status="successful", retryable=False),
+            UpdateJobStatus(job_id=job_ids[1], status="exception", retryable=False),
+            UpdateJobStatus(job_id=job_ids[2], status="exception", retryable=True),
+            UpdateJobStatus(job_id=job_ids[3], status="canceled", retryable=False),
+        ]
 
-    # Create events with different statuses
-    job_ids = [uuid.uuid4() for _ in range(4)]
-    events = [
-        UpdateJobStatus(job_id=job_ids[0], status="success", retryable=False),
-        UpdateJobStatus(job_id=job_ids[1], status="failed", retryable=False),
-        UpdateJobStatus(job_id=job_ids[2], status="failed", retryable=True),
-        UpdateJobStatus(job_id=job_ids[3], status="cancelled", retryable=False),
-    ]
+        await qm.handle_job_status(events)
 
-    await qm.handle_job_status(events)
+        # Verify retryable jobs
+        expected_retryable = [(job_ids[2], "failed", None)]
+        mock_mark_retryable.assert_called_once_with(expected_retryable)
 
-    # Verify retryable jobs
-    expected_retryable = [(job_ids[2], "failed", None)]
-    qm.queries.mark_jobs_as_retryable.assert_called_once_with(expected_retryable)
-
-    # Verify terminal jobs
-    expected_terminal = [
-        (job_ids[0], "success"),
-        (job_ids[1], "failed"),
-        (job_ids[3], "cancelled"),
-    ]
-    qm.queries.log_jobs.assert_called_once_with(expected_terminal)
+        # Verify terminal jobs
+        expected_terminal = [
+            (job_ids[0], "success"),
+            (job_ids[1], "failed"),
+            (job_ids[3], "cancelled"),
+        ]
+        mock_log_jobs.assert_called_once_with(expected_terminal)
