@@ -7,22 +7,22 @@ class PgqException(Exception):
     """Base class for all exceptions raised by PGQueuer."""
 
 
-class BaseRetryException(PgqException):
+class RetryException(PgqException):
     """Exception raised for retry-related errors in PGQueuer."""
 
 
-class RetryableException(BaseRetryException):
+class RetryableException(RetryException):
     """Exception raised for retry-related errors in PGQueuer."""
 
     def __init__(self, schedule_for: datetime | None):
         self.schedule_for = schedule_for
 
 
-class MaxRetriesExceeded(BaseRetryException):
+class MaxRetriesExceeded(RetryException):
     """Exception raised when all retry attempts have been exhausted."""
 
 
-class MaxTimeExceeded(BaseRetryException):
+class MaxTimeExceeded(RetryException):
     """Exception raised when the maximum time limit for retries has been exceeded."""
 
 
