@@ -505,14 +505,9 @@ class QueueManager:
         if max_concurrent_tasks < 2 * batch_size:
             raise RuntimeError("max_concurrent_tasks must be at least twice the batch size.")
 
-        job_status_log_buffer_timeout = helpers.retry_timer_buffer_timeout(
-            [x.parameters.retry_timer for x in self.entrypoint_registry.values()]
-        )
-
         async with (
             buffers.JobStatusLogBuffer(
                 max_size=batch_size,
-                timeout=job_status_log_buffer_timeout,
                 callback=self.handle_job_status,
             ) as jbuff,
             buffers.HeartbeatBuffer(
