@@ -36,3 +36,17 @@ class DuplicateJobError(PgqException):
 
 class FailingListenerError(PgqException):
     """Raised when a listener fails to process a job."""
+
+
+class NonRetryableError(PgqException):
+    """
+    Raise this from a job to skip retries and fail immediately.
+
+    Use for permanent failures like:
+    - Invalid input data
+    - Resource not found (404)
+    - Permission denied
+    - Business logic violations
+    """
+
+    pass
