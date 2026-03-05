@@ -102,6 +102,10 @@ class QueueManager:
 
     # Optional callback invoked after each dequeue with (duration_seconds, num_jobs).
     on_dequeue: Callable[[float, int], Any] | None = None
+    # Optional callback invoked after each dispatch with (active_tasks, max_tasks).
+    on_dispatch: Callable[[int, int], Any] | None = None
+    # Optional callback invoked after each listener health check with (healthy, duration_seconds).
+    on_listener_health_check: Callable[[bool, float], Any] | None = None
 
     # Per job.
     job_context: dict[models.JobId, models.Context] = dataclasses.field(
@@ -161,7 +165,16 @@ class QueueManager:
         """
 
         while not self.shutdown.is_set():
-            await self.listener_healthy(timeout=interval)
+            start = perf_counter()
+            try:
+                await self.listener_healthy(timeout=interval)
+                healthy = True
+            except errors.FailingListenerError:
+                healthy = False
+            if self.on_listener_health_check is not None:
+                self.on_listener_health_check(healthy, perf_counter() - start)
+            if not healthy:
+                raise errors.FailingListenerError
             with suppress(TimeoutError, asyncio.TimeoutError):
                 await asyncio.wait_for(
                     self.shutdown.wait(),
@@ -560,6 +573,8 @@ class QueueManager:
                         resources=self.resources,
                     )
                     task_manager.add(asyncio.create_task(self._dispatch(job, jbuff, hbuff)))
+                    if self.on_dispatch is not None:
+                        self.on_dispatch(len(task_manager.tasks), max_concurrent_tasks)
 
                     with contextlib.suppress(asyncio.QueueEmpty):
                         notice_event_listener.get_nowait()

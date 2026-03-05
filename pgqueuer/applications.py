@@ -57,6 +57,10 @@ class PgQueuer:
     )
     # Optional callback invoked after each dequeue with (duration_seconds, num_jobs).
     on_dequeue: Callable[[float, int], Any] | None = None
+    # Optional callback invoked after each dispatch with (active_tasks, max_tasks).
+    on_dispatch: Callable[[int, int], Any] | None = None
+    # Optional callback invoked after each listener health check with (healthy, duration_seconds).
+    on_listener_health_check: Callable[[bool, float], Any] | None = None
     shutdown: asyncio.Event = dataclasses.field(
         init=False,
         default_factory=asyncio.Event,
@@ -70,7 +74,12 @@ class PgQueuer:
 
     def __post_init__(self) -> None:
         self.qm = QueueManager(
-            self.connection, self.channel, resources=self.resources, on_dequeue=self.on_dequeue
+            self.connection,
+            self.channel,
+            resources=self.resources,
+            on_dequeue=self.on_dequeue,
+            on_dispatch=self.on_dispatch,
+            on_listener_health_check=self.on_listener_health_check,
         )
         self.sm = SchedulerManager(self.connection)
         self.qm.shutdown = self.shutdown
