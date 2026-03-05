@@ -8,12 +8,12 @@ try:
     import logfire
     import logfire.propagate
 except ImportError:
-    logfire = None  # type: ignore[assignment]
+    logfire = None
 
 try:
     import sentry_sdk
 except ImportError:
-    sentry_sdk = None  # type: ignore[assignment]
+    sentry_sdk = None
 
 from pgqueuer.models import Job
 

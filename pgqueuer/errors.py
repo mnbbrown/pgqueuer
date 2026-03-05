@@ -48,5 +48,3 @@ class NonRetryableError(PgqException):
     - Permission denied
     - Business logic violations
     """
-
-    pass

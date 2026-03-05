@@ -7,7 +7,7 @@ import pytest
 
 from pgqueuer import helpers as pg_helpers
 from pgqueuer.buffers import JobStatusLogBuffer
-from pgqueuer.models import JOB_STATUS, Job, TracebackRecord, UpdateJobStatus
+from pgqueuer.models import Job, UpdateJobStatus
 from test.helpers import mocked_job
 
 
@@ -344,7 +344,7 @@ async def test_job_buffer_retry_uses_jitter(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(pg_helpers, "timeout_with_jitter", fake_jitter)
 
-    async def failing_callback(_: list[LogEntry]) -> None:
+    async def failing_callback(_: list[UpdateJobStatus]) -> None:
         raise RuntimeError("flush failed")
 
     buffer = JobStatusLogBuffer(
@@ -353,7 +353,7 @@ async def test_job_buffer_retry_uses_jitter(monkeypatch: pytest.MonkeyPatch) -> 
         callback=failing_callback,
     )
 
-    await buffer.add((job_faker(), "successful", None))
+    await buffer.add(UpdateJobStatus(job_id=job_faker().id, status="successful"))
     await buffer.flush()
 
     assert jitter_calls
@@ -375,7 +375,7 @@ async def test_job_buffer_retry_skips_jitter_on_shutdown(
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(pg_helpers, "timeout_with_jitter", fail_if_called)
 
-    async def failing_callback(_: list[LogEntry]) -> None:
+    async def failing_callback(_: list[UpdateJobStatus]) -> None:
         raise RuntimeError("flush failed")
 
     buffer = JobStatusLogBuffer(
@@ -384,7 +384,7 @@ async def test_job_buffer_retry_skips_jitter_on_shutdown(
         callback=failing_callback,
     )
 
-    await buffer.add((job_faker(), "successful", None))
+    await buffer.add(UpdateJobStatus(job_id=job_faker().id, status="successful"))
     buffer.shutdown.set()
     await buffer.flush()
 
@@ -392,9 +392,9 @@ async def test_job_buffer_retry_skips_jitter_on_shutdown(
 
 
 async def test_job_buffer_flush_returns_when_lock_held() -> None:
-    helper_calls: list[list[LogEntry]] = []
+    helper_calls: list[list[UpdateJobStatus]] = []
 
-    async def helper(items: list[LogEntry]) -> None:
+    async def helper(items: list[UpdateJobStatus]) -> None:
         helper_calls.append(items)
 
     buffer = JobStatusLogBuffer(
@@ -403,7 +403,7 @@ async def test_job_buffer_flush_returns_when_lock_held() -> None:
         callback=helper,
     )
 
-    await buffer.add((job_faker(), "successful", None))
+    await buffer.add(UpdateJobStatus(job_id=job_faker().id, status="successful"))
     await buffer.lock.acquire()
     try:
         await buffer.flush()
@@ -412,6 +412,3 @@ async def test_job_buffer_flush_returns_when_lock_held() -> None:
 
     assert helper_calls == []
     assert buffer.events.qsize() == 1
-
-
-LogEntry = tuple[Job, JOB_STATUS, TracebackRecord | None]

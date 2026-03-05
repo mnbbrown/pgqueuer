@@ -228,9 +228,7 @@ RetryWithBackoffEntrypointExecutor = InlineRetryWithBackoffEntrypointExecutor
 @dataclasses.dataclass
 class DatabaseRetryWithBackoffEntrypointExecutor(BaseRetryWithBackoffExecutor):
     # Exception types that should skip retries and fail immediately
-    non_retryable_errors: tuple[type[Exception], ...] = dataclasses.field(
-        default_factory=tuple
-    )
+    non_retryable_errors: tuple[type[Exception], ...] = dataclasses.field(default_factory=tuple)
 
     # Callback for terminal failures (e.g., Sentry capture)
     on_terminal_failure: OnTerminalFailure | None = None
@@ -271,9 +269,7 @@ class DatabaseRetryWithBackoffEntrypointExecutor(BaseRetryWithBackoffExecutor):
 
                 except Exception as e:
                     # Check if this exception type is configured as non-retryable
-                    if self.non_retryable_errors and isinstance(
-                        e, self.non_retryable_errors
-                    ):
+                    if self.non_retryable_errors and isinstance(e, self.non_retryable_errors):
                         await self._handle_terminal(e, job, "non_retryable")
                         raise errors.RetryableException(None) from e
 

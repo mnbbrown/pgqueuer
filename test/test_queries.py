@@ -537,7 +537,7 @@ async def test_log_statistics(
     )
     assert len(jobs) == N
     for job in jobs:
-        await q.log_jobs([(job, "successful", None)])
+        await q.log_jobs([(job.id, "successful", None)])
 
     # Fetch statistics
     stats = await q.log_statistics(tail=tail, last=last)
@@ -564,7 +564,7 @@ async def test_enqueue_with_headers(apgdriver: db.Driver) -> None:
 
     assert len(jobs) == 1
     assert jobs[0].headers == headers
-    await q.log_jobs([(jobs[0], "successful", None)])
+    await q.log_jobs([(jobs[0].id, "successful", None)])
 
 
 async def test_queries_from_asyncpg_connection(dsn: str) -> None:
