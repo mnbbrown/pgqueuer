@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from datetime import timedelta
-from typing import TYPE_CHECKING, Callable, MutableMapping
+from typing import TYPE_CHECKING, Any, Callable, MutableMapping
 
 from .db import AsyncpgDriver, AsyncpgPoolDriver, Driver, PsycopgDriver
 from .executors import (
@@ -55,6 +55,8 @@ class PgQueuer:
     resources: MutableMapping = dataclasses.field(
         default_factory=dict,
     )
+    # Optional callback invoked after each dequeue with (duration_seconds, num_jobs).
+    on_dequeue: Callable[[float, int], Any] | None = None
     shutdown: asyncio.Event = dataclasses.field(
         init=False,
         default_factory=asyncio.Event,
@@ -67,7 +69,9 @@ class PgQueuer:
     )
 
     def __post_init__(self) -> None:
-        self.qm = QueueManager(self.connection, self.channel, resources=self.resources)
+        self.qm = QueueManager(
+            self.connection, self.channel, resources=self.resources, on_dequeue=self.on_dequeue
+        )
         self.sm = SchedulerManager(self.connection)
         self.qm.shutdown = self.shutdown
         self.sm.shutdown = self.shutdown

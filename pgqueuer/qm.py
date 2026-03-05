@@ -18,7 +18,8 @@ from collections.abc import MutableMapping
 from contextlib import nullcontext, suppress
 from datetime import timedelta
 from math import isfinite
-from typing import AsyncGenerator, Callable
+from time import perf_counter
+from typing import Any, AsyncGenerator, Callable
 
 import anyio
 
@@ -98,6 +99,9 @@ class QueueManager:
     resources: MutableMapping = dataclasses.field(
         default_factory=dict,
     )
+
+    # Optional callback invoked after each dequeue with (duration_seconds, num_jobs).
+    on_dequeue: Callable[[float, int], Any] | None = None
 
     # Per job.
     job_context: dict[models.JobId, models.Context] = dataclasses.field(
@@ -371,14 +375,17 @@ class QueueManager:
                 for x in self.entrypoints_below_capacity_limits()
             }
 
-            if not (
-                jobs := await self.queries.dequeue(
-                    batch_size=batch_size,
-                    entrypoints=entrypoints,
-                    queue_manager_id=self.queue_manager_id,
-                    global_concurrency_limit=global_concurrency_limit,
-                )
-            ):
+            start = perf_counter()
+            jobs = await self.queries.dequeue(
+                batch_size=batch_size,
+                entrypoints=entrypoints,
+                queue_manager_id=self.queue_manager_id,
+                global_concurrency_limit=global_concurrency_limit,
+            )
+            if self.on_dequeue is not None:
+                self.on_dequeue(perf_counter() - start, len(jobs))
+
+            if not jobs:
                 break
 
             for job in jobs:
