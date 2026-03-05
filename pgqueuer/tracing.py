@@ -7,13 +7,17 @@ from typing import AsyncContextManager, AsyncIterator, Final, Generator, Protoco
 try:
     import logfire
     import logfire.propagate
+
+    _has_logfire = True
 except ImportError:
-    logfire = None
+    _has_logfire = False
 
 try:
     import sentry_sdk
+
+    _has_sentry = True
 except ImportError:
-    sentry_sdk = None
+    _has_sentry = False
 
 from pgqueuer.models import Job
 
@@ -69,7 +73,7 @@ class TracingProtocol(Protocol):
 
 class LogfireTracing(TracingProtocol):
     def trace_publish(self, entrypoints: list[str]) -> Generator[dict, None, None]:
-        if logfire is None:
+        if not _has_logfire:
             yield {}
             return
 
@@ -90,7 +94,7 @@ class LogfireTracing(TracingProtocol):
             None: This context manager does not return a value but manages the tracing lifecycle.
         """
 
-        if logfire is None or job.headers is None:
+        if not _has_logfire or job.headers is None:
             yield
             return
 
@@ -112,7 +116,7 @@ class LogfireTracing(TracingProtocol):
 
 class SentryTracing(TracingProtocol):
     def trace_publish(self, entrypoints: list[str]) -> Generator[dict, None, None]:
-        if sentry_sdk is None:
+        if not _has_sentry:
             yield {}
             return
 
@@ -148,7 +152,7 @@ class SentryTracing(TracingProtocol):
                 metrics for the job lifecycle.
         """
 
-        if sentry_sdk is None or job.headers is None:
+        if not _has_sentry or job.headers is None:
             yield
             return
 

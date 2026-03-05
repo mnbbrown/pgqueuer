@@ -240,7 +240,7 @@ async def test_handle_job_status_only_terminal_jobs() -> None:
         mock_mark_retryable.assert_called_once_with([])
 
         # Verify terminal jobs were logged
-        expected_terminal = [(job_id_1, "successful"), (job_id_2, "exception")]
+        expected_terminal = [(job_id_1, "successful", None), (job_id_2, "exception", None)]
         mock_log_jobs.assert_called_once_with(expected_terminal)
 
 
@@ -274,7 +274,10 @@ async def test_handle_job_status_only_retryable_jobs() -> None:
         await qm.handle_job_status(events)
 
         # Verify retryable jobs were processed
-        expected_retryable = [(job_id_1, "failed", reschedule_time), (job_id_2, "failed", None)]
+        expected_retryable = [
+            (job_id_1, "exception", reschedule_time),
+            (job_id_2, "exception", None),
+        ]
         mock_mark_retryable.assert_called_once_with(expected_retryable)
 
         # Verify log_jobs was called with empty list
@@ -312,11 +315,11 @@ async def test_handle_job_status_mixed_jobs() -> None:
         await qm.handle_job_status(events)
 
         # Verify retryable jobs were processed
-        expected_retryable = [(retryable_job_id, "failed", reschedule_time)]
+        expected_retryable = [(retryable_job_id, "exception", reschedule_time)]
         mock_mark_retryable.assert_called_once_with(expected_retryable)
 
         # Verify terminal jobs were logged
-        expected_terminal = [(terminal_job_id, "success")]
+        expected_terminal = [(terminal_job_id, "successful", None)]
         mock_log_jobs.assert_called_once_with(expected_terminal)
 
 
@@ -399,13 +402,13 @@ async def test_handle_job_status_various_statuses() -> None:
         await qm.handle_job_status(events)
 
         # Verify retryable jobs
-        expected_retryable = [(job_ids[2], "failed", None)]
+        expected_retryable = [(job_ids[2], "exception", None)]
         mock_mark_retryable.assert_called_once_with(expected_retryable)
 
         # Verify terminal jobs
         expected_terminal = [
-            (job_ids[0], "success"),
-            (job_ids[1], "failed"),
-            (job_ids[3], "cancelled"),
+            (job_ids[0], "successful", None),
+            (job_ids[1], "exception", None),
+            (job_ids[3], "canceled", None),
         ]
         mock_log_jobs.assert_called_once_with(expected_terminal)

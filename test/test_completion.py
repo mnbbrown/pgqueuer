@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 from datetime import timedelta
 
 import pytest
@@ -85,14 +84,10 @@ async def test_completion_deleted(apgdriver: db.Driver) -> None:
     N = 25
     jids = await qm.queries.enqueue(["fetch"] * N, [None] * N, [0] * N)
 
-    @dataclass
-    class FakeJob:
-        id: int
-
     await qm.queries.log_jobs(
         [
             (
-                FakeJob(jid),  # type: ignore
+                jid,
                 "deleted",
                 None,
             )
