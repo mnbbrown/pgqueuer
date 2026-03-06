@@ -171,6 +171,8 @@ async def run_manager(
             dequeue_timeout=dequeue_timeout,
             batch_size=batch_size,
             mode=mode,
+            max_concurrent_tasks=max_concurrent_tasks,
+            shutdown_on_listener_failure=shutdown_on_listener_failure,
         )
     else:
         raise NotImplementedError(f"Unsupported instance type: {type(manager)}")
