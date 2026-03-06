@@ -7,7 +7,7 @@ import pytest
 
 from pgqueuer.buffers import JobStatusLogBuffer
 from pgqueuer.core import helpers as pg_helpers
-from pgqueuer.models import JOB_STATUS, Job, TracebackRecord
+from pgqueuer.models import JOB_STATUS, Job, UpdateJobStatus
 from test.helpers import mocked_job
 
 
@@ -25,6 +25,11 @@ def job_faker(
     )
 
 
+def status_entry(job: Job | None = None, status: JOB_STATUS = "successful") -> UpdateJobStatus:
+    j = job or job_faker()
+    return UpdateJobStatus(job_id=j.id, status=status)
+
+
 @pytest.mark.parametrize("max_size", (1, 2, 3, 5, 64))
 async def test_job_buffer_max_size(max_size: int) -> None:
     helper_buffer = []
@@ -38,10 +43,10 @@ async def test_job_buffer_max_size(max_size: int) -> None:
         callback=helper,
     ) as buffer:
         for _ in range(max_size - 1):
-            await buffer.add((job_faker(), "successful", None))
+            await buffer.add(status_entry())
             assert len(helper_buffer) == 0
 
-        await buffer.add((job_faker(), "successful", None))
+        await buffer.add(status_entry())
 
     # On ctx-mangner exit flush is forced.
     assert len(helper_buffer) == max_size
@@ -64,7 +69,7 @@ async def test_job_buffer_timeout(
         callback=helper,
     ) as buffer:
         for _ in range(N):
-            await buffer.add((job_faker(), "successful", None))
+            await buffer.add(status_entry())
             assert len(helper_buffer) == 0
 
         await asyncio.sleep(timeout.total_seconds() * 1.1)
@@ -89,7 +94,7 @@ async def test_job_buffer_flush_on_exit(max_size: int) -> None:
         callback=helper,
     ) as buffer:
         for _ in range(max_size - 2):
-            await buffer.add((job_faker(), "successful", None))
+            await buffer.add(status_entry())
             assert len(helper_buffer) == 0
 
     # After exiting the context, remaining items should be flushed
@@ -114,7 +119,7 @@ async def test_job_buffer_multiple_flushes(max_size: int, flushes: int) -> None:
     ) as buffer:
         for _ in range(flushes):
             for _ in range(max_size):
-                await buffer.add((job_faker(), "successful", None))
+                await buffer.add(status_entry())
             await buffer.flush()
 
     # Verify that the buffer flushed three times
@@ -142,7 +147,7 @@ async def test_job_buffer_flush_on_exception(max_size: int) -> None:
         callback=faulty_helper,
     ) as buffer:
         for _ in range(max_size):
-            await buffer.add((job_faker(), "successful", None))
+            await buffer.add(status_entry())
 
         # Allow time for the flush to be attempted and retried
         await asyncio.sleep(0.02)
@@ -167,9 +172,9 @@ async def test_job_buffer_flush_order(max_size: int) -> None:
         timeout=timedelta(seconds=100),
         callback=helper,
     ) as buffer:
-        items = [(job_faker(), "successful") for _ in range(max_size)]
+        items = [status_entry() for _ in range(max_size)]
         for item in items:
-            await buffer.add(item)  # type: ignore[arg-type]
+            await buffer.add(item)
 
     assert helper_buffer == items
 
@@ -192,7 +197,7 @@ async def test_job_buffer_concurrent_adds(max_size: int) -> None:
 
         async def add_items(n: int) -> None:
             for _ in range(n):
-                await buffer.add((job_faker(), "successful", None))
+                await buffer.add(status_entry())
 
         tasks = [asyncio.create_task(add_items(max_size // 2)) for _ in range(4)]
         await asyncio.gather(*tasks)
@@ -239,7 +244,7 @@ async def test_job_buffer_reuse_after_flush(max_size: int) -> None:
     ) as buffer:
         # First flush
         for _ in range(max_size):
-            await buffer.add((job_faker(), "successful", None))
+            await buffer.add(status_entry())
         await buffer.flush()
         assert len(helper_buffer) == max_size
 
@@ -248,7 +253,7 @@ async def test_job_buffer_reuse_after_flush(max_size: int) -> None:
 
         # Second flush
         for _ in range(max_size):
-            await buffer.add((job_faker(), "successful", None))
+            await buffer.add(status_entry())
         await buffer.flush()
         assert len(helper_buffer) == max_size
 
@@ -274,7 +279,7 @@ async def test_job_buffer_exception_during_flush(max_size: int) -> None:
         callback=faulty_helper,
     ) as buffer:
         for _ in range(max_size):
-            await buffer.add((job_faker(), "successful", None))
+            await buffer.add(status_entry())
 
         # Allow time for the flush to be attempted and retried
         await asyncio.sleep(0.02)
@@ -289,7 +294,7 @@ async def test_job_buffer_callback_called_correctly(max_size: int) -> None:
     """
     Test that the callback is called with the correct items.
     """
-    items = [(job_faker(), "successful") for _ in range(max_size)]
+    items = [status_entry() for _ in range(max_size)]
     received_items = []
 
     async def helper(x: list) -> None:
@@ -301,16 +306,14 @@ async def test_job_buffer_callback_called_correctly(max_size: int) -> None:
         callback=helper,
     ) as buffer:
         for item in items:
-            await buffer.add(item)  # type: ignore[arg-type]
+            await buffer.add(item)
 
     assert received_items == items
 
 
 async def test_job_buffer_callback_exception_during_teardown() -> None:
     N = 10
-    items: list[tuple[Job, JOB_STATUS, None]] = [
-        (job_faker(), "successful", None) for _ in range(N)
-    ]
+    items = [status_entry() for _ in range(N)]
 
     async def helper(_: object) -> None:
         raise ValueError
@@ -351,7 +354,7 @@ async def test_job_buffer_retry_uses_jitter(monkeypatch: pytest.MonkeyPatch) -> 
         callback=failing_callback,
     )
 
-    await buffer.add((job_faker(), "successful", None))
+    await buffer.add(status_entry())
     await buffer.flush()
 
     assert jitter_calls
@@ -382,7 +385,7 @@ async def test_job_buffer_retry_skips_jitter_on_shutdown(
         callback=failing_callback,
     )
 
-    await buffer.add((job_faker(), "successful", None))
+    await buffer.add(status_entry())
     buffer.shutdown.set()
     await buffer.flush()
 
@@ -401,7 +404,7 @@ async def test_job_buffer_flush_returns_when_lock_held() -> None:
         callback=helper,
     )
 
-    await buffer.add((job_faker(), "successful", None))
+    await buffer.add(status_entry())
     await buffer.lock.acquire()
     try:
         await buffer.flush()
@@ -412,4 +415,4 @@ async def test_job_buffer_flush_returns_when_lock_held() -> None:
     assert buffer.events.qsize() == 1
 
 
-LogEntry = tuple[Job, JOB_STATUS, TracebackRecord | None]
+LogEntry = UpdateJobStatus

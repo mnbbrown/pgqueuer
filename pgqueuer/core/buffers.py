@@ -234,9 +234,7 @@ class TimedOverflowBuffer(Generic[T]):
                 break
 
 
-class JobStatusLogBuffer(
-    TimedOverflowBuffer[models.UpdateJobStatus]
-):
+class JobStatusLogBuffer(TimedOverflowBuffer[models.UpdateJobStatus]):
     """
     Specialized TimedOverflowBuffer for handling Job/Status-log.
     """
