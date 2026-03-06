@@ -145,6 +145,7 @@ class Job(BaseModel):
     entrypoint: str
     payload: bytes | None
     queue_manager_id: uuid.UUID | None
+    attempts: int = 0
     headers: Annotated[
         dict[str, Any] | None,
         BeforeValidator(lambda x: None if x is None else from_json(x)),
@@ -167,6 +168,21 @@ class Job(BaseModel):
         Extracts OpenTelemetry W3C propagation headers from the job headers if available.
         """
         return None if self.headers is None else self.headers.get("otel")
+
+
+@dataclasses.dataclass
+class UpdateJobStatus:
+    """
+    Represents a request to update the job status.
+    If retryable is set to False the job is considered "terminal"
+    and will not be retried, and moved to the stats table.
+    """
+
+    job_id: JobId
+    status: JOB_STATUS
+    retryable: bool = False
+    reschedule_for: AwareDatetime | None = None
+    traceback: TracebackRecord | None = None
 
 
 ###### Log ######

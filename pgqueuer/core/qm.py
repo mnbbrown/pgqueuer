@@ -18,7 +18,8 @@ from collections.abc import MutableMapping
 from contextlib import nullcontext, suppress
 from datetime import timedelta
 from math import isfinite
-from typing import AsyncGenerator, Callable
+from time import perf_counter
+from typing import Any, AsyncGenerator, Callable
 
 import anyio
 
@@ -35,6 +36,7 @@ from pgqueuer.core import (
     tm,
 )
 from pgqueuer.domain import errors, models, types
+from pgqueuer.domain.errors import MaxRetriesExceeded, MaxTimeExceeded, RetryableException
 from pgqueuer.ports import RepositoryPort
 from pgqueuer.ports.driver import Driver
 from pgqueuer.ports.repository import EntrypointExecutionParameter
@@ -99,6 +101,13 @@ class QueueManager:
     # Optional injected tracer; falls back to the global ``tracing.TRACER.tracer``.
     tracer: tracing.TracingProtocol | None = None
 
+    # Optional callback invoked after each dequeue with (duration_seconds, num_jobs).
+    on_dequeue: Callable[[float, int], Any] | None = None
+    # Optional callback invoked after each dispatch with (active_tasks, max_tasks).
+    on_dispatch: Callable[[int, int], Any] | None = None
+    # Optional callback invoked after each listener health check with (healthy, duration_seconds).
+    on_listener_health_check: Callable[[bool, float], Any] | None = None
+
     # Per job.
     job_context: dict[models.JobId, models.Context] = dataclasses.field(
         init=False,
@@ -157,7 +166,16 @@ class QueueManager:
         """
 
         while not self.shutdown.is_set():
-            await self.listener_healthy(timeout=interval)
+            start = perf_counter()
+            try:
+                await self.listener_healthy(timeout=interval)
+                healthy = True
+            except errors.FailingListenerError:
+                healthy = False
+            if self.on_listener_health_check is not None:
+                self.on_listener_health_check(healthy, perf_counter() - start)
+            if not healthy:
+                raise errors.FailingListenerError
             with suppress(TimeoutError, asyncio.TimeoutError):
                 await asyncio.wait_for(
                     self.shutdown.wait(),
@@ -375,14 +393,17 @@ class QueueManager:
                 for x in self.entrypoints_below_capacity_limits()
             }
 
-            if not (
-                jobs := await self.queries.dequeue(
-                    batch_size=batch_size,
-                    entrypoints=entrypoints,
-                    queue_manager_id=self.queue_manager_id,
-                    global_concurrency_limit=global_concurrency_limit,
-                )
-            ):
+            start = perf_counter()
+            jobs = await self.queries.dequeue(
+                batch_size=batch_size,
+                entrypoints=entrypoints,
+                queue_manager_id=self.queue_manager_id,
+                global_concurrency_limit=global_concurrency_limit,
+            )
+            if self.on_dequeue is not None:
+                self.on_dequeue(perf_counter() - start, len(jobs))
+
+            if not jobs:
                 break
 
             for job in jobs:
@@ -398,6 +419,20 @@ class QueueManager:
                     if isfinite(self.entrypoint_registry[k].parameters.requests_per_second)
                 }
             )
+
+    async def handle_job_status(self, events: list[models.UpdateJobStatus]) -> None:
+        logconfig.logger.debug("Handling %s job updates", len(events))
+        terminal, retryable = [], []
+        for event in events:
+            if event.retryable:
+                retryable.append((event.job_id, event.status, event.reschedule_for))
+            else:
+                terminal.append((event.job_id, event.status, event.traceback))
+
+        await asyncio.gather(
+            self.queries.mark_jobs_as_retryable(retryable),
+            self.queries.log_jobs(terminal),
+        )
 
     async def verify_structure(self) -> None:
         """
@@ -493,7 +528,7 @@ class QueueManager:
         async with (
             buffers.JobStatusLogBuffer(
                 max_size=batch_size,
-                callback=self.queries.log_jobs,
+                callback=self.handle_job_status,
             ) as jbuff,
             buffers.HeartbeatBuffer(
                 # Flush will be mainly driven by timeouts, but allow flush if
@@ -538,6 +573,8 @@ class QueueManager:
                         resources=self.resources,
                     )
                     task_manager.add(asyncio.create_task(self._dispatch(job, jbuff, hbuff)))
+                    if self.on_dispatch is not None:
+                        self.on_dispatch(len(task_manager.tasks), max_concurrent_tasks)
 
                     with contextlib.suppress(asyncio.QueueEmpty):
                         notice_event_listener.get_nowait()
@@ -626,13 +663,44 @@ class QueueManager:
                 ctx = self.get_context(job.id)
                 if not ctx.cancellation.cancel_called:
                     await executor.execute(job, ctx)
-            except Exception as e:
+            except RetryableException as e:
+                next_status: types.JOB_STATUS = "exception" if e.schedule_for is None else "queued"
+                logconfig.logger.warning(
+                    "Exception while processing entrypoint/job-id: %s/%s. Marking as %s",
+                    job.entrypoint,
+                    job.id,
+                    next_status,
+                    exc_info=e.__cause__ or e.__context__ or e,
+                )
+                traceback_record = None
+                if next_status == "exception":
+                    cause = e.__cause__ or e.__context__ or e
+                    if not isinstance(cause, Exception):
+                        cause = e
+                    traceback_record = models.TracebackRecord.from_exception(
+                        exc=cause,
+                        job_id=job.id,
+                        additional_context={
+                            "entrypoint": job.entrypoint,
+                            "queue_manager_id": self.queue_manager_id,
+                        },
+                    )
+                await jbuff.add(
+                    models.UpdateJobStatus(
+                        job_id=job.id,
+                        status=next_status,
+                        retryable=True,
+                        reschedule_for=e.schedule_for,
+                        traceback=traceback_record,
+                    )
+                )
+            except (MaxRetriesExceeded, MaxTimeExceeded, Exception) as e:
                 logconfig.logger.exception(
                     "Exception while processing entrypoint/job-id: %s/%s",
                     job.entrypoint,
                     job.id,
                 )
-                tbr = models.TracebackRecord.from_exception(
+                traceback_record = models.TracebackRecord.from_exception(
                     exc=e,
                     job_id=job.id,
                     additional_context={
@@ -640,7 +708,15 @@ class QueueManager:
                         "queue_manager_id": self.queue_manager_id,
                     },
                 )
-                await jbuff.add((job, "exception", tbr))
+                await jbuff.add(
+                    models.UpdateJobStatus(
+                        job_id=job.id,
+                        status="exception",
+                        retryable=False,
+                        reschedule_for=None,
+                        traceback=traceback_record,
+                    )
+                )
             else:
                 logconfig.logger.debug(
                     "Dispatching entrypoint/id: %s/%s - successful",
@@ -648,6 +724,13 @@ class QueueManager:
                     job.id,
                 )
                 canceled = ctx.cancellation.cancel_called
-                await jbuff.add((job, "canceled" if canceled else "successful", None))
+                await jbuff.add(
+                    models.UpdateJobStatus(
+                        job_id=job.id,
+                        status="canceled" if canceled else "successful",
+                        retryable=False,
+                        reschedule_for=None,
+                    )
+                )
             finally:
                 self.job_context.pop(job.id, None)

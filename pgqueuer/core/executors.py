@@ -10,7 +10,7 @@ import random
 import warnings
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, TypeAlias, TypeVar, cast
+from typing import Awaitable, Callable, Literal, TypeAlias, TypeVar, cast
 
 import anyio
 import anyio.to_thread
@@ -33,6 +33,14 @@ EntrypointTypeVar = TypeVar("EntrypointTypeVar", bound=Entrypoint)
 
 
 AsyncCrontab: TypeAlias = Callable[[models.Schedule], Awaitable[None]]
+
+
+TerminalFailureReason = Literal["max_attempts", "timeout", "non_retryable"]
+
+OnTerminalFailure: TypeAlias = Callable[
+    [Exception, models.Job, TerminalFailureReason],
+    None | Awaitable[None],
+]
 
 
 def is_async_callable(obj: Callable[..., object] | object) -> bool:
@@ -147,7 +155,7 @@ class EntrypointExecutor(AbstractEntrypointExecutor):
 
 
 @dataclasses.dataclass
-class RetryWithBackoffEntrypointExecutor(EntrypointExecutor):
+class BaseRetryWithBackoffExecutor(EntrypointExecutor):
     # maximum retry attempts
     max_attempts: int | None = dataclasses.field(
         default=5,
@@ -183,18 +191,22 @@ class RetryWithBackoffEntrypointExecutor(EntrypointExecutor):
         jitter = self.jitter() * self.initial_delay / 2
         return delay + jitter
 
+
+@dataclasses.dataclass
+class InlineRetryWithBackoffEntrypointExecutor(BaseRetryWithBackoffExecutor):
     async def execute(self, job: models.Job, context: models.Context) -> None:
         """
         Execute the job with retry logic, using exponential backoff and jitter.
 
+        Note: this attempts the retries inline meaning the worker will not pick
+        up additional jobs while the current failing one is being retried. It will
+        also not increment the `attempts` field on the job.
+
+        After the specified attempts the job will be discarded.
+
         Args:
             job (models.Job): The job to execute.
             context (models.Context): The context for the job.
-
-        The function retries execution up to `max_attempts` times in case of failure,
-        applying exponential backoff with an initial delay (`initial_delay`),
-        up to a maximum delay (`max_delay`).
-        Jitter is added to the delay to avoid contention.
         """
 
         attempt = 0
@@ -221,6 +233,81 @@ class RetryWithBackoffEntrypointExecutor(EntrypointExecutor):
             asyncio.TimeoutError,
         ) as e:
             raise errors.MaxTimeExceeded(self.max_time) from e
+
+
+# backwards compatibility
+RetryWithBackoffEntrypointExecutor = InlineRetryWithBackoffEntrypointExecutor
+
+
+@dataclasses.dataclass
+class DatabaseRetryWithBackoffEntrypointExecutor(BaseRetryWithBackoffExecutor):
+    # Exception types that should skip retries and fail immediately
+    non_retryable_errors: tuple[type[Exception], ...] = dataclasses.field(default_factory=tuple)
+
+    # Callback for terminal failures (e.g., Sentry capture)
+    on_terminal_failure: OnTerminalFailure | None = None
+
+    async def execute(self, job: models.Job, context: models.Context) -> None:
+        """
+        Execute the job with retry logic, using exponential backoff and jitter.
+
+        When a job fails it raises a RetryableException - this will cause pgqueuer
+        to move this job back into the queue, ready to be retried.
+
+        If `schedule_for` is passed to RetryableException the job will be processed
+        after that datetime.
+
+        If it is not set the job will remain in `exception` status and require manual
+        recovery (by setting the status back to `queued`).
+        """
+
+        deadline = None if self.max_time is None else self.max_time.total_seconds()
+        try:
+            async with async_timeout.timeout(deadline):
+                try:
+                    return await super().execute(job, context)
+
+                except errors.NonRetryableError as e:
+                    await self._handle_terminal(e, job, "non_retryable")
+                    raise errors.RetryableException(None) from e
+
+                except Exception as e:
+                    # Check if this exception type is configured as non-retryable
+                    if self.non_retryable_errors and isinstance(e, self.non_retryable_errors):
+                        await self._handle_terminal(e, job, "non_retryable")
+                        raise errors.RetryableException(None) from e
+
+                    # Check if we've exceeded max attempts
+                    if self.max_attempts and job.attempts + 1 > self.max_attempts:
+                        await self._handle_terminal(e, job, "max_attempts")
+                        raise errors.RetryableException(None) from e
+
+                    # Calculate backoff and schedule retry
+                    max_delay = (
+                        self.max_delay
+                        if isinstance(self.max_delay, float | int)
+                        else self.max_delay.total_seconds()
+                    )
+                    delay = min(self.exponential_delay(job.attempts), max_delay)
+                    next_attempt_at = helpers.utc_now() + timedelta(seconds=delay)
+                    raise errors.RetryableException(schedule_for=next_attempt_at) from e
+
+        except (
+            TimeoutError,
+            asyncio.exceptions.TimeoutError,
+            asyncio.TimeoutError,
+        ) as e:
+            await self._handle_terminal(e, job, "timeout")
+            raise errors.RetryableException(None) from e
+
+    async def _handle_terminal(
+        self, exc: Exception, job: models.Job, reason: TerminalFailureReason
+    ) -> None:
+        """Called when a job fails terminally (no more retries)."""
+        if self.on_terminal_failure:
+            result = self.on_terminal_failure(exc, job, reason)
+            if inspect.isawaitable(result):
+                await result
 
 
 ######## Schedulers ########

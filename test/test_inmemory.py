@@ -81,7 +81,7 @@ async def test_dedupe_key_freed_after_log(queries: InMemoryQueries) -> None:
         None,
     )
     assert len(jobs) == 1
-    await queries.log_jobs([(jobs[0], "successful", None)])
+    await queries.log_jobs([(jobs[0].id, "successful", None)])
 
     # Should be able to enqueue again now
     ids2 = await queries.enqueue("ep", None, dedupe_key="dk1")
@@ -246,7 +246,7 @@ async def test_log_jobs_removes_from_queue(queries: InMemoryQueries) -> None:
         qm_id,
         None,
     )
-    await queries.log_jobs([(jobs[0], "successful", None)])
+    await queries.log_jobs([(jobs[0].id, "successful", None)])
 
     stats = await queries.queue_size()
     assert len(stats) == 0
@@ -262,7 +262,7 @@ async def test_log_jobs_adds_to_log(queries: InMemoryQueries) -> None:
         qm_id,
         None,
     )
-    await queries.log_jobs([(jobs[0], "successful", None)])
+    await queries.log_jobs([(jobs[0].id, "successful", None)])
 
     log = await queries.queue_log()
     statuses = [e.status for e in log]
@@ -360,7 +360,7 @@ async def test_queue_log_lifecycle(queries: InMemoryQueries) -> None:
         qm_id,
         None,
     )
-    await queries.log_jobs([(jobs[0], "successful", None)])
+    await queries.log_jobs([(jobs[0].id, "successful", None)])
 
     log = await queries.queue_log()
     statuses = [e.status for e in log if e.entrypoint == "ep"]
@@ -384,7 +384,7 @@ async def test_log_statistics(queries: InMemoryQueries) -> None:
         qm_id,
         None,
     )
-    await queries.log_jobs([(jobs[0], "successful", None)])
+    await queries.log_jobs([(jobs[0].id, "successful", None)])
 
     stats = await queries.log_statistics(tail=10)
     assert len(stats) > 0
@@ -406,7 +406,7 @@ async def test_job_status(queries: InMemoryQueries) -> None:
         qm_id,
         None,
     )
-    await queries.log_jobs([(jobs[0], "successful", None)])
+    await queries.log_jobs([(jobs[0].id, "successful", None)])
 
     result = await queries.job_status(ids)
     assert len(result) == 1

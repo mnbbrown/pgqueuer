@@ -70,7 +70,8 @@ class QueryBuilderEnvironment:
         entrypoint TEXT NOT NULL,
         dedupe_key TEXT,
         payload BYTEA,
-        headers JSONB
+        headers JSONB,
+        attempts INT NOT NULL DEFAULT 0
     );
     CREATE INDEX {self.settings.queue_table}_priority_id_id1_idx ON {self.settings.queue_table} (priority ASC, id DESC)
         INCLUDE (id) WHERE status = 'queued';
@@ -263,6 +264,7 @@ class QueryBuilderEnvironment:
         yield f"CREATE UNIQUE INDEX IF NOT EXISTS {self.settings.queue_table}_unique_dedupe_key ON {self.settings.queue_table} (dedupe_key) WHERE ((status IN ('queued', 'picked') AND dedupe_key IS NOT NULL));"  # noqa
         yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table_log}_job_id_status ON {self.settings.queue_table_log} (job_id, created DESC);"  # noqa: E501
         yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS headers JSONB;"  # noqa: E501
+        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;"  # noqa: E501
 
     def build_table_has_column_query(self) -> str:
         return """SELECT EXISTS (
@@ -499,7 +501,7 @@ class QueryQueueBuilder:
     ),
     updated AS (
         UPDATE {self.settings.queue_table}
-        SET status = 'picked', updated = NOW(), heartbeat = NOW(), queue_manager_id = $6
+        SET status = 'picked', updated = NOW(), heartbeat = NOW(), queue_manager_id = $6, attempts = attempts + 1
         WHERE id = ANY(SELECT id FROM combined_jobs)
         RETURNING *
     ), queue_log AS (
@@ -672,6 +674,42 @@ class QueryQueueBuilder:
         ) DO UPDATE SET
             count = {self.settings.statistics_table}.count + EXCLUDED.count
         """  # noqa
+
+    def build_reschedule_job_query(self) -> str:
+        """
+        Generate SQL query to move multiple jobs from picked back to another status.
+        """
+        return f"""WITH updated AS (
+            UPDATE {self.settings.queue_table}
+            SET
+                status = job_data.status,
+                execute_after = COALESCE(
+                    job_data.execute_after,
+                    {self.settings.queue_table}.execute_after
+                ),
+                updated = NOW(),
+                queue_manager_id = NULL
+            FROM (
+                SELECT
+                    UNNEST($1::integer[]) AS id,
+                    UNNEST($2::{self.settings.queue_status_type}[]) AS status,
+                    UNNEST($3::timestamptz[]) AS execute_after
+            ) AS job_data
+            WHERE {self.settings.queue_table}.id = job_data.id
+            RETURNING
+                {self.settings.queue_table}.id,
+                {self.settings.queue_table}.status,
+                entrypoint,
+                priority
+        )
+        INSERT INTO {self.settings.queue_table_log} (
+            job_id,
+            status,
+            entrypoint,
+            priority
+        )
+        SELECT id, status, entrypoint, priority FROM updated
+        """
 
     def build_job_status_query(self) -> str:
         return f"""SELECT DISTINCT ON (job_id) job_id, status

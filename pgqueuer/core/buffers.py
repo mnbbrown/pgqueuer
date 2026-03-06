@@ -235,13 +235,7 @@ class TimedOverflowBuffer(Generic[T]):
 
 
 class JobStatusLogBuffer(
-    TimedOverflowBuffer[
-        tuple[
-            models.Job,
-            models.JOB_STATUS,
-            models.TracebackRecord | None,
-        ]
-    ]
+    TimedOverflowBuffer[models.UpdateJobStatus]
 ):
     """
     Specialized TimedOverflowBuffer for handling Job/Status-log.

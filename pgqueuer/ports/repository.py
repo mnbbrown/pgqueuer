@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Protocol, overload
 
 from pgqueuer.domain import models
@@ -93,11 +93,16 @@ class QueueRepositoryPort(Protocol):
         self,
         job_status: list[
             tuple[
-                models.Job,
+                models.JobId,
                 models.JOB_STATUS,
                 models.TracebackRecord | None,
             ]
         ],
+    ) -> None: ...
+
+    async def mark_jobs_as_retryable(
+        self,
+        updates: list[tuple[models.JobId, models.JOB_STATUS, datetime | None]],
     ) -> None: ...
 
     async def clear_queue(self, entrypoint: str | list[str] | None = None) -> None: ...

@@ -452,7 +452,7 @@ class Queries:
         self,
         job_status: list[
             tuple[
-                models.Job,
+                models.JobId,
                 models.JOB_STATUS,
                 models.TracebackRecord | None,
             ]
@@ -465,15 +465,28 @@ class Queries:
         from the queue table and recording their details in the statistics table.
 
         Args:
-            job_status (list[tuple[models.Job, models.STATUS_LOG]]): A list of tuples
-                containing jobs and their corresponding statuses
-                ('successful', 'exception', or 'canceled').
+            job_status (list[tuple[models.JobId, models.JOB_STATUS, TracebackRecord | None]]):
+                A list of tuples containing job IDs, their corresponding statuses,
+                and optional traceback records.
         """
         await self.driver.execute(
             self.qbq.build_log_job_query(),
-            [job.id for job, _, _ in job_status],
+            [job_id for job_id, _, _ in job_status],
             [status for _, status, _ in job_status],
             [tb.model_dump_json() if tb else None for _, _, tb in job_status],
+        )
+
+    async def mark_jobs_as_retryable(
+        self, updates: list[tuple[models.JobId, models.JOB_STATUS, datetime | None]]
+    ) -> None:
+        """
+        Reschedule jobs by updating their status and optionally setting a new execute_after time.
+        """
+        await self.driver.execute(
+            self.qbq.build_reschedule_job_query(),
+            [job_id for job_id, _, _ in updates],
+            [status for _, status, _ in updates],
+            [rescheduled_for for _, _, rescheduled_for in updates],
         )
 
     async def clear_statistics_log(self, entrypoint: str | list[str] | None = None) -> None:

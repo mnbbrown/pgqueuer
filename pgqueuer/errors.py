@@ -5,7 +5,9 @@ from pgqueuer.domain.errors import (
     FailingListenerError,
     MaxRetriesExceeded,
     MaxTimeExceeded,
+    NonRetryableError,
     PgqException,
+    RetryableException,
     RetryException,
 )
 
@@ -14,6 +16,8 @@ __all__ = [
     "FailingListenerError",
     "MaxRetriesExceeded",
     "MaxTimeExceeded",
+    "NonRetryableError",
     "PgqException",
     "RetryException",
+    "RetryableException",
 ]

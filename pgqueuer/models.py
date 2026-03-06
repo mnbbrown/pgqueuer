@@ -16,6 +16,7 @@ from pgqueuer.domain.models import (
     Schedule,
     TableChangedEvent,
     TracebackRecord,
+    UpdateJobStatus,
 )
 from pgqueuer.domain.types import (
     EVENT_TYPES,
@@ -54,4 +55,5 @@ __all__ = [
     "ScheduleId",
     "TableChangedEvent",
     "TracebackRecord",
+    "UpdateJobStatus",
 ]

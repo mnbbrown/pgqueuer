@@ -362,30 +362,45 @@ class InMemoryQueries:
         self,
         job_status: list[
             tuple[
-                models.Job,
+                models.JobId,
                 models.JOB_STATUS,
                 models.TracebackRecord | None,
             ]
         ],
     ) -> None:
         now = _utc_now()
-        for job, status, tb in job_status:
-            self._jobs.pop(int(job.id), None)
+        for job_id, status, tb in job_status:
+            job_data = self._jobs.pop(int(job_id), None)
             # Clean dedupe index
-            self._remove_dedupe_for_job(int(job.id))
-            self._log.append(
-                {
-                    "id": self._next_log_id,
-                    "created": now,
-                    "job_id": int(job.id),
-                    "status": status,
-                    "priority": job.priority,
-                    "entrypoint": job.entrypoint,
-                    "traceback": tb.model_dump_json() if tb else None,
-                    "aggregated": False,
-                }
-            )
-            self._next_log_id += 1
+            self._remove_dedupe_for_job(int(job_id))
+            if job_data:
+                self._log.append(
+                    {
+                        "id": self._next_log_id,
+                        "created": now,
+                        "job_id": int(job_id),
+                        "status": status,
+                        "priority": job_data["priority"],
+                        "entrypoint": job_data["entrypoint"],
+                        "traceback": tb.model_dump_json() if tb else None,
+                        "aggregated": False,
+                    }
+                )
+                self._next_log_id += 1
+
+    async def mark_jobs_as_retryable(
+        self,
+        updates: list[tuple[models.JobId, models.JOB_STATUS, datetime | None]],
+    ) -> None:
+        now = _utc_now()
+        for job_id, status, execute_after in updates:
+            job_data = self._jobs.get(int(job_id))
+            if job_data is not None:
+                job_data["status"] = status
+                job_data["updated"] = now
+                job_data["queue_manager_id"] = None
+                if execute_after is not None:
+                    job_data["execute_after"] = execute_after
 
     # -- mark_job_as_cancelled -------------------------------------------------
 
