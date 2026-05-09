@@ -1,0 +1,67 @@
+pgqueuer/adapters/persistence/queries.py
+  s_6bff547dd35d7d::t_543ea5d57b6742 725-744
+  s_6bff547dd35d7d::t_76e947c8de42c3 779,791,802
+  s_6bff547dd35d7d::t_e0072ead2981d2 829,852
+  s_6bff547dd35d7d::t_675c46ec640d48 311,323,334,347-352,361,383
+  s_6bff547dd35d7d::t_3fb86f25bc31a1 298
+pgqueuer/ports/repository.py
+  s_6bff547dd35d7d::t_a710fb33aa5394 161-168
+  s_6bff547dd35d7d::t_825acd1b404daf 71,83,94
+  s_6bff547dd35d7d::t_bec53808c93dcf 35-38,42
+pgqueuer/adapters/persistence/query_helpers.py
+  s_6bff547dd35d7d::t_b6f59b878f895c 16
+  s_6bff547dd35d7d::t_82c45ede224e21 26,46-50,60
+test/test_query_helpers.py
+  s_6bff547dd35d7d::t_8dc850ed40cb41 23,61,79,155
+  s_6bff547dd35d7d::t_4d3e816bcbcd6f 43,97,116,135,175
+  s_6bff547dd35d7d::t_98f6cf4134e9c9 194-213
+mkdocs.yml
+  s_6bff547dd35d7d::t_0eed8bd80d5201 85
+test/test_serialize_key.py
+  s_6bff547dd35d7d::t_1f007d4eb112e6 1-18,20-314
+  s_6bff547dd35d7d::t_c2de793863f2ef 19
+pgqueuer/domain/models.py
+  s_6bff547dd35d7d::t_2d80b66bd76b7d 206-224
+docs/guides/per-key-serialization.md
+  s_6bff547dd35d7d::t_82254e34e6d25b 1-148
+pgqueuer/core/executors.py
+  s_6bff547dd35d7d::t_edca84201b9398 56
+pgqueuer/core/applications.py
+  s_6bff547dd35d7d::t_ea6dc7281e2e8d 236,248
+pgqueuer/adapters/inmemory/queries.py
+  s_6bff547dd35d7d::t_8d0a56155c5241 261-271,288-294,297-298,302-324
+  s_6bff547dd35d7d::t_3126763057e9ee 154
+  s_6bff547dd35d7d::t_770add50dcebd2 155,169
+  s_6bff547dd35d7d::t_fccccedce0721b 822-869
+  s_6bff547dd35d7d::t_b25686254497ce 101,113,124,127
+pgqueuer/adapters/persistence/qb.py
+  s_6bff547dd35d7d::t_e08fe0315e5486 808
+  s_6bff547dd35d7d::t_e586b0990ec7c0 564
+  s_6bff547dd35d7d::t_69f57c9b999c7c 450-451
+  s_6bff547dd35d7d::t_e9bc0bce89903b 419-445,452,484,503
+  s_6bff547dd35d7d::t_7218b96f26e726 73,86-92
+  s_6bff547dd35d7d::t_3c430ba1a2b694 549-552,556
+  s_6bff547dd35d7d::t_1d209be8105aa8 278-280
+  s_6bff547dd35d7d::t_1ff5844cebeed7 790-807,809-824
+pgqueuer/core/qm.py
+  s_6bff547dd35d7d::t_f652f46e7fca05 206,227-234,256-257,273
+  s_6bff547dd35d7d::t_71ac81ecafd0ac 308,310
+  s_6bff547dd35d7d::t_e945236d113a8f 258
+  s_6bff547dd35d7d::t_39194a67371025 309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c9868889dec824f38f2e6fcd8f645f9897cf0c81",
+  "prompts": {},
+  "sessions": {
+    "s_6bff547dd35d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4bae17d0-1205-4e45-a548-3a16b2c347ed",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
