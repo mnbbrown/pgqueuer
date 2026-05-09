@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import functools
 import inspect
@@ -27,7 +28,7 @@ AsyncContextCrontab: TypeAlias = Callable[
 ScheduleCrontab: TypeAlias = AsyncCrontab | AsyncContextCrontab
 
 
-TerminalFailureReason = Literal["max_attempts", "non_retryable"]
+TerminalFailureReason = Literal["max_attempts", "non_retryable", "timeout"]
 OnTerminalFailure: TypeAlias = Callable[
     [Exception, models.Job, TerminalFailureReason],
     None | Awaitable[None],
@@ -124,6 +125,10 @@ class DatabaseRetryEntrypointExecutor(EntrypointExecutor):
     ``on_terminal_failure`` fires once when retries are exhausted or skipped,
     giving observability hooks (Sentry capture, custom metrics) a single
     well-defined call site for terminal failures.
+
+    ``max_time`` optionally bounds a single attempt with ``asyncio.wait_for``.
+    On timeout the callback fires with ``reason='timeout'`` and the error
+    propagates terminally (no retry). ``None`` (default) disables the timeout.
     """
 
     max_attempts: int = 5
@@ -132,27 +137,45 @@ class DatabaseRetryEntrypointExecutor(EntrypointExecutor):
     backoff_multiplier: float = 2.0
     non_retryable_errors: tuple[type[Exception], ...] = dataclasses.field(default_factory=tuple)
     on_terminal_failure: OnTerminalFailure | None = None
+    max_time: timedelta | None = None
 
     async def execute(self, job: models.Job, context: models.Context) -> None:
         try:
-            await super().execute(job, context)
+            if self.max_time is None:
+                await super().execute(job, context)
+            else:
+                await asyncio.wait_for(
+                    super().execute(job, context),
+                    self.max_time.total_seconds(),
+                )
         except errors.RetryRequested:
             raise
         except errors.NonRetryableError as e:
             await self._handle_terminal(e, job, "non_retryable")
             raise
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            # Treat as terminal "timeout" only when our wait_for produced it.
+            # When max_time is None, a handler-raised TimeoutError falls through
+            # to the generic retry classification.
+            if self.max_time is not None:
+                await self._handle_terminal(e, job, "timeout")
+                raise
+            await self._classify_and_retry(e, job)
         except Exception as e:
-            if self.non_retryable_errors and isinstance(e, self.non_retryable_errors):
-                await self._handle_terminal(e, job, "non_retryable")
-                raise
-            if job.attempts >= self.max_attempts:
-                await self._handle_terminal(e, job, "max_attempts")
-                raise
-            delay = min(
-                self.initial_delay * (self.backoff_multiplier**job.attempts),
-                self.max_delay,
-            )
-            raise errors.RetryRequested(delay=delay, reason=str(e)) from e
+            await self._classify_and_retry(e, job)
+
+    async def _classify_and_retry(self, exc: Exception, job: models.Job) -> None:
+        if self.non_retryable_errors and isinstance(exc, self.non_retryable_errors):
+            await self._handle_terminal(exc, job, "non_retryable")
+            raise exc
+        if job.attempts >= self.max_attempts:
+            await self._handle_terminal(exc, job, "max_attempts")
+            raise exc
+        delay = min(
+            self.initial_delay * (self.backoff_multiplier**job.attempts),
+            self.max_delay,
+        )
+        raise errors.RetryRequested(delay=delay, reason=str(exc)) from exc
 
     async def _handle_terminal(
         self,

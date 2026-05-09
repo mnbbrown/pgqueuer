@@ -4,6 +4,7 @@ DatabaseRetryEntrypointExecutor.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 from pgqueuer.core.applications import PgQueuer
@@ -321,3 +322,199 @@ async def test_terminal_failure_postgres(apgdriver: AsyncpgDriver) -> None:
     assert len(exception_logs) == 1
     # Sanity that traceback shape matches RetryRequested branch
     assert isinstance(retry_logs[0].traceback, TracebackRecord)
+
+
+# ---------------------------------------------------------------------------
+# max_time / timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_max_time_fires_callback_with_timeout_reason() -> None:
+    pq = PgQueuer.in_memory()
+    calls: list[tuple[str, str]] = []
+    invocations = 0
+
+    def on_terminal(exc: Exception, job: Job, reason: str) -> None:
+        calls.append((type(exc).__name__, reason))
+
+    @pq.entrypoint(
+        "slow_ep",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=10,
+            initial_delay=timedelta(0),
+            max_time=timedelta(milliseconds=50),
+            on_terminal_failure=on_terminal,
+        ),
+    )
+    async def handler(job: Job) -> None:
+        nonlocal invocations
+        invocations += 1
+        # Sleep longer than max_time to guarantee the timeout fires.
+        await asyncio.sleep(2)
+
+    await pq.qm.queries.enqueue("slow_ep", b"data", priority=0)
+    await pq.qm.run(
+        batch_size=10,
+        mode=QueueExecutionMode.drain,
+        max_concurrent_tasks=100,
+        dequeue_timeout=timedelta(seconds=1),
+    )
+
+    # Single attempt, single terminal callback with reason="timeout"
+    assert invocations == 1
+    assert len(calls) == 1
+    exc_name, reason = calls[0]
+    assert reason == "timeout"
+    assert exc_name in ("TimeoutError", "CancelledError")
+
+
+async def test_max_time_does_not_fire_when_handler_completes_in_time() -> None:
+    pq = PgQueuer.in_memory()
+    calls: list[str] = []
+
+    def on_terminal(exc: Exception, job: Job, reason: str) -> None:
+        calls.append(reason)
+
+    @pq.entrypoint(
+        "fast_ep",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=2,
+            initial_delay=timedelta(0),
+            max_time=timedelta(seconds=5),
+            on_terminal_failure=on_terminal,
+        ),
+    )
+    async def handler(job: Job) -> None:
+        return None
+
+    await pq.qm.queries.enqueue("fast_ep", b"data", priority=0)
+    await pq.qm.run(
+        batch_size=10,
+        mode=QueueExecutionMode.drain,
+        max_concurrent_tasks=100,
+        dequeue_timeout=timedelta(seconds=1),
+    )
+
+    assert calls == []
+
+
+async def test_max_time_none_disables_timeout() -> None:
+    """With max_time=None, a slow handler runs to completion (within
+    pgqueuer's own dequeue_timeout) — no timeout fires."""
+    pq = PgQueuer.in_memory()
+    calls: list[str] = []
+
+    def on_terminal(exc: Exception, job: Job, reason: str) -> None:
+        calls.append(reason)
+
+    @pq.entrypoint(
+        "no_timeout_ep",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=2,
+            initial_delay=timedelta(0),
+            max_time=None,
+            on_terminal_failure=on_terminal,
+        ),
+    )
+    async def handler(job: Job) -> None:
+        await asyncio.sleep(0.1)  # would trigger any small max_time
+
+    await pq.qm.queries.enqueue("no_timeout_ep", b"data", priority=0)
+    await pq.qm.run(
+        batch_size=10,
+        mode=QueueExecutionMode.drain,
+        max_concurrent_tasks=100,
+        dequeue_timeout=timedelta(seconds=1),
+    )
+
+    assert calls == []
+
+
+async def test_handler_raised_timeout_error_falls_through_to_retry_when_max_time_none() -> None:
+    """If max_time is None and the handler itself raises TimeoutError, it is
+    classified by the generic retry path — not as a 'timeout' terminal."""
+    pq = PgQueuer.in_memory()
+    calls: list[tuple[str, str]] = []
+
+    def on_terminal(exc: Exception, job: Job, reason: str) -> None:
+        calls.append((type(exc).__name__, reason))
+
+    @pq.entrypoint(
+        "self_timeout_ep",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=1,  # exhaust on first attempt → terminal
+            initial_delay=timedelta(0),
+            max_time=None,
+            on_terminal_failure=on_terminal,
+        ),
+    )
+    async def handler(job: Job) -> None:
+        raise TimeoutError("my own timeout")
+
+    await pq.qm.queries.enqueue("self_timeout_ep", b"data", priority=0)
+    await pq.qm.run(
+        batch_size=10,
+        mode=QueueExecutionMode.drain,
+        max_concurrent_tasks=100,
+        dequeue_timeout=timedelta(seconds=1),
+    )
+
+    # Reason is "max_attempts", NOT "timeout" — the handler-raised TimeoutError
+    # is treated as a generic exception when max_time is None.
+    assert calls == [("TimeoutError", "max_attempts")]
+
+
+async def test_max_time_with_postgres(apgdriver: AsyncpgDriver) -> None:
+    """Real-DB: timeout fires terminal callback once and the job is recorded
+    as a single attempt with status='exception' (default on_failure='delete')."""
+    qm = QueueManager(Queries(apgdriver))
+    calls: list[tuple[str, str]] = []
+
+    def on_terminal(exc: Exception, job: Job, reason: str) -> None:
+        calls.append((type(exc).__name__, reason))
+
+    @qm.entrypoint(
+        "pg_timeout_ep",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=5,
+            initial_delay=timedelta(0),
+            max_time=timedelta(milliseconds=50),
+            on_terminal_failure=on_terminal,
+        ),
+    )
+    async def handler(job: Job) -> None:
+        await asyncio.sleep(2)
+
+    await qm.queries.enqueue("pg_timeout_ep", b"x", priority=0)
+    await qm.run(
+        batch_size=10,
+        mode=QueueExecutionMode.drain,
+        max_concurrent_tasks=100,
+        dequeue_timeout=timedelta(seconds=1),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1] == "timeout"
+
+    logs = await qm.queries.queue_log()
+    ep_logs = [log for log in logs if log.entrypoint == "pg_timeout_ep"]
+    # Single attempt: zero retry log entries, exactly one terminal exception entry
+    assert sum(1 for log in ep_logs if log.status == "queued" and log.traceback is not None) == 0
+    assert sum(1 for log in ep_logs if log.status == "exception") == 1
+
+
+def test_max_time_default_is_none() -> None:
+    """Default behaviour: no timeout. Same as commit 1."""
+    executor = DatabaseRetryEntrypointExecutor(
+        parameters=EntrypointExecutorParameters(
+            concurrency_limit=0,
+            func=_async_noop,
+        ),
+        max_attempts=1,
+    )
+    assert executor.max_time is None
