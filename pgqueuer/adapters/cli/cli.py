@@ -578,11 +578,21 @@ def failed(
 def requeue(
     ctx: Context,
     ids: list[int] = typer.Argument(..., help="Job IDs to re-queue."),
+    preserve_attempts: bool = typer.Option(
+        False,
+        "--preserve-attempts",
+        help=(
+            "Keep the existing attempts count instead of resetting to 0. "
+            "With this set, the job consumes its remaining max_attempts "
+            "budget — useful when you want to give a parked job exactly "
+            "one more shot rather than a full new retry budget."
+        ),
+    ),
 ) -> None:
     async def run() -> None:
         async with yield_queries(ctx, qb.DBSettings()) as q:
             typed_ids = [types.JobId(i) for i in ids]
-            await q.requeue_jobs(typed_ids)
+            await q.requeue_jobs(typed_ids, reset_attempts=not preserve_attempts)
             print(f"Re-queued {len(typed_ids)} job(s).")
 
     asyncio_run(run())

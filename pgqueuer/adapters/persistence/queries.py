@@ -477,14 +477,25 @@ class Queries:
             traceback_record.model_dump_json() if traceback_record else None,
         )
 
-    async def requeue_jobs(self, ids: list[models.JobId]) -> None:
+    async def requeue_jobs(
+        self,
+        ids: list[models.JobId],
+        reset_attempts: bool = True,
+    ) -> None:
         """Move failed jobs back to queued status for reprocessing.
 
-        Resets attempts to 0 and sets execute_after to NOW().
-        Only affects jobs with status ``'failed'``.
+        Sets ``execute_after`` to NOW(). Only affects jobs with status ``'failed'``.
+
+        Args:
+            ids: Job IDs to re-queue.
+            reset_attempts: When True (default) resets ``attempts`` to 0 so the
+                job gets a fresh retry budget. When False, preserves the
+                existing ``attempts`` value — useful when an operator wants to
+                give a parked job exactly one more shot rather than a full new
+                budget under ``max_attempts``.
         """
         await self.driver.execute(
-            self.qbq.build_requeue_jobs_query(),
+            self.qbq.build_requeue_jobs_query(reset_attempts=reset_attempts),
             ids,
         )
 

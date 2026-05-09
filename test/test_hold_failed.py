@@ -461,3 +461,94 @@ async def test_pg_failed_releases_dedupe_key(apgdriver: AsyncpgDriver) -> None:
     # is excluded from the unique index (status IN ('queued', 'picked')).
     ids = await queries.enqueue("dedupe_hold", b"second", priority=1, dedupe_key="dk1")
     assert len(ids) == 1
+
+
+# ---------------------------------------------------------------------------
+# requeue_jobs(reset_attempts=False) — preserve attempts for "one more shot"
+# ---------------------------------------------------------------------------
+
+
+async def test_inmemory_requeue_preserves_attempts_when_flag_false(
+    queries: InMemoryQueries,
+) -> None:
+    """reset_attempts=False keeps the existing attempts count."""
+    await queries.enqueue("ep", b"payload", priority=1)
+    qm_id = uuid.uuid4()
+    jobs = await queries.dequeue(
+        10, {"ep": EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
+    )
+    job = jobs[0]
+
+    # Two retries, then hold.
+    await queries.retry_job(job, timedelta(0), None)
+    await queries.retry_job(job, timedelta(0), None)
+    jobs2 = await queries.dequeue(
+        10, {"ep": EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
+    )
+    assert jobs2[0].attempts == 2
+    await queries.log_jobs([(jobs2[0], "failed", None)])
+
+    await queries.requeue_jobs([jobs2[0].id], reset_attempts=False)
+
+    jobs3 = await queries.dequeue(
+        10, {"ep": EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
+    )
+    assert jobs3[0].attempts == 2  # preserved, not reset
+
+
+async def test_pg_requeue_preserves_attempts_when_flag_false(
+    apgdriver: AsyncpgDriver,
+) -> None:
+    """Postgres: reset_attempts=False preserves attempts so the next failure
+    consumes the existing budget — operator gets exactly one more shot."""
+    queries = Queries(apgdriver)
+    pgq = PgQueuer(apgdriver)
+
+    @pgq.entrypoint(
+        "preserve_attempts_test",
+        on_failure="hold",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=2,
+            initial_delay=timedelta(seconds=0),
+        ),
+    )
+    async def handler(job: Job) -> None:
+        raise RuntimeError("always fails")
+
+    await queries.enqueue("preserve_attempts_test", b"payload", priority=1)
+
+    async with async_timeout.timeout(10):
+        await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
+
+    failed = await queries.list_failed_jobs()
+    assert len(failed) == 1
+    attempts_before = failed[0].attempts
+    assert attempts_before > 0
+
+    await queries.requeue_jobs([failed[0].id], reset_attempts=False)
+
+    pgq2 = PgQueuer(apgdriver)
+    attempts_seen: list[int] = []
+
+    @pgq2.entrypoint(
+        "preserve_attempts_test",
+        on_failure="hold",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=2,
+            initial_delay=timedelta(seconds=0),
+        ),
+    )
+    async def handler2(job: Job) -> None:
+        attempts_seen.append(job.attempts)
+        raise RuntimeError("fails again")
+
+    async with async_timeout.timeout(10):
+        await pgq2.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
+
+    # Re-runs picked up with attempts preserved (not 0)
+    assert attempts_seen[0] == attempts_before
+    # And lands back at failed quickly (next exception consumes the budget)
+    failed_after = await queries.list_failed_jobs()
+    assert len(failed_after) == 1

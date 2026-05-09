@@ -675,11 +675,15 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
         SELECT id, 'queued', entrypoint, priority, $3::JSONB FROM retry
         """  # noqa: E501
 
-    def build_requeue_jobs_query(self) -> str:
+    def build_requeue_jobs_query(self, reset_attempts: bool = True) -> str:
+        # When reset_attempts=False, attempts is preserved so the next failure
+        # consumes the existing retry budget (one more shot under max_attempts)
+        # rather than handing the job a fresh budget.
+        attempts_clause = "attempts = 0," if reset_attempts else ""
         return f"""WITH requeued AS (
             UPDATE {self.settings.queue_table}
             SET status = 'queued', execute_after = NOW(), updated = NOW(),
-                attempts = 0, queue_manager_id = NULL
+                {attempts_clause} queue_manager_id = NULL
             WHERE id = ANY($1::integer[]) AND status = 'failed'
             RETURNING id, entrypoint, priority
         )

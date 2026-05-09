@@ -104,7 +104,11 @@ class QueueRepositoryPort(Protocol):
         traceback_record: models.TracebackRecord | None,
     ) -> None: ...
 
-    async def requeue_jobs(self, ids: list[models.JobId]) -> None: ...
+    async def requeue_jobs(
+        self,
+        ids: list[models.JobId],
+        reset_attempts: bool = True,
+    ) -> None: ...
 
     async def list_failed_jobs(
         self, limit: int = 100, order: SortOrder = "DESC"

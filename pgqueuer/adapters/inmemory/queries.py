@@ -424,7 +424,11 @@ class InMemoryQueries:
 
     # -- requeue_jobs ----------------------------------------------------------
 
-    async def requeue_jobs(self, ids: list[JobId]) -> None:
+    async def requeue_jobs(
+        self,
+        ids: list[JobId],
+        reset_attempts: bool = True,
+    ) -> None:
         now = utc_now()
         for jid in ids:
             j = self._jobs.get(int(jid))
@@ -432,7 +436,8 @@ class InMemoryQueries:
                 j["status"] = "queued"
                 j["execute_after"] = now
                 j["updated"] = now
-                j["attempts"] = 0
+                if reset_attempts:
+                    j["attempts"] = 0
                 j["queue_manager_id"] = None
                 self._log.append(
                     {
