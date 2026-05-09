@@ -42,9 +42,7 @@ async def test_inmemory_enqueue_allows_multiple_with_same_serialize_key(
 @pytest.mark.asyncio
 async def test_inmemory_dispatch_serializes_per_key(queries: InMemoryQueries) -> None:
     """Same key → at most one picked at a time."""
-    await queries.enqueue(
-        ["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"]
-    )
+    await queries.enqueue(["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"])
     qm_id = uuid.uuid4()
     params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
 
@@ -65,7 +63,9 @@ async def test_inmemory_dispatch_serializes_per_key(queries: InMemoryQueries) ->
 async def test_inmemory_different_keys_run_in_parallel(queries: InMemoryQueries) -> None:
     """Different keys must dispatch concurrently."""
     await queries.enqueue(
-        ["ep", "ep", "ep"], [None, None, None], [0, 0, 0],
+        ["ep", "ep", "ep"],
+        [None, None, None],
+        [0, 0, 0],
         serialize_key=["a", "b", "c"],
     )
     qm_id = uuid.uuid4()
@@ -88,9 +88,7 @@ async def test_inmemory_null_serialize_key_unaffected(queries: InMemoryQueries) 
 @pytest.mark.asyncio
 async def test_inmemory_flag_off_no_per_key_behavior(queries: InMemoryQueries) -> None:
     """With the flag off, all same-key jobs dispatch normally."""
-    await queries.enqueue(
-        ["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"]
-    )
+    await queries.enqueue(["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"])
     qm_id = uuid.uuid4()
     # Default: serialize_dispatch_per_key=False
     params = {"ep": EntrypointExecutionParameter(0)}
@@ -102,7 +100,9 @@ async def test_inmemory_flag_off_no_per_key_behavior(queries: InMemoryQueries) -
 async def test_inmemory_fifo_within_key(queries: InMemoryQueries) -> None:
     """Same key, same priority → strict FIFO by id."""
     ids = await queries.enqueue(
-        ["ep", "ep", "ep"], [None, None, None], [0, 0, 0],
+        ["ep", "ep", "ep"],
+        [None, None, None],
+        [0, 0, 0],
         serialize_key=["k", "k", "k"],
     )
     qm_id = uuid.uuid4()
@@ -135,7 +135,9 @@ async def test_inmemory_priority_ordering_within_key(queries: InMemoryQueries) -
 @pytest.mark.asyncio
 async def test_inmemory_list_blocked_keys(queries: InMemoryQueries) -> None:
     await queries.enqueue(
-        ["ep", "ep", "ep"], [None, None, None], [0, 0, 0],
+        ["ep", "ep", "ep"],
+        [None, None, None],
+        [0, 0, 0],
         serialize_key=["k", "k", "other"],
     )
     qm_id = uuid.uuid4()
@@ -181,18 +183,12 @@ async def test_pg_partial_unique_index_prevents_two_picked(apgdriver: Driver) ->
     import asyncpg
 
     q = Queries(apgdriver)
-    ids = await q.enqueue(
-        ["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"]
-    )
+    ids = await q.enqueue(["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"])
     # First UPDATE succeeds.
-    await apgdriver.execute(
-        "UPDATE pgqueuer SET status='picked' WHERE id = $1", int(ids[0])
-    )
+    await apgdriver.execute("UPDATE pgqueuer SET status='picked' WHERE id = $1", int(ids[0]))
     # Second must fail with a unique constraint violation.
     with pytest.raises(asyncpg.UniqueViolationError):
-        await apgdriver.execute(
-            "UPDATE pgqueuer SET status='picked' WHERE id = $1", int(ids[1])
-        )
+        await apgdriver.execute("UPDATE pgqueuer SET status='picked' WHERE id = $1", int(ids[1]))
 
 
 @pytest.mark.asyncio
@@ -217,7 +213,9 @@ async def test_pg_dispatch_serializes_per_key(apgdriver: Driver) -> None:
 async def test_pg_different_keys_run_in_parallel(apgdriver: Driver) -> None:
     q = Queries(apgdriver)
     await q.enqueue(
-        ["ep", "ep", "ep"], [None, None, None], [0, 0, 0],
+        ["ep", "ep", "ep"],
+        [None, None, None],
+        [0, 0, 0],
         serialize_key=["a", "b", "c"],
     )
     qm_id = uuid.uuid4()
@@ -255,7 +253,9 @@ async def test_pg_priority_ordering_within_key(apgdriver: Driver) -> None:
 async def test_pg_list_blocked_keys(apgdriver: Driver) -> None:
     q = Queries(apgdriver)
     await q.enqueue(
-        ["ep", "ep", "ep"], [None, None, None], [0, 0, 0],
+        ["ep", "ep", "ep"],
+        [None, None, None],
+        [0, 0, 0],
         serialize_key=["k", "k", "other"],
     )
     qm_id = uuid.uuid4()

@@ -858,9 +858,7 @@ class InMemoryQueries:
                         (now - leader["updated"]).total_seconds() if leader is not None else None
                     ),
                     leader_heartbeat_age_seconds=(
-                        (now - leader["heartbeat"]).total_seconds()
-                        if leader is not None
-                        else None
+                        (now - leader["heartbeat"]).total_seconds() if leader is not None else None
                     ),
                 )
             )

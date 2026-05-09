@@ -44,9 +44,7 @@ def normalize_enqueue_params(
     normed_dedupe_key = dedupe_key if isinstance(dedupe_key, list) else [dedupe_key]
 
     serialize_key = [None] * len(normed_entrypoint) if serialize_key is None else serialize_key
-    normed_serialize_key = (
-        serialize_key if isinstance(serialize_key, list) else [serialize_key]
-    )
+    normed_serialize_key = serialize_key if isinstance(serialize_key, list) else [serialize_key]
 
     headers = [None] * len(normed_entrypoint) if headers is None else headers
     normed_headers = headers if isinstance(headers, list) else [headers]
