@@ -1,0 +1,23 @@
+test/test_serialize_key.py
+  s_6bff547dd35d7d::t_e3b84e7872a854 45,66-68,91,103-105,138-140,186,188,191,216-218,256-258
+pgqueuer/adapters/persistence/query_helpers.py
+  s_6bff547dd35d7d::t_e3b84e7872a854 47
+pgqueuer/adapters/inmemory/queries.py
+  s_6bff547dd35d7d::t_e3b84e7872a854 861
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "3d11026af2caada4f4a8e58b0cde5bcbc03bb18c",
+  "prompts": {},
+  "sessions": {
+    "s_6bff547dd35d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4bae17d0-1205-4e45-a548-3a16b2c347ed",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
