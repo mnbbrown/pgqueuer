@@ -13,6 +13,7 @@ class NormedEnqueueParam:
     execute_after: list[timedelta]
     dedupe_key: list[str | None]
     headers: list[dict | None]
+    serialize_key: list[str | None]
 
 
 def normalize_enqueue_params(
@@ -22,6 +23,7 @@ def normalize_enqueue_params(
     execute_after: timedelta | None | list[timedelta | None] = None,
     dedupe_key: str | list[str | None] | None = None,
     headers: dict | list[dict | None] | None = None,
+    serialize_key: str | list[str | None] | None = None,
 ) -> NormedEnqueueParam:
     """Normalize parameters for enqueue operations to handle both single and batch inputs."""
     normed_entrypoint = entrypoint if isinstance(entrypoint, list) else [entrypoint]
@@ -41,6 +43,11 @@ def normalize_enqueue_params(
     dedupe_key = [None] * len(normed_entrypoint) if dedupe_key is None else dedupe_key
     normed_dedupe_key = dedupe_key if isinstance(dedupe_key, list) else [dedupe_key]
 
+    serialize_key = [None] * len(normed_entrypoint) if serialize_key is None else serialize_key
+    normed_serialize_key = (
+        serialize_key if isinstance(serialize_key, list) else [serialize_key]
+    )
+
     headers = [None] * len(normed_entrypoint) if headers is None else headers
     normed_headers = headers if isinstance(headers, list) else [headers]
 
@@ -50,6 +57,7 @@ def normalize_enqueue_params(
         payload=normed_payload,
         execute_after=normed_execute_after,
         dedupe_key=normed_dedupe_key,
+        serialize_key=normed_serialize_key,
         headers=normed_headers,
     )
 

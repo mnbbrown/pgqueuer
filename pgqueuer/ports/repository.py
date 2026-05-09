@@ -32,9 +32,14 @@ class EntrypointExecutionParameter:
 
     Attributes:
         concurrency_limit (int): Max number of concurrent executions (0 = unlimited).
+        serialize_dispatch_per_key (bool): When True, jobs for this entrypoint
+            sharing the same non-NULL ``serialize_key`` are dispatched at most
+            one-at-a-time, in priority/FIFO order. Jobs with different keys (or
+            NULL keys) run normally.
     """
 
     concurrency_limit: int
+    serialize_dispatch_per_key: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,7 @@ class QueueRepositoryPort(Protocol):
         execute_after: timedelta | None = None,
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
+        serialize_key: str | None = None,
     ) -> list[models.JobId]: ...
 
     @overload
@@ -74,6 +80,7 @@ class QueueRepositoryPort(Protocol):
         execute_after: list[timedelta | None] | None = None,
         dedupe_key: list[str | None] | None = None,
         headers: list[dict[str, str] | None] | None = None,
+        serialize_key: list[str | None] | None = None,
     ) -> list[models.JobId]: ...
 
     async def enqueue(
@@ -84,6 +91,7 @@ class QueueRepositoryPort(Protocol):
         execute_after: timedelta | None | list[timedelta | None] = None,
         dedupe_key: str | list[str | None] | None = None,
         headers: dict[str, str] | list[dict[str, str] | None] | None = None,
+        serialize_key: str | list[str | None] | None = None,
     ) -> list[models.JobId]: ...
 
     async def log_jobs(
@@ -148,6 +156,14 @@ class QueueRepositoryPort(Protocol):
 
     async def next_deferred_eta(self, entrypoints: list[str]) -> timedelta | None:
         """Return time until the soonest deferred job becomes eligible, or None."""
+        ...
+
+    async def list_blocked_keys(
+        self,
+        entrypoints: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[models.BlockedKey]:
+        """List serialize_keys with queued jobs blocked behind a running peer."""
         ...
 
 

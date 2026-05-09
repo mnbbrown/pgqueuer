@@ -53,6 +53,7 @@ class EntrypointExecutorParameters:
     func: Entrypoint
     accepts_context: bool = False
     on_failure: types.OnFailure = "delete"
+    serialize_dispatch_per_key: bool = False
 
 
 @dataclasses.dataclass

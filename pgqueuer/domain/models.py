@@ -203,6 +203,25 @@ class LogStatistics(BaseModel):
     status: JOB_STATUS
 
 
+class BlockedKey(BaseModel):
+    """A serialize_key with at least one queued job blocked behind a leader.
+
+    Surfaced by ``Queries.list_blocked_keys`` so operators can see which keys
+    are not making progress and how stale the leader is. ``leader_id`` and the
+    leader-age fields are NULL when the queued jobs are blocked only by an
+    earlier-priority/id queued peer (no current leader).
+    """
+
+    entrypoint: str
+    serialize_key: str
+    queued_count: int
+    oldest_queued_created: AwareDatetime
+    oldest_queued_age_seconds: float
+    leader_id: JobId | None
+    leader_age_seconds: float | None
+    leader_heartbeat_age_seconds: float | None
+
+
 @dataclasses.dataclass
 class Context:
     """

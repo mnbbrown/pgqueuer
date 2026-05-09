@@ -233,6 +233,7 @@ class PgQueuer:
         concurrency_limit: int = 0,
         accepts_context: bool = False,
         on_failure: OnFailure = "delete",
+        serialize_dispatch_per_key: bool = False,
         executor_factory: Callable[
             [EntrypointExecutorParameters],
             AbstractEntrypointExecutor,
@@ -244,6 +245,7 @@ class PgQueuer:
             concurrency_limit=concurrency_limit,
             accepts_context=accepts_context,
             on_failure=on_failure,
+            serialize_dispatch_per_key=serialize_dispatch_per_key,
             executor_factory=executor_factory,
         )
 

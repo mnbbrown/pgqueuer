@@ -98,6 +98,7 @@ class InMemoryQueries:
         execute_after: timedelta | None = None,
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
+        serialize_key: str | None = None,
     ) -> list[JobId]: ...
 
     @overload
@@ -109,6 +110,7 @@ class InMemoryQueries:
         execute_after: list[timedelta | None] | None = None,
         dedupe_key: list[str | None] | None = None,
         headers: list[dict[str, str] | None] | None = None,
+        serialize_key: list[str | None] | None = None,
     ) -> list[JobId]: ...
 
     async def enqueue(
@@ -119,9 +121,10 @@ class InMemoryQueries:
         execute_after: timedelta | None | list[timedelta | None] = None,
         dedupe_key: str | list[str | None] | None = None,
         headers: dict[str, str] | list[dict[str, str] | None] | None = None,
+        serialize_key: str | list[str | None] | None = None,
     ) -> list[JobId]:
         normed = query_helpers.normalize_enqueue_params(
-            entrypoint, payload, priority, execute_after, dedupe_key, headers
+            entrypoint, payload, priority, execute_after, dedupe_key, headers, serialize_key
         )
 
         active_tracer = self.tracer or tracing.TRACER.tracer
@@ -148,6 +151,8 @@ class InMemoryQueries:
             ea = now + normed.execute_after[i]
             hdr = to_json(normed.headers[i]).decode()
 
+            dk = normed.dedupe_key[i]
+            sk = normed.serialize_key[i]
             job_dict: dict[str, Any] = {
                 "id": job_id,
                 "priority": normed.priority[i],
@@ -161,9 +166,9 @@ class InMemoryQueries:
                 "attempts": 0,
                 "queue_manager_id": None,
                 "headers": hdr,
+                "serialize_key": sk,
             }
 
-            dk = normed.dedupe_key[i]
             if dk is not None:
                 self._dedupe_index[dk] = job_id
 
@@ -253,6 +258,17 @@ class InMemoryQueries:
         """Select jobs respecting concurrency constraints."""
         selected: list[dict[str, Any]] = []
         seen: set[int] = set()
+        # (entrypoint, serialize_key) tuples already in 'picked' state, plus those
+        # we're about to pick this dispatch.
+        blocked_keys: set[tuple[str, str]] = {
+            (j["entrypoint"], j["serialize_key"])
+            for j in self._jobs.values()
+            if (
+                j["status"] == "picked"
+                and j["entrypoint"] in entrypoints
+                and j.get("serialize_key") is not None
+            )
+        }
         for j in candidates:
             if len(selected) >= batch_size:
                 break
@@ -269,10 +285,43 @@ class InMemoryQueries:
             ):
                 continue
 
+            sk = j.get("serialize_key")
+            if params.serialize_dispatch_per_key and sk is not None:
+                if (ep, sk) in blocked_keys:
+                    continue
+                if self._has_earlier_queued_peer(ep, sk, j["priority"], j["id"]):
+                    continue
+
             selected.append(j)
             picked_per_ep[ep] = picked_per_ep.get(ep, 0) + 1
+            if sk is not None:
+                blocked_keys.add((ep, sk))
 
         return selected
+
+    def _has_earlier_queued_peer(
+        self,
+        entrypoint: str,
+        serialize_key: str,
+        priority: int,
+        job_id: int,
+    ) -> bool:
+        """Return True if some other queued job for the same key precedes this one
+        under the priority-aware FIFO ordering (higher priority first; same priority,
+        lower id first)."""
+        for other in self._jobs.values():
+            if (
+                other["status"] != "queued"
+                or other["entrypoint"] != entrypoint
+                or other.get("serialize_key") != serialize_key
+                or other["id"] == job_id
+            ):
+                continue
+            if other["priority"] > priority:
+                return True
+            if other["priority"] == priority and other["id"] < job_id:
+                return True
+        return False
 
     def _write_picked_logs(
         self,
@@ -769,6 +818,54 @@ class InMemoryQueries:
         if candidates:
             return min(candidates) - now
         return None
+
+    async def list_blocked_keys(
+        self,
+        entrypoints: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[models.BlockedKey]:
+        now = utc_now()
+        ep_filter = set(entrypoints) if entrypoints else None
+        # Group queued by (entrypoint, serialize_key)
+        queued_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for j in self._jobs.values():
+            if j["status"] != "queued" or j.get("serialize_key") is None:
+                continue
+            if ep_filter and j["entrypoint"] not in ep_filter:
+                continue
+            queued_groups.setdefault((j["entrypoint"], j["serialize_key"]), []).append(j)
+        # Index picked by (entrypoint, serialize_key)
+        picked_lookup: dict[tuple[str, str], dict[str, Any]] = {
+            (j["entrypoint"], j["serialize_key"]): j
+            for j in self._jobs.values()
+            if j["status"] == "picked" and j.get("serialize_key") is not None
+        }
+        out: list[models.BlockedKey] = []
+        for (ep, sk), jobs in queued_groups.items():
+            leader = picked_lookup.get((ep, sk))
+            if len(jobs) <= 1 and leader is None:
+                continue
+            oldest = min(jobs, key=lambda j: j["created"])
+            out.append(
+                models.BlockedKey(
+                    entrypoint=ep,
+                    serialize_key=sk,
+                    queued_count=len(jobs),
+                    oldest_queued_created=oldest["created"],
+                    oldest_queued_age_seconds=(now - oldest["created"]).total_seconds(),
+                    leader_id=models.JobId(leader["id"]) if leader is not None else None,
+                    leader_age_seconds=(
+                        (now - leader["updated"]).total_seconds() if leader is not None else None
+                    ),
+                    leader_heartbeat_age_seconds=(
+                        (now - leader["heartbeat"]).total_seconds()
+                        if leader is not None
+                        else None
+                    ),
+                )
+            )
+        out.sort(key=lambda b: b.oldest_queued_age_seconds, reverse=True)
+        return out[:limit]
 
     # -- Private helpers -------------------------------------------------------
 

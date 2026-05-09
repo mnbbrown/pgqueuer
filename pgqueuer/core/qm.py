@@ -203,6 +203,7 @@ class QueueManager:
         concurrency_limit: int = 0,
         accepts_context: bool = False,
         on_failure: types.OnFailure = "delete",
+        serialize_dispatch_per_key: bool = False,
         executor_factory: Callable[
             [executors.EntrypointExecutorParameters],
             executors.AbstractEntrypointExecutor,
@@ -223,6 +224,14 @@ class QueueManager:
             on_failure (OnFailure): What to do when a job fails terminally. ``"delete"``
                 removes the job (default); ``"hold"`` parks it with status ``'failed'``
                 so it can be inspected and manually re-queued.
+            serialize_dispatch_per_key (bool): When True, jobs for this entrypoint
+                sharing the same non-NULL ``serialize_key`` are dispatched at most
+                one-at-a-time, in priority then FIFO order. Jobs with different
+                keys run in parallel; jobs with no key are unaffected. Use it
+                together with the ``serialize_key=`` argument on ``enqueue`` to
+                pin work to a resource (per-user, per-tenant, etc.). See
+                ``docs/guides/per-key-serialization.md`` for caveats including
+                head-of-line blocking.
 
         Returns:
             Callable[[T], T]: A decorator that registers the function as an entrypoint.
@@ -244,6 +253,9 @@ class QueueManager:
         if not isinstance(accepts_context, bool):
             raise ValueError("accepts_context must be boolean")
 
+        if not isinstance(serialize_dispatch_per_key, bool):
+            raise ValueError("serialize_dispatch_per_key must be boolean")
+
         if on_failure not in get_args(types.OnFailure):
             raise ValueError(f"on_failure must be one of {get_args(types.OnFailure)}.")
 
@@ -258,6 +270,7 @@ class QueueManager:
                         concurrency_limit=concurrency_limit,
                         accepts_context=accepts_context,
                         on_failure=on_failure,
+                        serialize_dispatch_per_key=serialize_dispatch_per_key,
                     )
                 ),
             )
@@ -292,6 +305,9 @@ class QueueManager:
             entrypoints = {
                 x: EntrypointExecutionParameter(
                     concurrency_limit=self.entrypoint_registry[x].parameters.concurrency_limit,
+                    serialize_dispatch_per_key=self.entrypoint_registry[
+                        x
+                    ].parameters.serialize_dispatch_per_key,
                 )
                 for x in self.entrypoints_below_capacity_limits()
             }

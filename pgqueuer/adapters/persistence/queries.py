@@ -295,6 +295,7 @@ class Queries:
             queue_manager_id,
             global_concurrency_limit,
             heartbeat_timeout,
+            [x.serialize_dispatch_per_key for x in entrypoints.values()],
         )
         return [models.Job.model_validate(row) for row in rows]
 
@@ -307,6 +308,7 @@ class Queries:
         execute_after: timedelta | None = None,
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
+        serialize_key: str | None = None,
     ) -> list[models.JobId]: ...
 
     @overload
@@ -318,6 +320,7 @@ class Queries:
         execute_after: list[timedelta | None] | None = None,
         dedupe_key: list[str | None] | None = None,
         headers: list[dict[str, str] | None] | None = None,
+        serialize_key: list[str | None] | None = None,
     ) -> list[models.JobId]: ...
 
     async def enqueue(
@@ -328,6 +331,7 @@ class Queries:
         execute_after: timedelta | None | list[timedelta | None] = None,
         dedupe_key: str | list[str | None] | None = None,
         headers: dict[str, str] | list[dict[str, str] | None] | None = None,
+        serialize_key: str | list[str | None] | None = None,
     ) -> list[models.JobId]:
         """
         Insert new jobs into the queue.
@@ -340,6 +344,12 @@ class Queries:
             entrypoint (str | list[str]): The entrypoint(s) associated with the job(s).
             payload (bytes | None | list[bytes | None]): The payload(s) for the job(s).
             priority (int | list[int]): The priority level(s) for the job(s).
+            serialize_key (str | list[str | None] | None): Optional per-job key
+                used for per-key dispatch serialization. When the entrypoint is
+                registered with ``serialize_dispatch_per_key=True``, jobs sharing
+                the same non-NULL ``serialize_key`` are dispatched at most
+                one-at-a-time, in priority then FIFO order. Multiple jobs with
+                the same ``serialize_key`` may queue concurrently.
 
         Returns:
             list[models.JobId]: A list of JobId instances representing the IDs of the enqueued jobs.
@@ -348,7 +358,7 @@ class Queries:
             ValueError: If the lengths of the lists provided do not match when using multiple jobs.
         """
         normed_params = query_helpers.normalize_enqueue_params(
-            entrypoint, payload, priority, execute_after, dedupe_key, headers
+            entrypoint, payload, priority, execute_after, dedupe_key, headers, serialize_key
         )
         active_tracer = self.tracer or tracing.TRACER.tracer
         if active_tracer:
@@ -370,6 +380,7 @@ class Queries:
                     normed_params.execute_after,
                     normed_params.dedupe_key,
                     [to_json(x).decode() for x in normed_params.headers],
+                    normed_params.serialize_key,
                 )
             ]
         except Exception as e:
@@ -711,6 +722,26 @@ class Queries:
         rows = await self.driver.fetch(self.qbq.build_next_deferred_eta_query(), entrypoints)
         return rows[0]["eta"] if rows and rows[0]["eta"] is not None else None
 
+    async def list_blocked_keys(
+        self,
+        entrypoints: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[models.BlockedKey]:
+        """List ``serialize_key``s with queued jobs blocked behind a running peer.
+
+        Returns one row per ``(entrypoint, serialize_key)`` that has either a
+        ``picked`` peer (a running "leader") or more than one queued job. Use
+        for diagnosing head-of-line blocking when a key has stopped making
+        progress (a stuck/long-running leader, a ``failed`` job parked with
+        ``on_failure='hold'``, etc.).
+        """
+        rows = await self.driver.fetch(
+            self.qbq.build_blocked_keys_query(),
+            entrypoints,
+            limit,
+        )
+        return [models.BlockedKey.model_validate(row) for row in rows]
+
 
 @dataclasses.dataclass
 class SyncQueries:
@@ -745,6 +776,7 @@ class SyncQueries:
         execute_after: timedelta | None = None,
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
+        serialize_key: str | None = None,
     ) -> list[models.JobId]: ...
 
     @overload
@@ -756,6 +788,7 @@ class SyncQueries:
         execute_after: list[timedelta | None] | None = None,
         dedupe_key: list[str | None] | None = None,
         headers: list[dict[str, str] | None] | None = None,
+        serialize_key: list[str | None] | None = None,
     ) -> list[models.JobId]: ...
 
     def enqueue(
@@ -766,6 +799,7 @@ class SyncQueries:
         execute_after: timedelta | None | list[timedelta | None] = None,
         dedupe_key: str | list[str | None] | None = None,
         headers: dict[str, str] | list[dict[str, str] | None] | None = None,
+        serialize_key: str | list[str | None] | None = None,
     ) -> list[models.JobId]:
         """
         Insert new jobs into the queue.
@@ -792,6 +826,7 @@ class SyncQueries:
             execute_after,
             dedupe_key,
             headers,
+            serialize_key,
         )
 
         active_tracer = self.tracer or tracing.TRACER.tracer
@@ -814,6 +849,7 @@ class SyncQueries:
                     normed_params.execute_after,
                     normed_params.dedupe_key,
                     [to_json(x).decode() for x in normed_params.headers],
+                    normed_params.serialize_key,
                 )
             ]
         except Exception as e:

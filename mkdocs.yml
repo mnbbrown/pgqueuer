@@ -83,6 +83,7 @@ nav:
   - Guides:
       - Job Processing:
           - Concurrency Control: guides/rate-limiting.md
+          - Per-Key Serialization: guides/per-key-serialization.md
           - Custom Executors: guides/custom-executors.md
           - Job Cancellation: guides/job-cancellation.md
           - Completion Tracking: guides/completion-tracking.md
