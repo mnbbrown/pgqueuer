@@ -3,6 +3,7 @@
 from pgqueuer.domain.errors import (
     DuplicateJobError,
     FailingListenerError,
+    NonRetryableError,
     PgqException,
     RetryException,
     RetryRequested,
@@ -11,6 +12,7 @@ from pgqueuer.domain.errors import (
 __all__ = [
     "DuplicateJobError",
     "FailingListenerError",
+    "NonRetryableError",
     "PgqException",
     "RetryException",
     "RetryRequested",

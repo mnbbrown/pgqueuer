@@ -7,7 +7,7 @@ import functools
 import inspect
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, TypeAlias, TypeVar, cast
+from typing import Awaitable, Callable, Literal, TypeAlias, TypeVar, cast
 
 from croniter import croniter
 
@@ -25,6 +25,13 @@ AsyncContextCrontab: TypeAlias = Callable[
     [models.Schedule, models.ScheduleContext], Awaitable[None]
 ]
 ScheduleCrontab: TypeAlias = AsyncCrontab | AsyncContextCrontab
+
+
+TerminalFailureReason = Literal["max_attempts", "non_retryable"]
+OnTerminalFailure: TypeAlias = Callable[
+    [Exception, models.Job, TerminalFailureReason],
+    None | Awaitable[None],
+]
 
 
 def is_async_callable(obj: Callable[..., object] | object) -> bool:
@@ -106,26 +113,58 @@ class DatabaseRetryEntrypointExecutor(EntrypointExecutor):
     On failure the job is re-queued via :class:`~pgqueuer.domain.errors.RetryRequested`
     with exponential backoff derived from ``job.attempts``.  After *max_attempts*
     consecutive failures the exception propagates as a terminal failure.
+
+    Two opt-in escape hatches sit alongside the default retry loop:
+
+    * ``non_retryable_errors`` — a tuple of exception types that should bypass
+      retry and propagate immediately (e.g. ``(ValidationError,)``).
+    * :class:`~pgqueuer.domain.errors.NonRetryableError` raised inside the
+      handler does the same thing programmatically.
+
+    ``on_terminal_failure`` fires once when retries are exhausted or skipped,
+    giving observability hooks (Sentry capture, custom metrics) a single
+    well-defined call site for terminal failures.
     """
 
     max_attempts: int = 5
     initial_delay: timedelta = dataclasses.field(default_factory=lambda: timedelta(seconds=1))
     max_delay: timedelta = dataclasses.field(default_factory=lambda: timedelta(minutes=5))
     backoff_multiplier: float = 2.0
+    non_retryable_errors: tuple[type[Exception], ...] = dataclasses.field(default_factory=tuple)
+    on_terminal_failure: OnTerminalFailure | None = None
 
     async def execute(self, job: models.Job, context: models.Context) -> None:
         try:
             await super().execute(job, context)
         except errors.RetryRequested:
             raise
+        except errors.NonRetryableError as e:
+            await self._handle_terminal(e, job, "non_retryable")
+            raise
         except Exception as e:
+            if self.non_retryable_errors and isinstance(e, self.non_retryable_errors):
+                await self._handle_terminal(e, job, "non_retryable")
+                raise
             if job.attempts >= self.max_attempts:
+                await self._handle_terminal(e, job, "max_attempts")
                 raise
             delay = min(
                 self.initial_delay * (self.backoff_multiplier**job.attempts),
                 self.max_delay,
             )
             raise errors.RetryRequested(delay=delay, reason=str(e)) from e
+
+    async def _handle_terminal(
+        self,
+        exc: Exception,
+        job: models.Job,
+        reason: TerminalFailureReason,
+    ) -> None:
+        if self.on_terminal_failure is None:
+            return
+        result = self.on_terminal_failure(exc, job, reason)
+        if inspect.isawaitable(result):
+            await result
 
 
 ######## Schedulers ########

@@ -32,6 +32,16 @@ class RetryRequested(RetryException):
         self.reason = reason
 
 
+class NonRetryableError(PgqException):
+    """Raise inside a job handler to skip retry and fail terminally.
+
+    When raised inside a handler wrapped by :class:`DatabaseRetryEntrypointExecutor`,
+    the executor bypasses its retry logic and lets the exception propagate as a
+    terminal failure (delete or hold, depending on the entrypoint's ``on_failure``
+    setting).
+    """
+
+
 class DuplicateJobError(PgqException):
     """Raised when enqueue violates a deduplication constraint."""
 
