@@ -15,6 +15,7 @@ import uuid
 from collections.abc import MutableMapping
 from contextlib import nullcontext, suppress
 from datetime import timedelta
+from time import perf_counter
 from typing import AsyncGenerator, Callable, get_args
 
 import anyio
@@ -87,6 +88,12 @@ class QueueManager:
     # Optional injected tracer; falls back to the global ``tracing.TRACER.tracer``.
     tracer: tracing.TracingProtocol | None = None
 
+    # Optional observability hooks. None = zero overhead. Callbacks must be
+    # synchronous and non-blocking — they fire in hot paths.
+    on_dequeue: Callable[[float, int], None] | None = None
+    on_dispatch: Callable[[int, int], None] | None = None
+    on_listener_health_check: Callable[[bool, float], None] | None = None
+
     # Per job.
     job_context: dict[models.JobId, models.Context] = dataclasses.field(
         init=False,
@@ -142,7 +149,15 @@ class QueueManager:
         """
 
         while not self.shutdown.is_set():
-            await self.listener_healthy(timeout=interval)
+            start = perf_counter()
+            try:
+                await self.listener_healthy(timeout=interval)
+            except errors.FailingListenerError:
+                if self.on_listener_health_check is not None:
+                    self.on_listener_health_check(False, perf_counter() - start)
+                raise
+            if self.on_listener_health_check is not None:
+                self.on_listener_health_check(True, perf_counter() - start)
             with suppress(TimeoutError, asyncio.TimeoutError):
                 await asyncio.wait_for(
                     self.shutdown.wait(),
@@ -289,15 +304,18 @@ class QueueManager:
             )
             effective_batch = min(batch_size, effective_batch)
 
-            if not (
-                jobs := await self.queries.dequeue(
-                    batch_size=effective_batch,
-                    entrypoints=entrypoints,
-                    queue_manager_id=self.queue_manager_id,
-                    global_concurrency_limit=global_concurrency_limit,
-                    heartbeat_timeout=heartbeat_timeout,
-                )
-            ):
+            start = perf_counter()
+            jobs = await self.queries.dequeue(
+                batch_size=effective_batch,
+                entrypoints=entrypoints,
+                queue_manager_id=self.queue_manager_id,
+                global_concurrency_limit=global_concurrency_limit,
+                heartbeat_timeout=heartbeat_timeout,
+            )
+            if self.on_dequeue is not None:
+                self.on_dequeue(perf_counter() - start, len(jobs))
+
+            if not jobs:
                 break
 
             for job in jobs:
@@ -493,6 +511,8 @@ class QueueManager:
                     task_manager.add(
                         asyncio.create_task(self._dispatch(job, jbuff, hbuff, heartbeat_timeout))
                     )
+                    if self.on_dispatch is not None:
+                        self.on_dispatch(len(task_manager.tasks), max_concurrent_tasks)
 
                     with contextlib.suppress(asyncio.QueueEmpty):
                         notice_event_listener.get_nowait()
