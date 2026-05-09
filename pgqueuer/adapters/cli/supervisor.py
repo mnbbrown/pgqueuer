@@ -88,6 +88,7 @@ async def runit(
     mode: types.QueueExecutionMode,
     max_concurrent_tasks: int | None,
     shutdown_on_listener_failure: bool,
+    heartbeat_timeout: timedelta = timedelta(seconds=30),
 ) -> None:
     """
     Supervise and manage the lifecycle of a queue management instance.
@@ -102,6 +103,7 @@ async def runit(
         mode (types.QueueExecutionMode): What mode to start the execution on
         max_concurrent_tasks (int | None): How many concurrent tasks to allow.
         shutdown_on_listener_failure (bool): Automatically shutdown if a listener fails
+        heartbeat_timeout (timedelta): Stale-heartbeat threshold for job re-pickup.
 
     Raises:
         ValueError: If restart_delay is negative.
@@ -122,6 +124,7 @@ async def runit(
                     mode,
                     max_concurrent_tasks,
                     shutdown_on_listener_failure,
+                    heartbeat_timeout,
                 )
         except Exception as exc:
             if not restart_on_failure:
@@ -142,6 +145,7 @@ async def run_manager(
     mode: types.QueueExecutionMode,
     max_concurrent_tasks: int | None,
     shutdown_on_listener_failure: bool,
+    heartbeat_timeout: timedelta = timedelta(seconds=30),
 ) -> None:
     """
     Run a queue management instance.
@@ -150,6 +154,7 @@ async def run_manager(
         manager: The instance to run (QueueManager, SchedulerManager, or PgQueuer).
         dequeue_timeout: Timeout duration for dequeuing jobs.
         batch_size: Number of jobs to process per batch.
+        heartbeat_timeout: Stale-heartbeat threshold for job re-pickup.
 
     Raises:
         NotImplementedError: If the instance type is unsupported.
@@ -162,6 +167,7 @@ async def run_manager(
             mode=mode,
             max_concurrent_tasks=max_concurrent_tasks,
             shutdown_on_listener_failure=shutdown_on_listener_failure,
+            heartbeat_timeout=heartbeat_timeout,
         )
     elif isinstance(manager, sm.SchedulerManager):
         await manager.run()
@@ -172,6 +178,7 @@ async def run_manager(
             mode=mode,
             max_concurrent_tasks=max_concurrent_tasks,
             shutdown_on_listener_failure=shutdown_on_listener_failure,
+            heartbeat_timeout=heartbeat_timeout,
         )
     else:
         raise NotImplementedError(f"Unsupported instance type: {type(manager)}")

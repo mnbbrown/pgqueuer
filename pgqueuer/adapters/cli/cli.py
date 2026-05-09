@@ -458,6 +458,17 @@ def run(
         "--shutdown-on-listener-failure",
         help="Shutdown the manager if the listener fails.",
     ),
+    heartbeat_timeout: float = typer.Option(
+        30.0,
+        "--heartbeat-timeout",
+        help=(
+            "Seconds after which a 'picked' job with a stale heartbeat becomes "
+            "eligible for re-pickup by another worker. Heartbeats are sent "
+            "automatically at half this interval. Tune above your longest "
+            "expected event-loop stall (NOT longest handler runtime — async "
+            "handlers stay healthy as long as the loop keeps spinning)."
+        ),
+    ),
 ) -> None:
     """
     Run the job manager, pulling tasks from the queue and handling them with workers.
@@ -481,6 +492,7 @@ def run(
             mode=mode,
             max_concurrent_tasks=max_concurrent_tasks,
             shutdown_on_listener_failure=shutdown_on_listener_failure,
+            heartbeat_timeout=timedelta(seconds=heartbeat_timeout),
         )
     )
 
