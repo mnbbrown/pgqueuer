@@ -3,9 +3,10 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: ['**']
   schedule:
     - cron: "0 */6 * * *"
+  workflow_dispatch:
 jobs:
   run-benchmark:
     strategy:
