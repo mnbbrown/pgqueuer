@@ -1,0 +1,37 @@
+pgqueuer/adapters/persistence/queries.py
+  s_cc9dee0684b2c5::t_8a789c439e3bea 391-459
+  s_cc9dee0684b2c5::t_eb850747cc4218 928-996
+pgqueuer/adapters/persistence/qb.py
+  s_cc9dee0684b2c5::t_de12057664267c 577-580,582-593,595-638
+  s_cc9dee0684b2c5::t_af90375f5a4f64 581
+  s_cc9dee0684b2c5::t_4ff7889f07a28b 594
+test/test_queries.py
+  s_cc9dee0684b2c5::t_58cb6339a6d2e8 504-563
+docs/guides/reliability.md
+  s_cc9dee0684b2c5::t_b1c7a897d2be75 125-142,196
+pgqueuer/adapters/inmemory/queries.py
+  s_cc9dee0684b2c5::t_79adb35e71a9fe 196-307
+test/test_inmemory.py
+  s_cc9dee0684b2c5::t_58f2114b68c3db 81-121
+pgqueuer/ports/repository.py
+  s_cc9dee0684b2c5::t_55bf1aecef9468 97-124
+docs/guides/per-key-serialization.md
+  s_cc9dee0684b2c5::t_3f8d53369df6f3 173-176
+  s_cc9dee0684b2c5::t_388ebe22573144 157-172,177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "8cd3d1db78746c1f8cfe59bcc263602ef95381bd",
+  "prompts": {},
+  "sessions": {
+    "s_cc9dee0684b2c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e122b-0877-7b40-9da4-d3af02df288b",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
