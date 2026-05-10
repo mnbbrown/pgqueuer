@@ -1,0 +1,21 @@
+docs/guides/reliability.md
+  s_79fe7a58b54fe5::t_4e18124fb13739 129-133
+docs/guides/per-key-serialization.md
+  s_79fe7a58b54fe5::t_4e18124fb13739 116-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "73795be7520462e25d683f1531a3efef540a6827",
+  "prompts": {},
+  "sessions": {
+    "s_79fe7a58b54fe5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e10d0-d990-7c42-b851-85c4191e3df6",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
