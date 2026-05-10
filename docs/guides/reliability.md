@@ -122,6 +122,26 @@ If a job with the same `dedupe_key` already exists in `queued` or `picked` state
 `DuplicateJobError` is raised. Once the job reaches a terminal state (`successful`,
 `exception`, `canceled`, `deleted`), the key is released and the same key can be used again.
 
+Use `enqueue_if_no_dedupe()` when duplicate requests should be skipped instead of
+reported as exceptions:
+
+```python
+job_id = await queries.enqueue_if_no_dedupe(
+    "send_invoice",
+    payload=b'{"order_id": 42}',
+    dedupe_key="invoice-order-42",
+)
+
+if job_id is None:
+    ...
+```
+
+This uses the same `queued` plus `picked` uniqueness rule as `enqueue(...,
+dedupe_key=...)`, but expresses the idempotent case as an atomic insert-or-skip
+operation. If the conflicting row is still `picked`, PgQueuer briefly retries
+before returning `None` so a just-completed job can release its dedupe slot via
+the completion buffer.
+
 **Choosing a dedupe key:** Use a stable, business-meaningful identifier — for example,
 `f"invoice-{order_id}"` or `f"report-{date}-{user_id}"`. This turns enqueue into an
 idempotent operation: calling it twice with the same key and payload is safe.
@@ -175,6 +195,6 @@ or use `pgq dashboard` from the CLI.
 | Durable retry across workers | `RetryRequested` / `DatabaseRetryEntrypointExecutor` |
 | Worker crash recovery | `heartbeat_timeout` |
 | Terminal failure parking | `on_failure="hold"` |
-| Duplicate enqueue prevention | `dedupe_key` unique constraint |
+| Duplicate enqueue prevention | `dedupe_key` unique constraint / `enqueue_if_no_dedupe()` |
 | Failure inspection | `pgqueuer_log` with traceback |
 | Audit trail | `pgqueuer_log` for all terminal states |

@@ -15,6 +15,7 @@ import dataclasses
 import uuid
 from contextlib import suppress
 from datetime import timedelta
+from time import monotonic, sleep
 from typing import TYPE_CHECKING, overload
 
 if TYPE_CHECKING:
@@ -31,6 +32,9 @@ from pgqueuer.ports import tracing
 from pgqueuer.ports.driver import Driver, SyncDriver
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 from pgqueuer.ports.tracing import TracingProtocol
+
+DEDUPE_CONFLICT_RETRY_TIMEOUT = timedelta(milliseconds=250)
+DEDUPE_CONFLICT_RETRY_INTERVAL = timedelta(milliseconds=10)
 
 
 def is_unique_violation(exc: Exception) -> bool:
@@ -387,6 +391,95 @@ class Queries:
             if is_unique_violation(e):
                 raise errors.DuplicateJobError(normed_params.dedupe_key) from e
             raise
+
+    async def enqueue_if_no_queued(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        serialize_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        dedupe_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> models.JobId | None:
+        """Enqueue iff no job for this entrypoint and serialize key is queued."""
+        normalized_headers = headers
+        active_tracer = self.tracer or tracing.TRACER.tracer
+        if active_tracer:
+            (normalized_headers,) = merge_tracing_headers(
+                [headers],
+                active_tracer.trace_publish([entrypoint]),
+            )
+
+        try:
+            rows = await self.driver.fetch(
+                self.qbq.build_enqueue_if_no_queued_query(),
+                entrypoint,
+                serialize_key,
+                priority,
+                payload,
+                execute_after or timedelta(seconds=0),
+                dedupe_key,
+                to_json(normalized_headers).decode(),
+            )
+        except Exception as e:
+            if is_unique_violation(e):
+                raise errors.DuplicateJobError([dedupe_key]) from e
+            raise
+        return models.JobId(rows[0]["id"]) if rows else None
+
+    async def enqueue_if_no_dedupe(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        dedupe_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        serialize_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> models.JobId | None:
+        """Enqueue iff no job with this dedupe key is queued or picked."""
+        normalized_headers = headers
+        active_tracer = self.tracer or tracing.TRACER.tracer
+        if active_tracer:
+            (normalized_headers,) = merge_tracing_headers(
+                [headers],
+                active_tracer.trace_publish([entrypoint]),
+            )
+
+        deadline = monotonic() + DEDUPE_CONFLICT_RETRY_TIMEOUT.total_seconds()
+        while True:
+            rows = await self.driver.fetch(
+                self.qbq.build_enqueue_if_no_dedupe_query(),
+                entrypoint,
+                dedupe_key,
+                priority,
+                payload,
+                execute_after or timedelta(seconds=0),
+                to_json(normalized_headers).decode(),
+                serialize_key,
+            )
+            if rows:
+                return models.JobId(rows[0]["id"])
+
+            status = await self.active_dedupe_status(dedupe_key)
+            if status == "queued":
+                return None
+
+            now = monotonic()
+            if now >= deadline:
+                return None
+
+            if status == "picked":
+                await asyncio.sleep(
+                    min(DEDUPE_CONFLICT_RETRY_INTERVAL.total_seconds(), deadline - now)
+                )
+
+    async def active_dedupe_status(self, dedupe_key: str) -> str | None:
+        rows = await self.driver.fetch(self.qbq.build_active_dedupe_status_query(), dedupe_key)
+        return str(rows[0]["status"]) if rows else None
 
     async def queued_work(self, entrypoints: list[str]) -> int:
         rows = await self.driver.fetch(self.qbq.build_has_queued_work(), entrypoints)
@@ -855,6 +948,93 @@ class SyncQueries:
             if is_unique_violation(e):
                 raise errors.DuplicateJobError(normed_params.dedupe_key) from e
             raise
+
+    def enqueue_if_no_queued(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        serialize_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        dedupe_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> models.JobId | None:
+        """Enqueue iff no job for this entrypoint and serialize key is queued."""
+        normalized_headers = headers
+        active_tracer = self.tracer or tracing.TRACER.tracer
+        if active_tracer:
+            (normalized_headers,) = merge_tracing_headers(
+                [headers],
+                active_tracer.trace_publish([entrypoint]),
+            )
+
+        try:
+            rows = self.driver.fetch(
+                self.qbq.build_enqueue_if_no_queued_query(),
+                entrypoint,
+                serialize_key,
+                priority,
+                payload,
+                execute_after or timedelta(seconds=0),
+                dedupe_key,
+                to_json(normalized_headers).decode(),
+            )
+        except Exception as e:
+            if is_unique_violation(e):
+                raise errors.DuplicateJobError([dedupe_key]) from e
+            raise
+        return models.JobId(rows[0]["id"]) if rows else None
+
+    def enqueue_if_no_dedupe(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        dedupe_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        serialize_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> models.JobId | None:
+        """Enqueue iff no job with this dedupe key is queued or picked."""
+        normalized_headers = headers
+        active_tracer = self.tracer or tracing.TRACER.tracer
+        if active_tracer:
+            (normalized_headers,) = merge_tracing_headers(
+                [headers],
+                active_tracer.trace_publish([entrypoint]),
+            )
+
+        deadline = monotonic() + DEDUPE_CONFLICT_RETRY_TIMEOUT.total_seconds()
+        while True:
+            rows = self.driver.fetch(
+                self.qbq.build_enqueue_if_no_dedupe_query(),
+                entrypoint,
+                dedupe_key,
+                priority,
+                payload,
+                execute_after or timedelta(seconds=0),
+                to_json(normalized_headers).decode(),
+                serialize_key,
+            )
+            if rows:
+                return models.JobId(rows[0]["id"])
+
+            status = self.active_dedupe_status(dedupe_key)
+            if status == "queued":
+                return None
+
+            now = monotonic()
+            if now >= deadline:
+                return None
+
+            if status == "picked":
+                sleep(min(DEDUPE_CONFLICT_RETRY_INTERVAL.total_seconds(), deadline - now))
+
+    def active_dedupe_status(self, dedupe_key: str) -> str | None:
+        rows = self.driver.fetch(self.qbq.build_active_dedupe_status_query(), dedupe_key)
+        return str(rows[0]["status"]) if rows else None
 
     def queue_size(self) -> list[models.QueueStatistics]:
         """

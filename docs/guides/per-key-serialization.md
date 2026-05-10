@@ -154,6 +154,27 @@ This keeps at most one queued or picked `sync_customer` job per customer. Once
 the active job finishes, a new enqueue with the same `dedupe_key` can create a
 fresh follow-up job to capture newer changes.
 
+#### Coalesce only queued follow-up work
+
+Use `enqueue_if_no_queued()` when an already-running job should not suppress a
+fresh follow-up. PgQueuer checks only for a queued job with the same
+`(entrypoint, serialize_key)` and deliberately ignores picked jobs:
+
+```python
+key = f"customer:{customer_id}"
+
+job_id = await pgq.queries.enqueue_if_no_queued(
+    "sync_customer",
+    {"customer_id": customer_id},
+    serialize_key=key,
+)
+```
+
+This usually keeps one queued follow-up per resource without suppressing work
+behind a picked leader. Under concurrent producer races, more than one queued
+follow-up can be inserted because this helper does not add a database-level
+uniqueness constraint.
+
 #### Dedupe narrower than serialization
 
 Sometimes the serialization lane is broad, but duplicate detection is narrower:

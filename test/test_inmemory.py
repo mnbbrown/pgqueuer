@@ -78,6 +78,83 @@ async def test_dedupe_key_freed_after_log(queries: InMemoryQueries) -> None:
     assert len(ids2) == 1
 
 
+@pytest.mark.asyncio
+async def test_enqueue_if_no_dedupe_skips_active_duplicate(queries: InMemoryQueries) -> None:
+    job_id = await queries.enqueue_if_no_dedupe("ep", None, dedupe_key="dk1")
+    assert job_id is not None
+
+    assert await queries.enqueue_if_no_dedupe("ep", None, dedupe_key="dk1") is None
+
+    jobs = await queries.dequeue(
+        10,
+        {"ep": EntrypointExecutionParameter(0)},
+        uuid.uuid4(),
+        None,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == 1
+    assert await queries.enqueue_if_no_dedupe("ep", None, dedupe_key="dk1") is None
+
+    await queries.log_jobs([(jobs[0], "successful", None)])
+    assert await queries.enqueue_if_no_dedupe("ep", None, dedupe_key="dk1") is not None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_if_no_dedupe_retries_picked_conflict(queries: InMemoryQueries) -> None:
+    await queries.enqueue("ep", None, dedupe_key="dk1")
+    jobs = await queries.dequeue(
+        10,
+        {"ep": EntrypointExecutionParameter(0)},
+        uuid.uuid4(),
+        None,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == 1
+
+    enqueue_task = asyncio.create_task(queries.enqueue_if_no_dedupe("ep", None, dedupe_key="dk1"))
+    await asyncio.sleep(0.02)
+    await queries.log_jobs([(jobs[0], "successful", None)])
+
+    assert await enqueue_task is not None
+
+
+@pytest.mark.asyncio
+async def test_enqueue_if_no_queued_ignores_picked_leader(queries: InMemoryQueries) -> None:
+    first_id = await queries.enqueue_if_no_queued("ep", None, serialize_key="resource-1")
+    assert first_id is not None
+    assert await queries.enqueue_if_no_queued("ep", None, serialize_key="resource-1") is None
+
+    jobs = await queries.dequeue(
+        10,
+        {"ep": EntrypointExecutionParameter(0)},
+        uuid.uuid4(),
+        None,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == 1
+
+    followup_id = await queries.enqueue_if_no_queued("ep", None, serialize_key="resource-1")
+    assert followup_id is not None
+    assert followup_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_enqueue_if_no_queued_ignores_deferred_jobs(queries: InMemoryQueries) -> None:
+    deferred_id = await queries.enqueue_if_no_queued(
+        "ep",
+        None,
+        serialize_key="resource-1",
+        execute_after=timedelta(hours=4),
+    )
+    assert deferred_id is not None
+
+    immediate_id = await queries.enqueue_if_no_queued("ep", None, serialize_key="resource-1")
+    assert immediate_id is not None
+    assert immediate_id != deferred_id
+
+    assert await queries.enqueue_if_no_queued("ep", None, serialize_key="resource-1") is None
+
+
 # ---------------------------------------------------------------------------
 # Dequeue
 # ---------------------------------------------------------------------------

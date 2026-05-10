@@ -94,6 +94,34 @@ class QueueRepositoryPort(Protocol):
         serialize_key: str | list[str | None] | None = None,
     ) -> list[models.JobId]: ...
 
+    async def enqueue_if_no_queued(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        serialize_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        dedupe_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> models.JobId | None:
+        """Enqueue iff no job for this entrypoint and serialize key is queued."""
+        ...
+
+    async def enqueue_if_no_dedupe(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        dedupe_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        serialize_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> models.JobId | None:
+        """Enqueue iff no job with this dedupe key is queued or picked."""
+        ...
+
     async def log_jobs(
         self,
         job_status: list[

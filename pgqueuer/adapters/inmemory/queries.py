@@ -9,6 +9,7 @@ import asyncio
 import dataclasses
 import uuid
 from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any, overload
 
 from pydantic_core import to_json
@@ -22,6 +23,9 @@ from pgqueuer.domain.types import CronEntrypoint, JobId, ScheduleId, SortOrder
 from pgqueuer.ports import tracing
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 from pgqueuer.ports.tracing import TracingProtocol
+
+DEDUPE_CONFLICT_RETRY_TIMEOUT = timedelta(milliseconds=250)
+DEDUPE_CONFLICT_RETRY_INTERVAL = timedelta(milliseconds=10)
 
 
 @dataclasses.dataclass
@@ -192,6 +196,140 @@ class InMemoryQueries:
 
         await self.emit_table_changed("insert")
         return ids
+
+    async def enqueue_if_no_queued(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        serialize_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        dedupe_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> JobId | None:
+        if any(
+            job["entrypoint"] == entrypoint
+            and job.get("serialize_key") == serialize_key
+            and job["status"] == "queued"
+            and job["execute_after"] < utc_now()
+            for job in self._jobs.values()
+        ):
+            return None
+        if dedupe_key is not None and dedupe_key in self._dedupe_index:
+            raise errors.DuplicateJobError([dedupe_key])
+        return await self.insert_single_job(
+            entrypoint,
+            payload,
+            priority=priority,
+            execute_after=execute_after,
+            dedupe_key=dedupe_key,
+            headers=headers,
+            serialize_key=serialize_key,
+        )
+
+    async def enqueue_if_no_dedupe(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        dedupe_key: str,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        serialize_key: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> JobId | None:
+        deadline = monotonic() + DEDUPE_CONFLICT_RETRY_TIMEOUT.total_seconds()
+        while True:
+            if dedupe_key not in self._dedupe_index:
+                return await self.insert_single_job(
+                    entrypoint,
+                    payload,
+                    priority=priority,
+                    execute_after=execute_after,
+                    dedupe_key=dedupe_key,
+                    headers=headers,
+                    serialize_key=serialize_key,
+                )
+
+            status = self.active_dedupe_status(dedupe_key)
+            if status == "queued":
+                return None
+
+            now = monotonic()
+            if now >= deadline:
+                return None
+
+            if status == "picked":
+                await asyncio.sleep(
+                    min(DEDUPE_CONFLICT_RETRY_INTERVAL.total_seconds(), deadline - now)
+                )
+
+    def active_dedupe_status(self, dedupe_key: str) -> str | None:
+        job_id = self._dedupe_index.get(dedupe_key)
+        if job_id is None:
+            return None
+        job = self._jobs.get(job_id)
+        return str(job["status"]) if job is not None else None
+
+    async def insert_single_job(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        *,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        dedupe_key: str | None = None,
+        headers: dict[str, str] | None = None,
+        serialize_key: str | None = None,
+    ) -> JobId:
+        active_tracer = self.tracer or tracing.TRACER.tracer
+        normalized_headers = headers
+        if active_tracer:
+            (normalized_headers,) = merge_tracing_headers(
+                [headers],
+                active_tracer.trace_publish([entrypoint]),
+            )
+
+        now = utc_now()
+        job_id = self._next_job_id
+        self._next_job_id += 1
+
+        self._jobs[job_id] = {
+            "id": job_id,
+            "priority": priority,
+            "created": now,
+            "updated": now,
+            "heartbeat": now,
+            "execute_after": now + (execute_after or timedelta(seconds=0)),
+            "status": "queued",
+            "entrypoint": entrypoint,
+            "payload": payload,
+            "attempts": 0,
+            "queue_manager_id": None,
+            "headers": to_json(normalized_headers).decode(),
+            "serialize_key": serialize_key,
+        }
+
+        if dedupe_key is not None:
+            self._dedupe_index[dedupe_key] = job_id
+
+        self._log.append(
+            {
+                "id": self._next_log_id,
+                "created": now,
+                "job_id": job_id,
+                "status": "queued",
+                "priority": priority,
+                "entrypoint": entrypoint,
+                "traceback": None,
+                "aggregated": False,
+            }
+        )
+        self._next_log_id += 1
+
+        await self.emit_table_changed("insert")
+        return JobId(job_id)
 
     # -- dequeue ---------------------------------------------------------------
 

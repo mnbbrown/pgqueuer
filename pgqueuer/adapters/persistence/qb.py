@@ -574,6 +574,78 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
         RETURNING job_id AS id
         """
 
+    def build_enqueue_if_no_queued_query(self) -> str:
+        t = self.settings.queue_table
+        t_log = self.settings.queue_table_log
+        return f"""
+        WITH inserted AS (
+            INSERT INTO {t}
+            (
+                priority,
+                entrypoint,
+                payload,
+                execute_after,
+                dedupe_key,
+                headers,
+                serialize_key,
+                status
+            )
+            SELECT $3, $1, $4, NOW() + $5, $6, $7, $2, 'queued'
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM {t}
+                WHERE entrypoint = $1
+                  AND serialize_key = $2
+                  AND status = 'queued'
+                  AND execute_after < NOW()
+            )
+            RETURNING id, entrypoint, status, priority
+        )
+        INSERT INTO {t_log}
+        (job_id, status, entrypoint, priority)
+        SELECT id, 'queued', entrypoint, priority
+        FROM inserted
+        RETURNING job_id AS id
+        """
+
+    def build_enqueue_if_no_dedupe_query(self) -> str:
+        t = self.settings.queue_table
+        t_log = self.settings.queue_table_log
+        return f"""
+        WITH inserted AS (
+            INSERT INTO {t}
+            (
+                priority,
+                entrypoint,
+                payload,
+                execute_after,
+                dedupe_key,
+                headers,
+                serialize_key,
+                status
+            )
+            VALUES ($3, $1, $4, NOW() + $5, $2, $6, $7, 'queued')
+            ON CONFLICT (dedupe_key)
+                WHERE (status IN ('queued', 'picked') AND dedupe_key IS NOT NULL)
+            DO NOTHING
+            RETURNING id, entrypoint, status, priority
+        )
+        INSERT INTO {t_log}
+        (job_id, status, entrypoint, priority)
+        SELECT id, 'queued', entrypoint, priority
+        FROM inserted
+        RETURNING job_id AS id
+        """
+
+    def build_active_dedupe_status_query(self) -> str:
+        return f"""
+        SELECT status
+        FROM {self.settings.queue_table}
+        WHERE dedupe_key = $1
+          AND status IN ('queued', 'picked')
+        LIMIT 1
+        """
+
     def build_delete_from_queue_query(self) -> str:
         return f"""WITH deleted AS (
             DELETE FROM {self.settings.queue_table}

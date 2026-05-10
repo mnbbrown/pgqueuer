@@ -501,6 +501,143 @@ async def test_queue_log_queued_dedupe_key_raises_contains_dedupe_key(
     assert dedupe_key in raised.value.dedupe_key
 
 
+async def test_enqueue_if_no_dedupe_skips_without_exception(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+    dedupe_key = "test_enqueue_if_no_dedupe_skips_without_exception"
+
+    first_id = await aq.enqueue_if_no_dedupe("ep", b"first", dedupe_key=dedupe_key)
+    assert first_id is not None
+    assert await aq.enqueue_if_no_dedupe("ep", b"duplicate", dedupe_key=dedupe_key) is None
+
+    jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={"ep": queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=uuid.uuid4(),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == 1
+    assert await aq.enqueue_if_no_dedupe("ep", b"picked", dedupe_key=dedupe_key) is None
+
+    await aq.log_jobs([(jobs[0], "successful", None)])
+    assert await aq.enqueue_if_no_dedupe("ep", b"fresh", dedupe_key=dedupe_key) is not None
+
+    sq = queries.SyncQueries(pgdriver)
+    sync_key = "test_enqueue_if_no_dedupe_skips_without_exception_sync"
+    assert sq.enqueue_if_no_dedupe("sync_ep", None, dedupe_key=sync_key) is not None
+    assert sq.enqueue_if_no_dedupe("sync_ep", None, dedupe_key=sync_key) is None
+
+
+async def test_enqueue_if_no_dedupe_retries_picked_conflict(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+    dedupe_key = "test_enqueue_if_no_dedupe_retries_picked_conflict"
+
+    await aq.enqueue("ep", None, dedupe_key=dedupe_key)
+    jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={"ep": queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=uuid.uuid4(),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == 1
+
+    enqueue_task = asyncio.create_task(aq.enqueue_if_no_dedupe("ep", None, dedupe_key=dedupe_key))
+    await asyncio.sleep(0.02)
+    await aq.log_jobs([(jobs[0], "successful", None)])
+
+    assert await enqueue_task is not None
+
+    sync_key = "test_enqueue_if_no_dedupe_retries_picked_conflict_sync"
+    await aq.enqueue("sync_ep", None, dedupe_key=sync_key)
+    sync_jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={"sync_ep": queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=uuid.uuid4(),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(sync_jobs) == 1
+
+    sq = queries.SyncQueries(pgdriver)
+    sync_enqueue_task = asyncio.create_task(
+        asyncio.to_thread(sq.enqueue_if_no_dedupe, "sync_ep", None, dedupe_key=sync_key)
+    )
+    await asyncio.sleep(0.02)
+    await aq.log_jobs([(sync_jobs[0], "successful", None)])
+
+    assert await sync_enqueue_task is not None
+
+
+async def test_enqueue_if_no_queued_skips_only_queued_jobs(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+
+    first_id = await aq.enqueue_if_no_queued("ep", b"first", serialize_key="resource-1")
+    assert first_id is not None
+    assert await aq.enqueue_if_no_queued("ep", b"duplicate", serialize_key="resource-1") is None
+    assert await aq.enqueue_if_no_queued("other", b"other", serialize_key="resource-1") is not None
+    assert await aq.enqueue_if_no_queued("ep", b"other", serialize_key="resource-2") is not None
+
+    jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={"ep": queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=uuid.uuid4(),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert {job.payload for job in jobs} == {b"first", b"other"}
+
+    followup_id = await aq.enqueue_if_no_queued("ep", b"followup", serialize_key="resource-1")
+    assert followup_id is not None
+    assert followup_id != first_id
+
+    sq = queries.SyncQueries(pgdriver)
+    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is not None
+    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None
+
+
+async def test_enqueue_if_no_queued_ignores_deferred_jobs(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+
+    deferred_id = await aq.enqueue_if_no_queued(
+        "ep",
+        b"deferred",
+        serialize_key="resource-1",
+        execute_after=timedelta(hours=4),
+    )
+    assert deferred_id is not None
+
+    immediate_id = await aq.enqueue_if_no_queued("ep", b"immediate", serialize_key="resource-1")
+    assert immediate_id is not None
+    assert immediate_id != deferred_id
+
+    assert await aq.enqueue_if_no_queued("ep", b"duplicate", serialize_key="resource-1") is None
+
+    sq = queries.SyncQueries(pgdriver)
+    sync_deferred_id = sq.enqueue_if_no_queued(
+        "sync_ep",
+        None,
+        serialize_key="sync-resource",
+        execute_after=timedelta(hours=4),
+    )
+    assert sync_deferred_id is not None
+
+    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is not None
+    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None
+
+
 @pytest.mark.parametrize("limit", (None, 10))
 @pytest.mark.parametrize("last", (None, timedelta(minutes=5)))
 @pytest.mark.parametrize("N", (2, 10))
