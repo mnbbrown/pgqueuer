@@ -1,0 +1,49 @@
+pgqueuer/ports/repository.py
+  s_cc9dee0684b2c5::t_55bf1aecef9468 97-124
+pgqueuer/adapters/persistence/qb.py
+  s_cc9dee0684b2c5::t_772ef23efd448c 640-648
+  s_cc9dee0684b2c5::t_4ff7889f07a28b 594
+  s_cc9dee0684b2c5::t_af90375f5a4f64 581
+  s_cc9dee0684b2c5::t_de12057664267c 577-580,582-593,595-599,601-639
+  s_cc9dee0684b2c5::t_8e53f486e5b17c 600
+pgqueuer/adapters/persistence/queries.py
+  s_cc9dee0684b2c5::t_55e3aee86dbd94 18,36-37,452-481
+  s_cc9dee0684b2c5::t_eb850747cc4218 952-1008,1038
+  s_cc9dee0684b2c5::t_d4d831bfcdd585 482
+  s_cc9dee0684b2c5::t_8a789c439e3bea 395-451,483
+  s_cc9dee0684b2c5::t_894ff26d2b0f51 1009-1037
+docs/guides/per-key-serialization.md
+  s_cc9dee0684b2c5::t_3f8d53369df6f3 173-176
+  s_cc9dee0684b2c5::t_388ebe22573144 157-172,177
+test/test_queries.py
+  s_cc9dee0684b2c5::t_dfb3013cea92cb 608-640
+  s_cc9dee0684b2c5::t_58cb6339a6d2e8 504-533,578-607
+  s_cc9dee0684b2c5::t_0f3eaed262f340 534-577
+test/test_inmemory.py
+  s_cc9dee0684b2c5::t_58f2114b68c3db 81-102,122-140
+  s_cc9dee0684b2c5::t_8c6396e81869d7 141-157
+  s_cc9dee0684b2c5::t_0132e7131688df 103-121
+docs/guides/reliability.md
+  s_cc9dee0684b2c5::t_24497e3ff0642e 141-143
+  s_cc9dee0684b2c5::t_b1c7a897d2be75 125-140,144,198
+pgqueuer/adapters/inmemory/queries.py
+  s_cc9dee0684b2c5::t_a36202e40e97c7 12,27-28,242-270,272-273
+  s_cc9dee0684b2c5::t_79adb35e71a9fe 200-214,216-241,271,274-333
+  s_cc9dee0684b2c5::t_3c0083f7b3f65e 215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "2cc32d5ebcdcae20006027fd589e0a3c3293fcd5",
+  "prompts": {},
+  "sessions": {
+    "s_cc9dee0684b2c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e122b-0877-7b40-9da4-d3af02df288b",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}
