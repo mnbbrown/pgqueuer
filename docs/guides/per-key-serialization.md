@@ -113,7 +113,66 @@ Mitigations:
 | Default behavior | Always enforced | Opt-in per entrypoint |
 | Use it for... | Idempotency at the API edge | Per-resource ordering |
 
-You can use both on the same job — they answer different questions.
+You can use both on the same job — they answer different questions:
+
+- `serialize_key` controls **concurrency**.
+- `dedupe_key` controls **accumulation**.
+
+#### Serialize every event for a resource
+
+Use only `serialize_key` when every job matters, but same-resource jobs must
+not run concurrently:
+
+```python
+await pgq.queries.enqueue(
+    "sync_customer_event",
+    {"customer_id": customer_id, "event_id": event_id},
+    serialize_key=f"customer:{customer_id}",
+)
+```
+
+All events are retained. Different customers can run in parallel, while one
+customer's jobs are dispatched one-at-a-time.
+
+#### Coalesce repeated work for a resource
+
+Use both keys when repeated enqueue attempts should collapse while pending, but
+the active job should still exclude same-resource followers:
+
+```python
+key = f"customer:{customer_id}"
+
+await pgq.queries.enqueue(
+    "sync_customer",
+    {"customer_id": customer_id},
+    dedupe_key=f"sync_customer:{key}",
+    serialize_key=key,
+)
+```
+
+This keeps at most one queued or picked `sync_customer` job per customer. Once
+the active job finishes, a new enqueue with the same `dedupe_key` can create a
+fresh follow-up job to capture newer changes.
+
+#### Dedupe narrower than serialization
+
+Sometimes the serialization lane is broad, but duplicate detection is narrower:
+
+```python
+await pgq.queries.enqueue(
+    "send_customer_notification",
+    {"customer_id": customer_id, "notification_id": notification_id},
+    serialize_key=f"customer:{customer_id}",
+    dedupe_key=f"notification:{notification_id}",
+)
+```
+
+Notifications for the same customer do not send concurrently, but distinct
+notifications are still preserved. Only a duplicate notification enqueue is
+rejected.
+
+Treat `dedupe_key` values as application-level identifiers: prefix them with
+the workflow name so unrelated entrypoints do not accidentally share a key.
 
 ### Performance
 

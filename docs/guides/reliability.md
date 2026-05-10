@@ -126,6 +126,11 @@ If a job with the same `dedupe_key` already exists in `queued` or `picked` state
 `f"invoice-{order_id}"` or `f"report-{date}-{user_id}"`. This turns enqueue into an
 idempotent operation: calling it twice with the same key and payload is safe.
 
+`dedupe_key` can be combined with `serialize_key` when you want to both coalesce repeated
+enqueue attempts and prevent concurrent work for the same resource. See
+[Per-Key Dispatch Serialization](per-key-serialization.md#serialize_key-vs-dedupe_key)
+for examples.
+
 ## Poison Jobs
 
 A "poison job" is one that consistently causes worker crashes or hangs without updating its
