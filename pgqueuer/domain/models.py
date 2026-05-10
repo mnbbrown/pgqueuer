@@ -204,12 +204,12 @@ class LogStatistics(BaseModel):
 
 
 class BlockedKey(BaseModel):
-    """A serialize_key with at least one queued job blocked behind a leader.
+    """A serialize_key with at least one eligible queued job blocked.
 
     Surfaced by ``Queries.list_blocked_keys`` so operators can see which keys
-    are not making progress and how stale the leader is. ``leader_id`` and the
-    leader-age fields are NULL when the queued jobs are blocked only by an
-    earlier-priority/id queued peer (no current leader).
+    are not making progress and how stale any running leader is. ``leader_id``
+    and the leader-age fields are NULL when eligible queued jobs are blocked
+    only by an earlier-priority/id queued peer (no current leader).
     """
 
     entrypoint: str

@@ -163,7 +163,7 @@ class QueueRepositoryPort(Protocol):
         entrypoints: list[str] | None = None,
         limit: int = 100,
     ) -> list[models.BlockedKey]:
-        """List serialize_keys with queued jobs blocked behind a running peer."""
+        """List serialize_keys with eligible queued jobs currently blocked."""
         ...
 
 

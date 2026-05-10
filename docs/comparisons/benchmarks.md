@@ -49,6 +49,47 @@ python3 tools/benchmark.py --strategy drain --jobs 50000
 
 Use this when evaluating batch processing performance rather than sustained throughput.
 
+### Serialize Drain Strategy
+
+Enqueues a fixed number of jobs with configurable `serialize_key` distribution and
+reports both drain throughput and dequeue latency percentiles:
+
+```bash
+python3 tools/benchmark.py \
+  --strategy serialize-drain \
+  --jobs 100000 \
+  --key-mode unique \
+  --dequeue 5 \
+  --dequeue-batch-size 10 \
+  -d apg
+```
+
+`--key-mode` controls the shape of the workload:
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `none` | No `serialize_key` values are enqueued | Baseline for the current dequeue query |
+| `unique` | Every job has a distinct key | Measures per-key predicate overhead without blocking |
+| `round-robin` | Jobs are spread across `--keys` keys | Measures realistic key reuse |
+| `single` | Every job uses one key | Measures worst-case head-of-line serialization |
+
+The strategy also accepts `--serialize-dispatch-per-key/--no-serialize-dispatch-per-key`
+so you can isolate the cost of storing keys from the cost of enforcing per-key dispatch.
+
+For a broad pre/post comparison around a query change, run the same command on each
+Git ref and write JSON output:
+
+```bash
+git checkout <before-ref>
+python3 tools/benchmark.py --strategy drain --jobs 100000 -d apg --output-json before.json
+
+git checkout <after-ref>
+python3 tools/benchmark.py --strategy drain --jobs 100000 -d apg --output-json after.json
+```
+
+For targeted serialize-key measurements, use `serialize-drain` on the ref that includes
+the feature and compare `none`, `unique`, and `round-robin` key modes.
+
 ## asyncpg vs psycopg
 
 Both tests use identical settings: 10-second timer, 5 dequeue workers (batch size 10),

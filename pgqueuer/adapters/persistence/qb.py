@@ -418,11 +418,11 @@ class QueryQueueBuilder:
         t_log = self.settings.queue_table_log
         # The per-key clause excludes a candidate row q when its (entrypoint,
         # serialize_key) is "blocked": either another job with the same key is
-        # already 'picked', OR another queued peer with the same key has earlier
-        # priority/id under the (priority DESC, id ASC) ordering. The latter
-        # gives strict FIFO-per-key, mirroring Procrastinate's
-        # procrastinate_fetch_job_v2 (PR #1411). Short-circuits to false for
-        # entrypoints with the flag off, or for rows with NULL serialize_key.
+        # already 'picked', OR another eligible queued peer with the same key
+        # has earlier priority/id under the (priority DESC, id ASC) ordering.
+        # Future and failed jobs are outside the active dispatch lane.
+        # Short-circuits to false for entrypoints with the flag off, or for rows
+        # with NULL serialize_key.
         per_key_block = f"""(
           p.serialize_dispatch_per_key
           AND q.serialize_key IS NOT NULL
@@ -435,6 +435,7 @@ class QueryQueueBuilder:
                     other.status = 'picked'
                     OR (
                         other.status = 'queued'
+                        AND other.execute_after < NOW()
                         AND (
                             other.priority > q.priority
                             OR (other.priority = q.priority AND other.id < q.id)
@@ -809,6 +810,7 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
         FROM {self.settings.queue_table} q
         WHERE q.status = 'queued'
           AND q.serialize_key IS NOT NULL
+          AND q.execute_after < NOW()
           AND ($1::text[] IS NULL OR q.entrypoint = ANY($1))
         GROUP BY q.entrypoint, q.serialize_key
         HAVING COUNT(*) > 1

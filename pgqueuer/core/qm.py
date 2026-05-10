@@ -367,6 +367,7 @@ class QueueManager:
             (self.queries.qbe.settings.queue_table, "execute_after"),
             (self.queries.qbe.settings.queue_table, "headers"),
             (self.queries.qbe.settings.queue_table, "attempts"),
+            (self.queries.qbe.settings.queue_table, "serialize_key"),
             (self.queries.qbe.settings.queue_table_log, "traceback"),
         ):
             if not (await self.queries.table_has_column(table, column)):
@@ -388,6 +389,14 @@ class QueueManager:
             (
                 self.queries.qbe.settings.queue_table_log,
                 f"{self.queries.qbe.settings.queue_table_log}_job_id_status",
+            ),
+            (
+                self.queries.qbe.settings.queue_table,
+                f"{self.queries.qbe.settings.queue_table}_picked_serialize_key_idx",
+            ),
+            (
+                self.queries.qbe.settings.queue_table,
+                f"{self.queries.qbe.settings.queue_table}_queued_serialize_key_idx",
             ),
         ):
             if not (await self.queries.table_has_index(table, index)):

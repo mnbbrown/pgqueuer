@@ -36,11 +36,13 @@ filters out any candidate row whose `(entrypoint, serialize_key)` is "blocked":
 
 1. **Another job with the same key is already `picked`** — at-most-one-running
    per key is enforced. A partial unique index acts as a safety net.
-2. **Another *queued* peer with the same key has earlier priority/FIFO order**
-   under `(priority DESC, id ASC)` — only the head of the per-key queue is
-   eligible.
+2. **Another eligible *queued* peer with the same key has earlier
+   priority/FIFO order** under `(priority DESC, id ASC)` — only the head of
+   the currently runnable per-key queue is eligible.
 
-Rows with `serialize_key IS NULL` bypass the check entirely.
+Rows with `serialize_key IS NULL` bypass the check entirely. Jobs that are not
+currently runnable, such as future `execute_after` rows or jobs parked as
+`failed`, do not block the key.
 
 ### What counts as "earlier" (priority-aware FIFO)
 
@@ -76,28 +78,27 @@ for b in blocked:
     )
 ```
 
-Returns one row per `(entrypoint, serialize_key)` with at least one peer
-(another queued job, or a running leader). Use it to spot keys that have
-stopped making progress.
+Returns one row per `(entrypoint, serialize_key)` with eligible queued work
+blocked by another eligible queued job or by a running leader. Use it to spot
+keys that have stopped making progress.
 
 ## Caveats
 
 ### Head-of-line blocking
 
-A leader job that gets stuck — long-running, slow handler, terminally failed
-with `on_failure="hold"`, or ending in a `non_retryable_error` — wedges every
-queued job behind it for that key. PgQueuer does not bypass the leader; this
-is the explicit FIFO trade-off.
+A leader job that gets stuck — long-running, slow handler, or crashed worker
+whose heartbeat has not timed out yet — wedges every eligible queued job behind
+it for that key. PgQueuer does not bypass a running leader; this is the
+explicit FIFO trade-off.
 
 Mitigations:
 
 - Set `max_time` on `DatabaseRetryEntrypointExecutor` so single attempts have
   a hard ceiling.
-- Use `non_retryable_errors` deliberately. A non-retryable terminal failure
-  with `on_failure="hold"` parks the leader as `failed` and blocks the key
-  until you call `requeue_jobs` or `clear_queue` on the parked id. With
-  `on_failure="delete"` (the default), terminal failures clear the row and
-  unblock the key.
+- Use `on_failure="hold"` deliberately. A terminal failure parked as `failed`
+  leaves the active serialization lane, so later same-key jobs may continue.
+  Requeueing the failed job later can therefore process it after some followers
+  have already completed.
 - Watch `list_blocked_keys()` — `oldest_queued_age_seconds` and
   `leader_heartbeat_age_seconds` together signal stuck keys before they
   cause user-visible problems.

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from itertools import count
 from pathlib import Path
+from statistics import quantiles
 from typing import Protocol
 
 import typer
@@ -48,6 +49,16 @@ class StrategyEnum(str, Enum):
 
     throughput = "throughput"
     drain = "drain"
+    serialize_drain = "serialize-drain"
+
+
+class SerializeKeyMode(str, Enum):
+    """Serialize-key distribution for targeted dispatch benchmarks."""
+
+    none = "none"
+    unique = "unique"
+    round_robin = "round-robin"
+    single = "single"
 
 
 class BenchmarkResult(BaseModel):
@@ -59,19 +70,33 @@ class BenchmarkResult(BaseModel):
     queued: int
     rate: float
     steps: int
+    dequeue_calls: int = 0
+    dequeue_p50_ms: float | None = None
+    dequeue_p95_ms: float | None = None
+    dequeue_p99_ms: float | None = None
 
     def pretty_print(self) -> None:
+        rows: list[list[str | int | AwareDatetime | timedelta | float]] = [
+            ["Created At", self.created_at],
+            ["Driver", self.driver],
+            ["Elapsed Time", self.elapsed],
+            ["GitHub Ref Name", self.github_ref_name],
+            ["Rate", f"{self.rate:.2f}"],
+            ["Steps", self.steps],
+            ["Queued", self.queued],
+        ]
+        if self.dequeue_calls:
+            rows.extend(
+                [
+                    ["Dequeue Calls", self.dequeue_calls],
+                    ["Dequeue p50 (ms)", f"{self.dequeue_p50_ms:.3f}"],
+                    ["Dequeue p95 (ms)", f"{self.dequeue_p95_ms:.3f}"],
+                    ["Dequeue p99 (ms)", f"{self.dequeue_p99_ms:.3f}"],
+                ]
+            )
         print(
             tabulate(
-                [
-                    ["Created At", self.created_at],
-                    ["Driver", self.driver],
-                    ["Elapsed Time", self.elapsed],
-                    ["GitHub Ref Name", self.github_ref_name],
-                    ["Rate", f"{self.rate:.2f}"],
-                    ["Steps", self.steps],
-                    ["Queued", self.queued],
-                ],
+                rows,
                 headers=["Field", "Value"],
                 tablefmt=os.environ.get(add_prefix("TABLEFMT"), "pretty"),
                 colalign=("left", "left"),
@@ -177,6 +202,65 @@ class DrainSettings(BaseModel):
         )
 
 
+class SerializeDrainSettings(BaseModel):
+    driver: DriverEnum = typer.Option(
+        DriverEnum.apg,
+        help="Postgres driver to use.",
+    )
+    strategy: StrategyEnum = typer.Option(
+        StrategyEnum.serialize_drain,
+        help="Benchmarking strategy to execute.",
+    )
+    jobs: int = typer.Option(
+        50_000,
+        help="Number of jobs to enqueue for the drain strategy.",
+    )
+    key_mode: SerializeKeyMode = typer.Option(
+        SerializeKeyMode.unique,
+        help="Serialize-key distribution: none, unique, round-robin, or single.",
+    )
+    keys: int = typer.Option(
+        1_000,
+        help="Number of distinct keys for round-robin mode.",
+    )
+    serialize_dispatch_per_key: bool = typer.Option(
+        True,
+        help="Enable per-key dispatch serialization on the benchmark entrypoint.",
+    )
+    dequeue: int = typer.Option(
+        5,
+        help="Number of concurrent dequeue tasks.",
+    )
+    dequeue_batch_size: int = typer.Option(
+        10,
+        help="Batch size for dequeue tasks.",
+    )
+    output_json: Path | None = typer.Option(
+        None,
+        help="Output JSON file for benchmark metrics.",
+    )
+
+    def pretty_print(self) -> None:
+        print(
+            tabulate(
+                [
+                    ["Driver", self.driver],
+                    ["Strategy", self.strategy],
+                    ["Jobs", self.jobs],
+                    ["Key Mode", self.key_mode],
+                    ["Keys", self.keys],
+                    ["Serialize Dispatch Per Key", self.serialize_dispatch_per_key],
+                    ["Dequeue Tasks", self.dequeue],
+                    ["Dequeue Batch Size", self.dequeue_batch_size],
+                    ["Output JSON", self.output_json or "None"],
+                ],
+                headers=["Field", "Value"],
+                tablefmt=os.environ.get(add_prefix("TABLEFMT"), "pretty"),
+                colalign=("left", "left"),
+            )
+        )
+
+
 _shared_inmem: RepositoryPort | None = None
 
 
@@ -219,9 +303,15 @@ class Consumer:
     batch_size: int
     bar: tqdm
     mode: types.QueueExecutionMode = types.QueueExecutionMode.continuous
+    serialize_dispatch_per_key: bool = False
+    dequeue_durations: list[float] | None = None
 
     async def run(self) -> None:
-        @self.pgq.entrypoint("fetch")
+        if self.dequeue_durations is not None:
+            dequeue_durations = self.dequeue_durations
+            self.pgq.qm.on_dequeue = lambda duration, _count: dequeue_durations.append(duration)
+
+        @self.pgq.entrypoint("fetch", serialize_dispatch_per_key=self.serialize_dispatch_per_key)
         async def fetch(job: Job) -> None:
             self.bar.update()
 
@@ -429,6 +519,108 @@ class DrainStrategy:
         pass
 
 
+def serialize_keys_for(settings: SerializeDrainSettings) -> list[str | None] | None:
+    match settings.key_mode:
+        case SerializeKeyMode.none:
+            return None
+        case SerializeKeyMode.unique:
+            return [f"k:{i}" for i in range(settings.jobs)]
+        case SerializeKeyMode.round_robin:
+            if settings.keys < 1:
+                raise ValueError("keys must be greater than or equal to one")
+            return [f"k:{i % settings.keys}" for i in range(settings.jobs)]
+        case SerializeKeyMode.single:
+            return ["k:0"] * settings.jobs
+
+
+def dequeue_latency_summary(
+    durations: list[float],
+) -> tuple[float | None, float | None, float | None]:
+    if not durations:
+        return None, None, None
+    durations_ms = sorted(x * 1000 for x in durations)
+    if len(durations_ms) < 2:
+        return durations_ms[0], durations_ms[0], durations_ms[0]
+    percentile = quantiles(durations_ms, n=100, method="inclusive")
+    return durations_ms[len(durations_ms) // 2], percentile[94], percentile[98]
+
+
+@dataclass
+class SerializeDrainStrategy:
+    """Drain benchmark focused on per-key dispatch serialization overhead."""
+
+    settings: SerializeDrainSettings
+    pgqs: list[PgQueuer] = dataclass_field(default_factory=list, init=False)
+    tqdm_format_dict: dict[str, str] = dataclass_field(default_factory=dict, init=False)
+    dequeue_durations: list[float] = dataclass_field(default_factory=list, init=False)
+
+    async def setup(self) -> None:
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self.graceful_shutdown)
+
+        self.settings.pretty_print()
+        queries = await make_queries(self.settings.driver, _get_conninfo(self.settings.driver))
+        await queries.clear_statistics_log()
+        await queries.clear_queue()
+
+        serialize_keys = serialize_keys_for(self.settings)
+        entrypoints = ["fetch"] * self.settings.jobs
+        payloads: list[bytes | None] = [b"" for _ in range(self.settings.jobs)]
+        priorities = [0] * self.settings.jobs
+        if serialize_keys is None:
+            await queries.enqueue(entrypoints, payloads, priorities)
+        else:
+            await queries.enqueue(entrypoints, payloads, priorities, serialize_key=serialize_keys)
+
+    def graceful_shutdown(self) -> None:
+        for qm in self.pgqs:
+            qm.shutdown.set()
+
+    async def run(self) -> BenchmarkResult:
+        queries = [
+            await make_queries(self.settings.driver, _get_conninfo(self.settings.driver))
+            for _ in range(self.settings.dequeue)
+        ]
+        for q in queries:
+            self.pgqs.append(PgQueuer(q.driver, queries=q))
+
+        start = datetime.now(timezone.utc)
+        with job_progress_bar(total=self.settings.jobs) as bar:
+            tasks = [
+                Consumer(
+                    pgq,
+                    self.settings.dequeue_batch_size,
+                    bar,
+                    types.QueueExecutionMode.drain,
+                    self.settings.serialize_dispatch_per_key,
+                    self.dequeue_durations,
+                ).run()
+                for pgq in self.pgqs
+            ]
+            await asyncio.gather(*tasks)
+            self.tqdm_format_dict.update(bar.format_dict)
+        elapsed = datetime.now(timezone.utc) - start
+        p50, p95, p99 = dequeue_latency_summary(self.dequeue_durations)
+        return BenchmarkResult(
+            created_at=datetime.now(timezone.utc),
+            driver=self.settings.driver,
+            strategy=StrategyEnum.serialize_drain,
+            elapsed=elapsed,
+            github_ref_name=os.environ.get("REF_NAME", ""),
+            queued=0,
+            rate=self.settings.jobs / elapsed.total_seconds(),
+            steps=self.settings.jobs,
+            dequeue_calls=len(self.dequeue_durations),
+            dequeue_p50_ms=p50,
+            dequeue_p95_ms=p95,
+            dequeue_p99_ms=p99,
+        )
+
+    async def teardown(self) -> None:  # pragma: no cover - nothing to clean up
+        pass
+
+
 @dataclass
 class BenchmarkRunner:
     """Execute benchmarks using a chosen strategy."""
@@ -455,6 +647,15 @@ def main(
     enqueue: int = typer.Option(1),
     enqueue_batch_size: int = typer.Option(10),
     jobs: int = typer.Option(50_000, help="Number of jobs for the drain strategy"),
+    key_mode: SerializeKeyMode = typer.Option(
+        SerializeKeyMode.unique,
+        help="Serialize-key distribution for serialize-drain.",
+    ),
+    keys: int = typer.Option(1_000, help="Distinct keys for serialize-drain round-robin mode"),
+    serialize_dispatch_per_key: bool = typer.Option(
+        True,
+        help="Enable per-key dispatch serialization for serialize-drain.",
+    ),
     output_json: Path | None = typer.Option(None),
     strategy: StrategyEnum = typer.Option(StrategyEnum.throughput, "-s", "--strategy"),
 ) -> None:
@@ -468,6 +669,19 @@ def main(
             output_json=output_json,
         )
         strategy_impl: BenchmarkStrategy = DrainStrategy(drain_settings)
+    elif strategy is StrategyEnum.serialize_drain:
+        serialize_settings = SerializeDrainSettings(
+            driver=driver,
+            strategy=strategy,
+            jobs=jobs,
+            key_mode=key_mode,
+            keys=keys,
+            serialize_dispatch_per_key=serialize_dispatch_per_key,
+            dequeue=dequeue,
+            dequeue_batch_size=dequeue_batch_size,
+            output_json=output_json,
+        )
+        strategy_impl = SerializeDrainStrategy(serialize_settings)
     else:
         tp_settings = ThroughputSettings(
             driver=driver,

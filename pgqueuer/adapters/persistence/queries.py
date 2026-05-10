@@ -727,13 +727,12 @@ class Queries:
         entrypoints: list[str] | None = None,
         limit: int = 100,
     ) -> list[models.BlockedKey]:
-        """List ``serialize_key``s with queued jobs blocked behind a running peer.
+        """List ``serialize_key``s with eligible queued jobs currently blocked.
 
-        Returns one row per ``(entrypoint, serialize_key)`` that has either a
-        ``picked`` peer (a running "leader") or more than one queued job. Use
-        for diagnosing head-of-line blocking when a key has stopped making
-        progress (a stuck/long-running leader, a ``failed`` job parked with
-        ``on_failure='hold'``, etc.).
+        Returns one row per ``(entrypoint, serialize_key)`` that has eligible
+        queued work behind either a ``picked`` peer (a running "leader") or an
+        earlier eligible queued job. Future and failed jobs do not block the
+        active dispatch lane.
         """
         rows = await self.driver.fetch(
             self.qbq.build_blocked_keys_query(),

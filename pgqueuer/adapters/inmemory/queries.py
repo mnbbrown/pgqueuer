@@ -254,6 +254,7 @@ class InMemoryQueries:
         candidates: list[dict[str, Any]],
         entrypoints: dict[str, EntrypointExecutionParameter],
         picked_per_ep: dict[str, int],
+        now: datetime,
     ) -> list[dict[str, Any]]:
         """Select jobs respecting concurrency constraints."""
         selected: list[dict[str, Any]] = []
@@ -289,7 +290,7 @@ class InMemoryQueries:
             if params.serialize_dispatch_per_key and sk is not None:
                 if (ep, sk) in blocked_keys:
                     continue
-                if self._has_earlier_queued_peer(ep, sk, j["priority"], j["id"]):
+                if self._has_earlier_queued_peer(ep, sk, j["priority"], j["id"], now):
                     continue
 
             selected.append(j)
@@ -305,16 +306,18 @@ class InMemoryQueries:
         serialize_key: str,
         priority: int,
         job_id: int,
+        now: datetime,
     ) -> bool:
         """Return True if some other queued job for the same key precedes this one
         under the priority-aware FIFO ordering (higher priority first; same priority,
-        lower id first)."""
+        lower id first). Future jobs are not blockers until they become eligible."""
         for other in self._jobs.values():
             if (
                 other["status"] != "queued"
                 or other["entrypoint"] != entrypoint
                 or other.get("serialize_key") != serialize_key
                 or other["id"] == job_id
+                or other["execute_after"] > now
             ):
                 continue
             if other["priority"] > priority:
@@ -378,6 +381,7 @@ class InMemoryQueries:
             [*queued_candidates, *retry_candidates],
             entrypoints,
             picked_per_ep,
+            now,
         )
 
         # Update matched jobs
@@ -826,10 +830,14 @@ class InMemoryQueries:
     ) -> list[models.BlockedKey]:
         now = utc_now()
         ep_filter = set(entrypoints) if entrypoints else None
-        # Group queued by (entrypoint, serialize_key)
+        # Group eligible queued rows by (entrypoint, serialize_key).
         queued_groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for j in self._jobs.values():
-            if j["status"] != "queued" or j.get("serialize_key") is None:
+            if (
+                j["status"] != "queued"
+                or j.get("serialize_key") is None
+                or j["execute_after"] > now
+            ):
                 continue
             if ep_filter and j["entrypoint"] not in ep_filter:
                 continue
