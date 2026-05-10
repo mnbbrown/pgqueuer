@@ -1,0 +1,42 @@
+pgqueuer/adapters/persistence/qb.py
+  s_79fe7a58b54fe5::t_569df8fd6b898f 421-425,438,813
+pgqueuer/core/qm.py
+  s_79fe7a58b54fe5::t_e294fedc28cdd4 370,393-399
+docs/guides/per-key-serialization.md
+  s_79fe7a58b54fe5::t_d222819ece958d 39-41,43-45,81-83,89-92,98-101
+tools/benchmark.py
+  s_79fe7a58b54fe5::t_7907ab9b376d2a 14,52-61,73-76,79-96,99,205-263,306-307,310,313-314,522-535,539-568,570-623,650-658,672-684
+  s_79fe7a58b54fe5::t_e32446cfe23cb2 536-538
+  s_79fe7a58b54fe5::t_114dd77dfcd6f5 311-312,569
+test/test_benchmark_grace_period.py
+  s_79fe7a58b54fe5::t_d436e90ae99151 12-33,37-71
+  s_79fe7a58b54fe5::t_e32446cfe23cb2 34-36
+pgqueuer/adapters/persistence/queries.py
+  s_79fe7a58b54fe5::t_e33edcd5e47b1e 730,732-735
+docs/comparisons/benchmarks.md
+  s_79fe7a58b54fe5::t_b906ca940d3f8a 52-92
+pgqueuer/adapters/inmemory/queries.py
+  s_79fe7a58b54fe5::t_a1571faa118949 384
+  s_79fe7a58b54fe5::t_b37ed5e9ee0fac 833,836-840
+  s_79fe7a58b54fe5::t_681c23ee05a61d 257,293,309,313,320
+pgqueuer/ports/repository.py
+  s_79fe7a58b54fe5::t_082b45eadf71de 166
+pgqueuer/domain/models.py
+  s_79fe7a58b54fe5::t_235078362328f1 207,210-212
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.4",
+  "base_commit_sha": "c71941235587969a8aea6bd7152ec8e022333f7c",
+  "prompts": {},
+  "sessions": {
+    "s_79fe7a58b54fe5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e10d0-d990-7c42-b851-85c4191e3df6",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
