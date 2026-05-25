@@ -1,0 +1,40 @@
+docs/guides/reliability.md
+  s_79fe7a58b54fe5::t_4e18124fb13739 129-133
+docs/guides/per-key-serialization.md
+  s_6bff547dd35d7d::t_82254e34e6d25b 1-38,42,46-80,84-88,93-97,102-115,176-208,117,120,122,125,133,136,138,141,144,152,156,158,160,169,173
+  s_79fe7a58b54fe5::t_d222819ece958d 39-41,43-45,81-83,89-92,98-101
+  s_79fe7a58b54fe5::t_4e18124fb13739 116,118-119,121,123-124,126-132,134-135,137,139-140,142,145,148,150-151,153-155,157,159,161-168,170-172,174-175
+  s_cc9dee0684b2c5::t_388ebe22573144 143,146-147,149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "339ed020b7239eb6beefbd42dcd712a972d3b0e2",
+  "prompts": {},
+  "sessions": {
+    "s_6bff547dd35d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4bae17d0-1205-4e45-a548-3a16b2c347ed",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_79fe7a58b54fe5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e10d0-d990-7c42-b851-85c4191e3df6",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_cc9dee0684b2c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e122b-0877-7b40-9da4-d3af02df288b",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}

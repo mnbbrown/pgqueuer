@@ -1,0 +1,109 @@
+pgqueuer/domain/models.py
+  s_6bff547dd35d7d::t_2d80b66bd76b7d 206,208-209,213-224
+  s_79fe7a58b54fe5::t_235078362328f1 207,210-212
+test/test_benchmark_grace_period.py
+  s_79fe7a58b54fe5::t_d436e90ae99151 12-33,37-71
+  s_79fe7a58b54fe5::t_e32446cfe23cb2 34-36
+pgqueuer/core/qm.py
+  s_4d1312457608c4::t_cbc61dd77d49ed 18
+  s_4d1312457608c4::t_d3f9cfb2a9e529 91-96
+  s_4d1312457608c4::t_730ef65d7dd04f 152-160
+  s_4d1312457608c4::t_4c5f208e982717 323-334,258
+  s_4d1312457608c4::t_21d191bd03095a 539-540
+  s_6bff547dd35d7d::t_f652f46e7fca05 206,227-234,256-257,273
+  s_6bff547dd35d7d::t_71ac81ecafd0ac 308,310
+  s_6bff547dd35d7d::t_39194a67371025 309
+  s_79fe7a58b54fe5::t_e294fedc28cdd4 370,393-400
+pgqueuer/adapters/inmemory/queries.py
+  s_cc9dee0684b2c5::t_79adb35e71a9fe 195,101
+  s_4d1312457608c4::t_4b02505c9ad0b0 480-484,492-493
+  s_6bff547dd35d7d::t_fccccedce0721b 825,266,271-272,295,304,322,328,826-832,834-835,841-868,870-875
+  s_6bff547dd35d7d::t_b25686254497ce 113,124,127
+  s_6bff547dd35d7d::t_3126763057e9ee 154
+  s_6bff547dd35d7d::t_770add50dcebd2 155,169
+  s_6bff547dd35d7d::t_8d0a56155c5241 262-265,268-270,289-292,294,298-299,303,305-308,310-312,314,316-319,323-327
+  s_79fe7a58b54fe5::t_b37ed5e9ee0fac 267,315,321,833,836-840
+  s_6bff547dd35d7d::t_e3b84e7872a854 869
+  s_79fe7a58b54fe5::t_681c23ee05a61d 257,293,309,313,320
+  s_79fe7a58b54fe5::t_a1571faa118949 384
+docs/guides/per-key-serialization.md
+  s_6bff547dd35d7d::t_82254e34e6d25b 1-38,42,46-80,84-88,93-97,102-115,117-149
+  s_79fe7a58b54fe5::t_d222819ece958d 39-41,43-45,81-83,89-92,98-101
+pgqueuer/ports/repository.py
+  s_4d1312457608c4::t_5ede90c1d10e6e 115-119
+  s_6bff547dd35d7d::t_a710fb33aa5394 159-160,161-165,167-168
+  s_6bff547dd35d7d::t_bec53808c93dcf 35-38,42
+  s_cc9dee0684b2c5::t_55bf1aecef9468 71
+  s_6bff547dd35d7d::t_825acd1b404daf 83,94
+  s_79fe7a58b54fe5::t_082b45eadf71de 166
+tools/benchmark.py
+  s_79fe7a58b54fe5::t_7907ab9b376d2a 14,52-61,73-76,79-96,99,205-263,306-307,310,313-314,522-535,539-568,570-623,650-658,672-684
+  s_79fe7a58b54fe5::t_114dd77dfcd6f5 311-312,569
+  s_79fe7a58b54fe5::t_e32446cfe23cb2 536-538
+docs/comparisons/benchmarks.md
+  s_79fe7a58b54fe5::t_b906ca940d3f8a 52-92
+pgqueuer/adapters/persistence/queries.py
+  s_cc9dee0684b2c5::t_8a789c439e3bea 389
+  s_cc9dee0684b2c5::t_55e3aee86dbd94 390
+  s_4d1312457608c4::t_cf4b9d2fd9579a 491-495,498-506,509
+  s_6bff547dd35d7d::t_543ea5d57b6742 724,725,727-729,736-742
+  s_cc9dee0684b2c5::t_eb850747cc4218 857-858,311,726,731,743,778
+  s_6bff547dd35d7d::t_3fb86f25bc31a1 298
+  s_6bff547dd35d7d::t_76e947c8de42c3 323,334,790,801
+  s_6bff547dd35d7d::t_675c46ec640d48 347-352,361
+  s_6bff547dd35d7d::t_e0072ead2981d2 383,828,851
+  s_79fe7a58b54fe5::t_e33edcd5e47b1e 730,732-735
+pgqueuer/adapters/persistence/qb.py
+  s_cc9dee0684b2c5::t_de12057664267c 571-574,553
+  s_cc9dee0684b2c5::t_772ef23efd448c 575-576
+  s_4d1312457608c4::t_b3c29662354755 725-729,733
+  s_6bff547dd35d7d::t_1ff5844cebeed7 789-790,428,791-808,810-812,814-826
+  s_6bff547dd35d7d::t_7218b96f26e726 73,86-92
+  s_6bff547dd35d7d::t_1d209be8105aa8 278-280
+  s_6bff547dd35d7d::t_e9bc0bce89903b 419-420,426-427,429-437,439-446,453,485,504
+  s_6bff547dd35d7d::t_69f57c9b999c7c 451-452
+  s_6bff547dd35d7d::t_3c430ba1a2b694 550-552,557
+  s_6bff547dd35d7d::t_e586b0990ec7c0 565
+  s_6bff547dd35d7d::t_e08fe0315e5486 809
+  s_79fe7a58b54fe5::t_569df8fd6b898f 421-425,438,813
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "367c4d65a52e8d0448d61b4d38c73a6c5790bff8",
+  "prompts": {},
+  "sessions": {
+    "s_4d1312457608c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e90adee9-2a26-49b2-91df-f7c69280f240",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_6bff547dd35d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4bae17d0-1205-4e45-a548-3a16b2c347ed",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_79fe7a58b54fe5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e10d0-d990-7c42-b851-85c4191e3df6",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_cc9dee0684b2c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e122b-0877-7b40-9da4-d3af02df288b",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}

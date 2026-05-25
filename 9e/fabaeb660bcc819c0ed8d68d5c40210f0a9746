@@ -1,0 +1,59 @@
+pgqueuer/adapters/inmemory/queries.py
+  s_cc9dee0684b2c5::t_79adb35e71a9fe 195,101
+  s_4d1312457608c4::t_4b02505c9ad0b0 476-480,488-489
+  s_6bff547dd35d7d::t_fccccedce0721b 821,265,270-271,294,303,319,325,822-828,830-831,833-860,862-867
+  s_6bff547dd35d7d::t_b25686254497ce 113,124,127
+  s_6bff547dd35d7d::t_3126763057e9ee 154
+  s_6bff547dd35d7d::t_770add50dcebd2 155,169
+  s_6bff547dd35d7d::t_8d0a56155c5241 261-264,267-269,288-291,293,297-298,302,304-310,312,314-317,320-324
+  s_79fe7a58b54fe5::t_b37ed5e9ee0fac 266,313,318
+  s_6bff547dd35d7d::t_e3b84e7872a854 861
+test/test_serialize_key.py
+  s_6bff547dd35d7d::t_1f007d4eb112e6 1-18,20-44,46-65,69-90,92-102,106-137,141-185,187,189-190,192-215,219-255,259-314
+  s_6bff547dd35d7d::t_c2de793863f2ef 19
+  s_6bff547dd35d7d::t_e3b84e7872a854 45,66-68,91,103-105,138-140,186,188,191,216-218,256-258
+pgqueuer/adapters/persistence/query_helpers.py
+  s_6bff547dd35d7d::t_b6f59b878f895c 16
+  s_6bff547dd35d7d::t_82c45ede224e21 26,46,48,58
+  s_6bff547dd35d7d::t_e3b84e7872a854 47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "9efabaeb660bcc819c0ed8d68d5c40210f0a9746",
+  "prompts": {},
+  "sessions": {
+    "s_4d1312457608c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e90adee9-2a26-49b2-91df-f7c69280f240",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_6bff547dd35d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4bae17d0-1205-4e45-a548-3a16b2c347ed",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_79fe7a58b54fe5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e10d0-d990-7c42-b851-85c4191e3df6",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_cc9dee0684b2c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e122b-0877-7b40-9da4-d3af02df288b",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}

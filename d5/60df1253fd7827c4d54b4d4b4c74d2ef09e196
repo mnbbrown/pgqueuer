@@ -1,0 +1,32 @@
+pgqueuer/core/qm.py
+  s_4d1312457608c4::t_cbc61dd77d49ed 18
+  s_4d1312457608c4::t_d3f9cfb2a9e529 91-96
+  s_4d1312457608c4::t_730ef65d7dd04f 152-160
+  s_4d1312457608c4::t_4c5f208e982717 307-318
+  s_4d1312457608c4::t_21d191bd03095a 514-515
+test/test_observability_hooks.py
+  s_4d1312457608c4::t_638fe97835539b 1-4,7,9-15,17-107,109,111,122-123,125-127,129-130,132-143,147-200
+  s_4d1312457608c4::t_19f852897f1c1e 5-6
+  s_4d1312457608c4::t_b9b274c93cd2c2 8,16
+  s_4d1312457608c4::t_6bd3547635a20a 108,110,112,115-116,119-121,124,128
+  s_4d1312457608c4::t_979d52c832d17b 113-114,117
+  s_4d1312457608c4::t_1940d3272e770b 118
+  s_4d1312457608c4::t_a796a1e369da35 131
+  s_4d1312457608c4::t_9a24f258d03edd 144-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "d560df1253fd7827c4d54b4d4b4c74d2ef09e196",
+  "prompts": {},
+  "sessions": {
+    "s_4d1312457608c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e90adee9-2a26-49b2-91df-f7c69280f240",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}

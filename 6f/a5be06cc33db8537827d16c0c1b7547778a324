@@ -1,0 +1,21 @@
+pgqueuer/adapters/cli/cli.py
+  s_4d1312457608c4::t_bcb39e3a7980d1 461-471,495
+pgqueuer/adapters/cli/supervisor.py
+  s_4d1312457608c4::t_67121e8c39efba 91,106,127,148,157,170,181
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "6fa5be06cc33db8537827d16c0c1b7547778a324",
+  "prompts": {},
+  "sessions": {
+    "s_4d1312457608c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e90adee9-2a26-49b2-91df-f7c69280f240",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}

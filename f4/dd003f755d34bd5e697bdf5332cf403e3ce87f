@@ -1,0 +1,19 @@
+.github/workflows/ci.yml
+  s_6bff547dd35d7d::t_4a64abd94a6800 6,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "f4dd003f755d34bd5e697bdf5332cf403e3ce87f",
+  "prompts": {},
+  "sessions": {
+    "s_6bff547dd35d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4bae17d0-1205-4e45-a548-3a16b2c347ed",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}

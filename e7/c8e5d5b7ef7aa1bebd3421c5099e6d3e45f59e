@@ -1,0 +1,56 @@
+pgqueuer/adapters/cli/cli.py
+  s_4d1312457608c4::t_bcb39e3a7980d1 461-471,495
+  s_4d1312457608c4::t_3d4d0ae5c4d0eb 581-590,595
+pgqueuer/adapters/persistence/qb.py
+  s_cc9dee0684b2c5::t_de12057664267c 524-527
+  s_cc9dee0684b2c5::t_772ef23efd448c 528-529
+  s_4d1312457608c4::t_b3c29662354755 678-682,686
+  s_6bff547dd35d7d::t_1ff5844cebeed7 742-743
+pgqueuer/adapters/persistence/queries.py
+  s_cc9dee0684b2c5::t_8a789c439e3bea 378
+  s_cc9dee0684b2c5::t_55e3aee86dbd94 379
+  s_4d1312457608c4::t_cf4b9d2fd9579a 480-484,487-495,498
+  s_6bff547dd35d7d::t_543ea5d57b6742 713
+  s_cc9dee0684b2c5::t_eb850747cc4218 822-823
+pgqueuer/ports/repository.py
+  s_4d1312457608c4::t_5ede90c1d10e6e 107-111
+  s_6bff547dd35d7d::t_a710fb33aa5394 151-152
+test/test_hold_failed.py
+  s_4d1312457608c4::t_d76a69ff759a81 464-554
+pgqueuer/adapters/inmemory/queries.py
+  s_cc9dee0684b2c5::t_79adb35e71a9fe 190
+  s_4d1312457608c4::t_4b02505c9ad0b0 427-431,439-440
+  s_6bff547dd35d7d::t_fccccedce0721b 772
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "e7c8e5d5b7ef7aa1bebd3421c5099e6d3e45f59e",
+  "prompts": {},
+  "sessions": {
+    "s_4d1312457608c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e90adee9-2a26-49b2-91df-f7c69280f240",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_6bff547dd35d7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4bae17d0-1205-4e45-a548-3a16b2c347ed",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    },
+    "s_cc9dee0684b2c5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e122b-0877-7b40-9da4-d3af02df288b",
+        "model": "gpt-5.5"
+      },
+      "human_author": null
+    }
+  }
+}

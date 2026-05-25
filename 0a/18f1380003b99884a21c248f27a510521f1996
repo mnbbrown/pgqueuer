@@ -1,0 +1,27 @@
+pgqueuer/core/executors.py
+  s_4d1312457608c4::t_4bdc58f46ae947 11,32-35
+  s_4d1312457608c4::t_47a14e21ad7c4b 117-127,138-139,153-155,180-190
+  s_4d1312457608c4::t_a77201bd924340 5
+  s_4d1312457608c4::t_147069bad8d5cc 31
+  s_4d1312457608c4::t_dd288527050b26 128-131,140,144-150,156-161,163-178
+test/test_terminal_failure_hooks.py
+  s_4d1312457608c4::t_ac4ab24102f94f 1-6,8-324
+  s_4d1312457608c4::t_dcec5e5723be8a 7
+  s_4d1312457608c4::t_393e14dcaf67a9 325-520
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "0a18f1380003b99884a21c248f27a510521f1996",
+  "prompts": {},
+  "sessions": {
+    "s_4d1312457608c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e90adee9-2a26-49b2-91df-f7c69280f240",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
