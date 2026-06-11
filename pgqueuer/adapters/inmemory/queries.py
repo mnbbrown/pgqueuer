@@ -337,8 +337,16 @@ class InMemoryQueries:
         self,
         queue_manager_id: uuid.UUID,
         entrypoints: dict[str, EntrypointExecutionParameter],
+        now: datetime,
+        heartbeat_timeout: timedelta,
     ) -> tuple[dict[str, int], int]:
-        """Count picked jobs per entrypoint (globally) and this worker's total."""
+        """Count picked jobs per entrypoint (globally) and this worker's total.
+
+        Stale rows (heartbeat older than the timeout) are excluded from the
+        per-entrypoint cap so a dead worker holding a full batch cannot count
+        against — and thereby block reclaim of — its own slots. The worker's
+        total still includes its own stale rows, mirroring the SQL worker_load.
+        """
         picked_per_ep: dict[str, int] = {}
         total_picked = 0
         for j in self._jobs.values():
@@ -347,7 +355,7 @@ class InMemoryQueries:
             ep = j["entrypoint"]
             if j["queue_manager_id"] == queue_manager_id:
                 total_picked += 1
-            if ep in entrypoints:
+            if ep in entrypoints and now - j["heartbeat"] < heartbeat_timeout:
                 picked_per_ep[ep] = picked_per_ep.get(ep, 0) + 1
         return picked_per_ep, total_picked
 
@@ -501,7 +509,9 @@ class InMemoryQueries:
 
         now = utc_now()
 
-        picked_per_ep, total_picked = self._count_picked_jobs(queue_manager_id, entrypoints)
+        picked_per_ep, total_picked = self._count_picked_jobs(
+            queue_manager_id, entrypoints, now, heartbeat_timeout
+        )
 
         # Apply global concurrency limit
         if global_concurrency_limit is not None and total_picked >= global_concurrency_limit:

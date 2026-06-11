@@ -381,3 +381,66 @@ async def test_retry_reclaims_stale_picked_job_after_crash(apgdriver: db.Driver)
     assert second_claim, (
         "expected new worker to reclaim stale picked job after heartbeat_timeout elapsed"
     )
+
+
+async def test_reclaims_full_concurrency_batch_after_crash(apgdriver: db.Driver) -> None:
+    """Reproduce the permanent deadlock when count(stale picked) == concurrency_limit.
+
+    A single worker dequeues the whole concurrency budget in one batch
+    (effective_batch == concurrency_limit) and then dies, freezing every
+    heartbeat. The stale rows must not count against the per-entrypoint cap,
+    otherwise reclaim is gated by the very jobs it is trying to free and the
+    queue deadlocks forever.
+    """
+
+    retry_timer = timedelta(milliseconds=200)
+    concurrency_limit = 5
+    entrypoint = "full_batch_crash"
+
+    async def noop(_: Job) -> None:
+        return None
+
+    crashed_manager = QueueManager(queries.Queries(apgdriver))
+    crashed_manager.entrypoint(entrypoint, concurrency_limit=concurrency_limit)(noop)
+
+    n_jobs = concurrency_limit + 3  # extra queued jobs that must eventually flow
+    job_ids = await crashed_manager.queries.enqueue(
+        [entrypoint] * n_jobs, [None] * n_jobs, [0] * n_jobs
+    )
+
+    execution_params = {
+        entrypoint: queries.EntrypointExecutionParameter(concurrency_limit=concurrency_limit)
+    }
+
+    # One worker grabs the entire concurrency budget in a single batch.
+    first_claim = await crashed_manager.queries.dequeue(
+        batch_size=concurrency_limit,
+        entrypoints=execution_params,
+        queue_manager_id=crashed_manager.queue_manager_id,
+        global_concurrency_limit=None,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(first_claim) == concurrency_limit
+
+    # The worker dies: heartbeats freeze and become stale.
+    await asyncio.sleep(retry_timer.total_seconds() * 2)
+
+    rows = await inspect_queued_jobs(job_ids, apgdriver)
+    assert sum(r.status == "picked" for r in rows) == concurrency_limit
+
+    # A fresh worker must be able to reclaim the stale batch even though
+    # count(stale picked) == concurrency_limit.
+    recovery_manager = QueueManager(queries.Queries(apgdriver))
+    recovery_manager.entrypoint(entrypoint, concurrency_limit=concurrency_limit)(noop)
+
+    second_claim = await recovery_manager.queries.dequeue(
+        batch_size=concurrency_limit,
+        entrypoints=execution_params,
+        queue_manager_id=recovery_manager.queue_manager_id,
+        global_concurrency_limit=None,
+        heartbeat_timeout=retry_timer,
+    )
+    assert second_claim, (
+        "expected new worker to reclaim stale picked batch when "
+        "count(stale picked) == concurrency_limit"
+    )

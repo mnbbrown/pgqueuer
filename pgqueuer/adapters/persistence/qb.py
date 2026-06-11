@@ -453,12 +453,16 @@ params AS (
         UNNEST($7::boolean[]) AS serialize_dispatch_per_key
 ),
 
--- Per-entrypoint count of picked jobs (global, all workers).
+-- Per-entrypoint count of *live* picked jobs (global, all workers).
+-- Stale rows (heartbeat timed out) are excluded so a dead worker holding a
+-- full batch cannot count against — and thereby block reclaim of — its own
+-- slots. See next_stale/next_queued, both gated on this count.
 picked AS (
     SELECT entrypoint, COUNT(*) AS total
     FROM {t}
     WHERE queue_manager_id IS NOT NULL
       AND entrypoint = ANY($2)
+      AND heartbeat >= NOW() - $6::interval
     GROUP BY entrypoint
 ),
 
