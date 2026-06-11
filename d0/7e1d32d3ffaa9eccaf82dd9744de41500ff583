@@ -1,0 +1,25 @@
+pgqueuer/adapters/inmemory/queries.py
+  s_e8ea10a9dca6fa::t_492690d284bb8e 211-213
+test/test_inmemory.py
+  s_e8ea10a9dca6fa::t_f20291d6ca053a 142-145
+pgqueuer/adapters/persistence/qb.py
+  s_e8ea10a9dca6fa::t_505cfa1c66e627 598-602
+test/test_queries.py
+  s_e8ea10a9dca6fa::t_85698e386c5bae 608,612-614
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "d07e1d32d3ffaa9eccaf82dd9744de41500ff583",
+  "prompts": {},
+  "sessions": {
+    "s_e8ea10a9dca6fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4ad159b0-d9ca-4d6a-bbf9-636c37886ae0",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
