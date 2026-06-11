@@ -605,10 +605,13 @@ async def test_enqueue_if_no_queued_skips_only_queued_jobs(
     assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None
 
 
-async def test_enqueue_if_no_queued_ignores_deferred_jobs(
+async def test_enqueue_if_no_queued_blocks_on_deferred_jobs(
     apgdriver: db.Driver,
     pgdriver: db.SyncDriver,
 ) -> None:
+    # A future-scheduled queued row still covers the work (it will run and
+    # observe current state), so it must block duplicates — this is what
+    # makes debouncing via a deferred execute_after composable.
     aq = queries.Queries(apgdriver)
 
     deferred_id = await aq.enqueue_if_no_queued(
@@ -618,10 +621,6 @@ async def test_enqueue_if_no_queued_ignores_deferred_jobs(
         execute_after=timedelta(hours=4),
     )
     assert deferred_id is not None
-
-    immediate_id = await aq.enqueue_if_no_queued("ep", b"immediate", serialize_key="resource-1")
-    assert immediate_id is not None
-    assert immediate_id != deferred_id
 
     assert await aq.enqueue_if_no_queued("ep", b"duplicate", serialize_key="resource-1") is None
 
@@ -634,7 +633,6 @@ async def test_enqueue_if_no_queued_ignores_deferred_jobs(
     )
     assert sync_deferred_id is not None
 
-    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is not None
     assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None
 
 

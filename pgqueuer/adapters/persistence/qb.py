@@ -595,13 +595,17 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
                 status
             )
             SELECT $3, $1, $4, NOW() + $5, $6, $7, $2, 'queued'
+            -- Any queued row blocks, including one deferred into the future:
+            -- it will still run and observe current state, so it covers the
+            -- work. This is what makes debouncing composable — a row whose
+            -- execute_after was pushed forward keeps absorbing duplicates.
+            -- Picked (running) rows do NOT block: trailing-wake-up semantics.
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM {t}
                 WHERE entrypoint = $1
                   AND serialize_key = $2
                   AND status = 'queued'
-                  AND execute_after < NOW()
             )
             RETURNING id, entrypoint, status, priority
         )

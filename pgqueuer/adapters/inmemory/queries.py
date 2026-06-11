@@ -208,11 +208,13 @@ class InMemoryQueries:
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> JobId | None:
+        # Any queued row blocks, including one deferred into the future: it
+        # will still run and observe current state, so it covers the work.
+        # Picked (running) rows do NOT block: trailing-wake-up semantics.
         if any(
             job["entrypoint"] == entrypoint
             and job.get("serialize_key") == serialize_key
             and job["status"] == "queued"
-            and job["execute_after"] < utc_now()
             for job in self._jobs.values()
         ):
             return None
