@@ -1,0 +1,24 @@
+test/test_retry.py
+  s_6854bb6e708719::t_2efcfec352f8e4 384-446
+pgqueuer/adapters/persistence/qb.py
+  s_6854bb6e708719::t_b873a3f37cdf70 456-459,465
+pgqueuer/adapters/inmemory/queries.py
+  s_6854bb6e708719::t_1fc2ec645c8722 340-341,343-348
+  s_6854bb6e708719::t_80cb3e4a239663 512-513
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "13f17517c2e5b4dc542d8bc0c4f1bb7f940b4974",
+  "prompts": {},
+  "sessions": {
+    "s_6854bb6e708719": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bc700398-226a-42bc-8112-e077dfe89281",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Matt Brown <matt@elyos.ai>"
+    }
+  }
+}
