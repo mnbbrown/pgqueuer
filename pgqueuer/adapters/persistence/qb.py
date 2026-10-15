@@ -445,6 +445,7 @@ class QueryQueueBuilder:
         # stale job only transfers ownership of a row already counted in `picked`, so
         # net live execution is unchanged. Applying the gate would deadlock recovery
         # once leaked rows fill the slot.
+        # Recovery retains the picked key; queued siblings must not block its owner.
         composer.cte(
             "next_stale",
             f"""
@@ -454,7 +455,6 @@ class QueryQueueBuilder:
                   AND stale.entrypoint = ANY({eps})
                   AND stale.heartbeat < NOW() - {heartbeat}::interval
                   AND stale.execute_after < NOW()
-                  {key_guard("stale")}
                   {budget_and}
                 ORDER BY stale.priority DESC, stale.id ASC
                 FOR UPDATE SKIP LOCKED

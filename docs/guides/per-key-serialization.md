@@ -66,10 +66,15 @@ dispatched one-at-a-time as the leader completes. This is the SQS-FIFO
 
 ## Crash recovery
 
-If a worker dies mid-job, the existing heartbeat-timeout machinery requeues
-the stale `picked` row (status flips back to `queued`). When that happens, the
-row leaves the partial index that gates the per-key check, so the key becomes
-unblocked for any worker to pick up. No special recovery path is required.
+If a worker dies mid-job, another worker can reclaim the stale `picked` row
+once its heartbeat expires. The row stays `picked` and retains its key. Queued
+siblings cannot block recovery, even if they have higher priority or an earlier ID.
+After the recovered job completes, queued siblings become eligible normally.
+Explicit retries and terminal failures retain their existing scheduling behaviour.
+
+Recovery can repeat work if the original worker is still executing after its
+heartbeat expires. Handlers must tolerate replay; the unique index guarantees
+one picked row per key, not exactly-once execution.
 
 ## Diagnostics — `list_blocked_keys()`
 

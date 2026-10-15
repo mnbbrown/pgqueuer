@@ -1270,7 +1270,7 @@ class InMemoryQueries:
             for other in self._jobs.values()
         ):
             return True
-        return self._has_earlier_queued_peer(
+        return job["status"] == "queued" and self._has_earlier_queued_peer(
             job["entrypoint"], key, job["priority"], job["id"], now
         )
 
