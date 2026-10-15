@@ -45,6 +45,10 @@ Rows with `serialize_key IS NULL` bypass the check entirely. Jobs that are not
 currently runnable, such as future `execute_after` rows or jobs parked as
 `failed`, do not block the key.
 
+Concurrent workers can select from different database snapshots. If the picked-key
+unique index rejects a competing claim, dequeue returns an empty batch and polls
+again. The rejected batch rolls back; unrelated constraint violations still raise.
+
 ### What counts as "earlier" (priority-aware FIFO)
 
 - A higher-priority queued peer wins, regardless of insertion order.

@@ -11,7 +11,7 @@ from pgqueuer.adapters.persistence import sqlstate
 from pgqueuer.adapters.persistence.queries import (
     Queries,
     SyncQueries,
-    lost_capacity_slot_race,
+    lost_claim_race,
     raising_duplicate_job,
 )
 from pgqueuer.domain.errors import DuplicateJobError
@@ -21,6 +21,7 @@ from pgqueuer.models import Job
 from pgqueuer.queries import EntrypointExecutionParameter
 
 SLOT_INDEX = f"{DBSettings().queue_table}_picked_slot_idx"
+SERIALIZE_INDEX = f"{DBSettings().queue_table}_picked_serialize_key_idx"
 OTHER_INDEX = f"{DBSettings().queue_table}_unique_dedupe_key"
 
 
@@ -97,6 +98,8 @@ def test_constraint_of_reads_the_name_both_drivers_carry(
     (
         (AsyncpgNamedUnique(SLOT_INDEX), True),
         (PsycopgNamedUnique(SLOT_INDEX), True),
+        (AsyncpgNamedUnique(SERIALIZE_INDEX), True),
+        (PsycopgNamedUnique(SERIALIZE_INDEX), True),
         (asyncpg.DeadlockDetectedError(), True),
         (psycopg.errors.DeadlockDetected(), True),
         (AsyncpgNamedUnique(OTHER_INDEX), False),
@@ -108,11 +111,11 @@ def test_constraint_of_reads_the_name_both_drivers_carry(
         (ValueError("not from the database"), False),
     ),
 )
-def test_lost_capacity_slot_race_matches_only_the_slot_index(
+def test_lost_claim_race_matches_only_claim_indexes(
     exc: Exception,
     lost: bool,
 ) -> None:
-    assert lost_capacity_slot_race(exc, SLOT_INDEX) is lost
+    assert lost_claim_race(exc, SLOT_INDEX, SERIALIZE_INDEX) is lost
 
 
 class FetchBoom:
@@ -137,6 +140,8 @@ async def test_dequeue_returns_empty_on_slot_unique_violation() -> None:
     assert await dequeue_jobs(FetchBoom(AsyncpgNamedUnique(SLOT_INDEX))) == []
     assert await dequeue_jobs(FetchBoom(PsycopgNamedUnique(SLOT_INDEX))) == []
     assert await dequeue_jobs(FetchBoom(asyncpg.DeadlockDetectedError())) == []
+    assert await dequeue_jobs(FetchBoom(AsyncpgNamedUnique(SERIALIZE_INDEX))) == []
+    assert await dequeue_jobs(FetchBoom(PsycopgNamedUnique(SERIALIZE_INDEX))) == []
 
 
 async def test_dequeue_reraises_unrelated_unique_violation() -> None:
