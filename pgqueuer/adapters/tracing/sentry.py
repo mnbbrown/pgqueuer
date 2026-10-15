@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Generator
+from typing import TYPE_CHECKING, AsyncIterator, Generator
+
+if TYPE_CHECKING:
+    import sentry_sdk
 
 try:
-    import sentry_sdk
+    import sentry_sdk  # noqa: F811
+
+    HAS_SENTRY = True
 except ImportError:
-    sentry_sdk = None  # type: ignore[assignment]
+    HAS_SENTRY = False
 
 from pgqueuer.domain.models import Job
 from pgqueuer.ports.tracing import TracingProtocol
 
 
 class SentryTracing(TracingProtocol):
-    def trace_publish(self, entrypoints: list[str]) -> Generator[dict, None, None]:
-        if sentry_sdk is None:
-            yield {}
+    def trace_publish(self, entrypoints: list[str]) -> Generator[dict[str, object], None, None]:
+        if not HAS_SENTRY:
+            # One header per entrypoint: merge_tracing_headers zips against
+            # the entrypoint list with strict=True.
+            for _ in entrypoints:
+                yield {}
             return
 
         with sentry_sdk.start_transaction(
@@ -38,19 +46,8 @@ class SentryTracing(TracingProtocol):
 
     @asynccontextmanager
     async def trace_process(self, job: Job) -> AsyncIterator[None]:
-        """
-        Async context manager for tracing queue consumer job processing,
-        capturing performance metrics.
-
-        Args:
-            job (Job): The job being processed, containing headers, metadata, and payload.
-
-        Yields:
-            None: This context manager does not return a value but captures tracing
-                metrics for the job lifecycle.
-        """
-
-        if sentry_sdk is None or job.headers is None:
+        """Wrap consumer processing of *job* in a Sentry transaction + span."""
+        if not HAS_SENTRY or job.headers is None:
             yield
             return
 
@@ -93,3 +90,4 @@ class SentryTracing(TracingProtocol):
                 transaction.set_status("ok")
             except Exception:
                 transaction.set_status("internal_error")
+                raise

@@ -1,8 +1,8 @@
 # Contributing
 
-PGQueuer's integration tests use [Testcontainers](https://testcontainers.com/) to launch
+PgQueuer's integration tests use [Testcontainers](https://testcontainers.com/) to launch
 an ephemeral PostgreSQL instance automatically. You no longer need to run or manage a local
-database manually — just have a container runtime available (Docker Desktop, Colima,
+database manually; just have a container runtime available (Docker Desktop, Colima,
 Rancher Desktop, etc.).
 
 ## Prerequisites
@@ -11,11 +11,11 @@ Rancher Desktop, etc.).
 - A working Docker (or compatible) daemon on your system path
 - Internet access the first time tests pull the PostgreSQL image
 
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Install dependencies (including all extras)
-uv sync --all-extras --frozen
+# 1. Install dependencies (the default dev group pulls in every extra)
+uv sync --frozen
 
 # 2. Lint and formatting checks
 uv run ruff check .
@@ -27,18 +27,30 @@ uv run mypy .
 uv run pytest
 ```
 
-No manual database bootstrapping required. Schema install happens inside the container
-during test setup.
+You do not have to bootstrap a database yourself. The test setup installs the schema
+inside the container.
 
-## Makefile (Optional)
+## Dependency groups
+
+Development dependencies live in `[dependency-groups]` in `pyproject.toml`, not in
+published extras. `uv sync` installs the `dev` group by default, which includes all the
+others. To install one group only, as CI does:
+
+| Group | Contents |
+|-------|----------|
+| `test` | pytest and plugins, Testcontainers, and every runtime extra |
+| `lint` | ruff, mypy, import-linter, type stubs |
+| `bench` | the asyncpg and psycopg drivers and tqdm, for `tools/benchmark.py` |
+| `docs` | MkDocs and its plugins |
 
 ```bash
-make check
+uv sync --no-default-groups --group test --frozen
+uv run --no-sync pytest
 ```
 
-Runs lint, type, dependency, and test steps in sequence.
+Pass `--no-sync` to `uv run`; otherwise it installs the `dev` group again.
 
-## Test Structure & Tips
+## Test structure and tips
 
 - Integration tests trigger the PostgreSQL Testcontainer automatically on first database access.
 - The container is reused across tests within a single run for speed, then discarded.
@@ -51,7 +63,7 @@ uv run pytest -vv --log-cli-level=INFO
 uv run pytest -m "not integration"
 ```
 
-## Forcing an External Database (Advanced / CI Override)
+## Forcing an external database (advanced / CI override)
 
 Provide a full PostgreSQL DSN via `EXTERNAL_POSTGRES_DSN` to bypass Testcontainers:
 
@@ -60,9 +72,9 @@ export EXTERNAL_POSTGRES_DSN=postgresql://user:pass@localhost:5432/postgres
 uv run pytest -v
 ```
 
-What happens under the hood:
+The session fixture then does the following:
 
-1. The session fixture treats your DSN as a base server reference.
+1. It treats your DSN as a base server reference.
 2. It connects to the `postgres` maintenance database on that server.
 3. It creates a temporary template database named `parent_<uuid>` with the PgQueuer schema.
 4. For each test, it creates a fresh `test_<uuid>` database `FROM TEMPLATE parent_<uuid>`,
@@ -79,7 +91,7 @@ What happens under the hood:
     Pointing at a shared production-like server may create load due to frequent database
     creation. Use a dedicated instance.
 
-## Hot Reloading During Local Development
+## Hot reloading during local development
 
 PgQueuer does not include a built-in `--reload` mode. Use a file-watcher like
 [entr](https://eradman.com/entrproject/):
@@ -98,10 +110,10 @@ This restarts the worker process whenever any Python file changes. For developme
 - **Permission errors inside container**: Ensure your user is in the Docker group (Linux)
   or restart Docker Desktop (macOS/Windows).
 
-## Development Flow Summary
+## Development flow summary
 
 ```bash
-uv sync --all-extras --frozen
+uv sync --frozen
 uv run ruff check .
 uv run lint-imports
 uv run mypy .

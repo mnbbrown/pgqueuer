@@ -1,16 +1,84 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from itertools import count
+from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlparse
 
 import async_timeout
 
+from pgqueuer import db
+from pgqueuer.adapters.persistence import qb
+from pgqueuer.adapters.persistence.queries import Queries
+from pgqueuer.adapters.persistence.query_helpers import cell
+from pgqueuer.domain.schema.declaration import target
+from pgqueuer.domain.schema.model import Schema
+from pgqueuer.domain.types import JOB_STATUS, JobId, QueueEntrypoint, QueueManagerId
 from pgqueuer.models import Job
 from pgqueuer.ports import RepositoryPort
+
+# Tables whose id was int4 SERIAL before #671 and gets widened to BIGINT.
+WIDENED_ID_TABLES = [
+    qb.DBSettings().queue_table,
+    qb.DBSettings().statistics_table,
+    qb.DBSettings().schedules_table,
+]
+
+
+def queries_for(driver: db.Driver, settings: qb.DBSettings) -> Queries:
+    """Queries wired to non-default DBSettings across all three builders."""
+    return Queries(
+        driver,
+        qbe=qb.QueryBuilderEnvironment(settings=settings),
+        qbq=qb.QueryQueueBuilder(settings=settings),
+        qbs=qb.QuerySchedulerBuilder(settings=settings),
+    )
+
+
+async def id_data_type(driver: db.Driver, table: str, schema: str | None = None) -> str:
+    """SQL data_type of ``table.id`` in *schema* (default: the current schema)."""
+    schema_expr = f"'{schema}'" if schema else "current_schema()"
+    rows = await driver.fetch(
+        f"""SELECT data_type FROM information_schema.columns
+        WHERE table_schema = {schema_expr}
+          AND table_name = $1
+          AND column_name = 'id';""",
+        table,
+    )
+    return cell(rows[0], "data_type", str)
+
+
+async def simulate_legacy_serial(driver: db.Driver, table: str, schema: str | None = None) -> None:
+    """Recreate the pre-#671 state: int4 column backed by an int4 SERIAL sequence.
+
+    Resets from any current shape (BIGSERIAL or identity) so it is stable
+    regardless of what the install builder produces.
+    """
+    target = f"{schema}.{table}" if schema else table
+    seq = f"{schema}.{table}_id_seq" if schema else f"{table}_id_seq"
+    await driver.execute(f"ALTER TABLE {target} ALTER COLUMN id DROP IDENTITY IF EXISTS;")
+    await driver.execute(f"ALTER TABLE {target} ALTER COLUMN id DROP DEFAULT;")
+    await driver.execute(f"DROP SEQUENCE IF EXISTS {seq};")
+    await driver.execute(f"ALTER TABLE {target} ALTER COLUMN id TYPE INTEGER;")
+    await driver.execute(f"CREATE SEQUENCE {seq} AS INTEGER OWNED BY {target}.id;")
+    await driver.execute(f"ALTER TABLE {target} ALTER COLUMN id SET DEFAULT nextval('{seq}');")
+
+
+def env_from_dsn(dsn: str) -> dict[str, str]:
+    """Build the PG* environment variables asyncpg/psycopg expect from a DSN."""
+    parsed = urlparse(dsn)
+    return {
+        "PGHOST": parsed.hostname or "localhost",
+        "PGPORT": str(parsed.port or 5432),
+        "PGUSER": parsed.username or "",
+        "PGPASSWORD": parsed.password or "",
+        "PGDATABASE": parsed.path.lstrip("/") or "",
+    }
 
 
 class ShutdownCapable(Protocol):
@@ -18,30 +86,30 @@ class ShutdownCapable(Protocol):
 
 
 def mocked_job(
-    id: int | count = count(),
+    id: int | count[int] = count(),
     priority: int = 1,
     created: datetime | None = None,
     heartbeat: datetime | None = None,
     execute_after: datetime | None = None,
     updated: datetime | None = None,
-    status: str = "queued",
+    status: JOB_STATUS = "queued",
     entrypoint: str = "test",
     payload: bytes | None = None,
     queue_manager_id: None | uuid.UUID = None,
-    headers: dict | None = None,
+    headers: dict[str, object] | None = None,
 ) -> Job:
     now = datetime.now(timezone.utc)
     return Job(
-        id=id if isinstance(id, int) else next(id),
+        id=JobId(id if isinstance(id, int) else next(id)),
         priority=priority,
         created=created or now,
         heartbeat=heartbeat or now,
         execute_after=execute_after or now,
         updated=updated or now,
         status=status,
-        entrypoint=entrypoint,
+        entrypoint=QueueEntrypoint(entrypoint),
         payload=payload,
-        queue_manager_id=queue_manager_id or uuid.uuid4(),
+        queue_manager_id=QueueManagerId(queue_manager_id or uuid.uuid4()),
         headers=headers,
     )
 
@@ -62,3 +130,32 @@ async def wait_until_empty_queue(
 
     for manager in managers:
         manager.shutdown.set()
+
+
+def collapse(schema: Schema) -> Schema:
+    """Whitespace-normalise function bodies; everything else compares exactly.
+
+    A plpgsql body cannot be normalised in the model itself: it carries ``--``
+    comments, so folding newlines would swallow the rest of each line.
+    """
+    return dataclasses.replace(
+        schema,
+        functions=tuple(
+            dataclasses.replace(function, body=" ".join(function.body.split()))
+            for function in schema.functions
+        ),
+    )
+
+
+def declared_schema(settings: qb.DBSettings) -> Schema:
+    """The target model, normalised the same way ``collapse`` reads."""
+    return collapse(target(settings))
+
+
+RELEASES_DIR = Path(__file__).parent / "schema_releases"
+
+
+async def install_release(driver: db.Driver, release: str) -> None:
+    """Replace the template schema with the one *release* shipped."""
+    await Queries(driver).uninstall()
+    await driver.execute((RELEASES_DIR / f"{release}.sql").read_text())

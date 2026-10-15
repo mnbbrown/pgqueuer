@@ -14,11 +14,11 @@ from pgqueuer.core.listeners import (
     default_event_router,
     initialize_notice_event_listener,
 )
-from pgqueuer.domain.settings import DBSettings, add_prefix
+from pgqueuer.domain.settings import DBSettings
+from pgqueuer.domain.types import Channel, HealthCheckId, QueueEntrypoint, QueueManagerId
 from pgqueuer.models import (
     AnyEvent,
     CancellationEvent,
-    Channel,
     Context,
     HealthCheckEvent,
     JobId,
@@ -30,11 +30,11 @@ from pgqueuer.queries import EntrypointExecutionParameter, Queries
 async def test_handle_table_changed_event() -> None:
     notice_event_queue = PGNoticeEventListener()
     canceled: MutableMapping[JobId, Context] = {}
-    pending_health_check: MutableMapping[uuid.UUID, asyncio.Future[HealthCheckEvent]] = {}
+    pending_health_check: MutableMapping[HealthCheckId, asyncio.Future[HealthCheckEvent]] = {}
 
     event = AnyEvent(
         root=TableChangedEvent(
-            channel="channel_1",
+            channel=Channel("channel_1"),
             sent_at=datetime.now(tz=timezone.utc),
             type="table_changed_event",
             operation="insert",
@@ -54,7 +54,7 @@ async def test_handle_table_changed_event() -> None:
 async def test_handle_cancellation_event() -> None:
     notice_event_queue = PGNoticeEventListener()
     canceled: MutableMapping[JobId, Context] = {}
-    pending_health_check: MutableMapping[uuid.UUID, asyncio.Future[HealthCheckEvent]] = {}
+    pending_health_check: MutableMapping[HealthCheckId, asyncio.Future[HealthCheckEvent]] = {}
 
     cancellation_context = Context(
         cancellation=CancelScope(), resources={"test_key": "listener_test"}
@@ -64,7 +64,7 @@ async def test_handle_cancellation_event() -> None:
 
     event = AnyEvent(
         root=CancellationEvent(
-            channel="channel_1",
+            channel=Channel("channel_1"),
             sent_at=datetime.now(tz=timezone.utc),
             type="cancellation_event",
             ids=[job_id],
@@ -83,14 +83,14 @@ async def test_handle_cancellation_event() -> None:
 async def test_handle_health_check_event_event() -> None:
     notice_event_queue = PGNoticeEventListener()
     canceled: MutableMapping[JobId, Context] = {}
-    pending_health_check: MutableMapping[uuid.UUID, asyncio.Future[HealthCheckEvent]] = {}
+    pending_health_check: MutableMapping[HealthCheckId, asyncio.Future[HealthCheckEvent]] = {}
 
     event = AnyEvent(
         root=HealthCheckEvent(
-            channel="channel_1",
+            channel=Channel("channel_1"),
             sent_at=datetime.now(timezone.utc),
             type="health_check_event",
-            id=uuid.uuid4(),
+            id=HealthCheckId(uuid.uuid4()),
         )
     )
     assert isinstance(event.root, HealthCheckEvent)
@@ -125,7 +125,7 @@ async def test_emit_stable_changed_insert(apgdriver: db.Driver) -> None:
     (event,) = evnets
 
     assert event.root.type == "table_changed_event"
-    assert event.root.table == add_prefix("pgqueuer")
+    assert event.root.table == DBSettings().queue_table
     assert event.root.operation == "insert"
 
 
@@ -149,14 +149,14 @@ async def test_emit_stable_changed_update(apgdriver: db.Driver) -> None:
     (event,) = evnets
 
     assert event.root.type == "table_changed_event"
-    assert event.root.table == add_prefix("pgqueuer")
+    assert event.root.table == DBSettings().queue_table
     assert event.root.operation == "insert"
     evnets.clear()
 
     await Queries(apgdriver).dequeue(
         100,
-        {"test_emit_stable_changed_update": EntrypointExecutionParameter(0)},
-        uuid.uuid4(),
+        {QueueEntrypoint("test_emit_stable_changed_update"): EntrypointExecutionParameter(0)},
+        QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=timedelta(seconds=30),
     )
@@ -190,7 +190,7 @@ async def test_emits_truncate_table_truncate(apgdriver: db.Driver) -> None:
     (event,) = evnets
 
     assert event.root.type == "table_changed_event"
-    assert event.root.table == add_prefix("pgqueuer")
+    assert event.root.table == DBSettings().queue_table
     assert event.root.operation == "truncate"
     evnets.clear()
 
@@ -214,7 +214,7 @@ async def test_pgqueuer_heartbeat_event_trigger(apgdriver: db.Driver) -> None:
 
     (event,) = evnets
     assert event.root.type == "table_changed_event"
-    assert event.root.table == add_prefix("pgqueuer")
+    assert event.root.table == DBSettings().queue_table
     evnets.clear()
 
     await asyncio.gather(
@@ -224,17 +224,10 @@ async def test_pgqueuer_heartbeat_event_trigger(apgdriver: db.Driver) -> None:
     assert len(evnets) == 0
 
 
-def test_event_router_dispatches_correct_handler() -> None:
-    router = EventRouter()
-    called = {"flag": False}
-
-    @router.register("table_changed_event")
-    def _handle(evt: TableChangedEvent) -> None:
-        called["flag"] = evt.table == "jobs_table"
-
-    event = AnyEvent(
+def _table_changed_event() -> AnyEvent:
+    return AnyEvent(
         root=TableChangedEvent(
-            channel="chan",
+            channel=Channel("chan"),
             sent_at=datetime.now(tz=timezone.utc),
             type="table_changed_event",
             operation="insert",
@@ -242,36 +235,46 @@ def test_event_router_dispatches_correct_handler() -> None:
         )
     )
 
-    router(event)
-    assert called["flag"] is True
+
+def test_event_router_dispatches_table_changed_to_its_handler() -> None:
+    seen: list[TableChangedEvent] = []
+    router = EventRouter(
+        on_table_changed=seen.append,
+        on_cancellation=lambda evt: pytest.fail(f"unexpected {evt!r}"),
+        on_health_check=lambda evt: pytest.fail(f"unexpected {evt!r}"),
+    )
+
+    router(_table_changed_event())
+
+    assert [evt.table for evt in seen] == ["jobs_table"]
 
 
-def test_event_router_duplicate_registration_raises() -> None:
-    router = EventRouter()
+def test_event_router_dispatches_each_type_once() -> None:
+    hits: list[str] = []
+    router = EventRouter(
+        on_table_changed=lambda evt: hits.append(evt.type),
+        on_cancellation=lambda evt: hits.append(evt.type),
+        on_health_check=lambda evt: hits.append(evt.type),
+    )
+    sent_at = datetime.now(tz=timezone.utc)
 
-    @router.register("table_changed_event")
-    def _handler(evt: TableChangedEvent) -> None:
-        pass
-
-    with pytest.raises(ValueError):
-
-        @router.register("table_changed_event")
-        def _another(evt: TableChangedEvent) -> None:
-            pass
-
-
-def test_event_router_missing_handler_raises() -> None:
-    router = EventRouter()
-
-    event = AnyEvent(
-        root=TableChangedEvent(
-            channel="chan",
-            sent_at=datetime.now(tz=timezone.utc),
-            type="table_changed_event",
-            operation="insert",
-            table="jobs_table",
+    router(_table_changed_event())
+    router(
+        AnyEvent(
+            root=CancellationEvent(
+                channel=Channel("chan"), sent_at=sent_at, type="cancellation_event", ids=[]
+            )
+        )
+    )
+    router(
+        AnyEvent(
+            root=HealthCheckEvent(
+                channel=Channel("chan"),
+                sent_at=sent_at,
+                type="health_check_event",
+                id=HealthCheckId(uuid.uuid4()),
+            )
         )
     )
 
-    with pytest.raises(NotImplementedError):
-        router(event)
+    assert hits == ["table_changed_event", "cancellation_event", "health_check_event"]

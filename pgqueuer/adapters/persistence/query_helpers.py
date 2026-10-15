@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Generator, Sequence
+from typing import Generator, Sequence, TypeVar
+
+from pgqueuer.domain.types import JobId
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -12,7 +17,7 @@ class NormedEnqueueParam:
     payload: list[bytes | None]
     execute_after: list[timedelta]
     dedupe_key: list[str | None]
-    headers: list[dict | None]
+    headers: list[Mapping[str, object] | None]
     serialize_key: list[str | None]
 
 
@@ -22,7 +27,7 @@ def normalize_enqueue_params(
     priority: int | list[int],
     execute_after: timedelta | None | list[timedelta | None] = None,
     dedupe_key: str | list[str | None] | None = None,
-    headers: dict | list[dict | None] | None = None,
+    headers: dict[str, str] | list[dict[str, str] | None] | None = None,
     serialize_key: str | list[str | None] | None = None,
 ) -> NormedEnqueueParam:
     """Normalize parameters for enqueue operations to handle both single and batch inputs."""
@@ -43,11 +48,36 @@ def normalize_enqueue_params(
     dedupe_key = [None] * len(normed_entrypoint) if dedupe_key is None else dedupe_key
     normed_dedupe_key = dedupe_key if isinstance(dedupe_key, list) else [dedupe_key]
 
-    serialize_key = [None] * len(normed_entrypoint) if serialize_key is None else serialize_key
-    normed_serialize_key = serialize_key if isinstance(serialize_key, list) else [serialize_key]
+    normed_headers: list[Mapping[str, object] | None] = (
+        [None] * len(normed_entrypoint)
+        if headers is None
+        else list(headers)
+        if isinstance(headers, list)
+        else [headers]
+    )
 
-    headers = [None] * len(normed_entrypoint) if headers is None else headers
-    normed_headers = headers if isinstance(headers, list) else [headers]
+    normed_serialize_key: list[str | None] = (
+        [None] * len(normed_entrypoint)
+        if serialize_key is None
+        else serialize_key
+        if isinstance(serialize_key, list)
+        else [serialize_key]
+    )
+
+    count = len(normed_entrypoint)
+    lengths = {
+        "payload": len(normed_payload),
+        "priority": len(normed_priority),
+        "execute_after": len(normed_execute_after),
+        "dedupe_key": len(normed_dedupe_key),
+        "headers": len(normed_headers),
+        "serialize_key": len(normed_serialize_key),
+    }
+    for parameter, length in lengths.items():
+        if length != count:
+            raise ValueError(
+                f"Expected {count} values for {parameter} to match entrypoint, got {length}."
+            )
 
     return NormedEnqueueParam(
         priority=normed_priority,
@@ -55,15 +85,50 @@ def normalize_enqueue_params(
         payload=normed_payload,
         execute_after=normed_execute_after,
         dedupe_key=normed_dedupe_key,
-        serialize_key=normed_serialize_key,
         headers=normed_headers,
+        serialize_key=normed_serialize_key,
     )
 
 
+def reject_repeated_dedupe_keys(dedupe_key: list[str | None]) -> None:
+    """``on_conflict="update_priority"`` takes each dedupe key at most once per call.
+
+    PostgreSQL's ``ON CONFLICT DO UPDATE`` cannot update one row twice in a statement.
+    """
+    keys = [key for key in dedupe_key if key is not None]
+    if len(keys) != len(set(keys)):
+        raise ValueError(
+            "on_conflict='update_priority' needs each dedupe_key at most once per call"
+        )
+
+
+def cell(row: Mapping[str, object], key: str, kind: type[T]) -> T:
+    """Return ``row[key]`` checked to be *kind*; driver rows arrive untyped."""
+    value = row[key]
+    if not isinstance(value, kind):
+        raise TypeError(f"column {key!r}: expected {kind.__name__}, got {type(value).__name__}")
+    return value
+
+
+def scatter_ids_by_ordinal(
+    rows: list[dict[str, object]],
+    count: int,
+) -> list[JobId | None]:
+    """Place each inserted row's id at its 1-based input ordinal.
+
+    `count` input rows produce `count` slots; positions whose row was skipped by
+    ON CONFLICT never appear in *rows* and stay ``None``.
+    """
+    ids: list[JobId | None] = [None] * count
+    for row in rows:
+        ids[cell(row, "ord", int) - 1] = JobId(cell(row, "id", int))
+    return ids
+
+
 def merge_tracing_headers(
-    headers: list[dict | None],
-    trace_headers: Generator[dict | None, None, None],
-) -> list[dict]:
+    headers: list[Mapping[str, object] | None],
+    trace_headers: Generator[Mapping[str, object] | None, None, None],
+) -> list[Mapping[str, object] | None]:
     """Merge tracing headers into the existing headers for each entrypoint."""
     return [
         {**(h or {}), **(t or {})}

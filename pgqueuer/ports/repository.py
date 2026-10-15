@@ -1,21 +1,21 @@
-"""Port protocols for PgQueuer's hexagonal architecture.
-
-These Protocol classes define the contracts that the core domain
-(QueueManager, SchedulerManager) depends on. The existing ``Queries``
-class satisfies all four ports via structural subtyping -- no
-inheritance or registration is required.
-"""
+"""Repository port protocols satisfied by Queries via structural subtyping."""
 
 from __future__ import annotations
 
 import dataclasses
-import uuid
 from datetime import timedelta
-from typing import Protocol, overload
+from typing import Literal, Protocol, overload
 
-from pgqueuer.domain import models
+from pgqueuer.domain import models, types
 from pgqueuer.domain.settings import DBSettings
-from pgqueuer.domain.types import CronEntrypoint, SortOrder
+from pgqueuer.domain.types import (
+    CronEntrypoint,
+    HealthCheckId,
+    OnConflict,
+    QueueEntrypoint,
+    QueueManagerId,
+    SortOrder,
+)
 from pgqueuer.ports.driver import Driver
 
 
@@ -27,24 +27,10 @@ class QueryBuilderEnvironmentPort(Protocol):
 
 @dataclasses.dataclass
 class EntrypointExecutionParameter:
-    """
-    Job execution parameters passed to dequeue.
-
-    Attributes:
-        concurrency_limit (int): Max number of concurrent executions (0 = unlimited).
-        serialize_dispatch_per_key (bool): When True, jobs for this entrypoint
-            sharing the same non-NULL ``serialize_key`` are dispatched at most
-            one-at-a-time, in priority/FIFO order. Jobs with different keys (or
-            NULL keys) run normally.
-    """
+    """Per-entrypoint dequeue parameter. ``concurrency_limit=0`` means unlimited."""
 
     concurrency_limit: int
     serialize_dispatch_per_key: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Queue persistence
-# ---------------------------------------------------------------------------
 
 
 class QueueRepositoryPort(Protocol):
@@ -53,8 +39,8 @@ class QueueRepositoryPort(Protocol):
     async def dequeue(
         self,
         batch_size: int,
-        entrypoints: dict[str, EntrypointExecutionParameter],
-        queue_manager_id: uuid.UUID,
+        entrypoints: dict[QueueEntrypoint, EntrypointExecutionParameter],
+        queue_manager_id: QueueManagerId,
         global_concurrency_limit: int | None,
         heartbeat_timeout: timedelta,
     ) -> list[models.Job]: ...
@@ -69,7 +55,23 @@ class QueueRepositoryPort(Protocol):
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
         serialize_key: str | None = None,
-    ) -> list[models.JobId]: ...
+        *,
+        on_conflict: Literal["raise", "update_priority"] = "raise",
+    ) -> list[types.JobId]: ...
+
+    @overload
+    async def enqueue(
+        self,
+        entrypoint: str,
+        payload: bytes | None,
+        priority: int = 0,
+        execute_after: timedelta | None = None,
+        dedupe_key: str | None = None,
+        headers: dict[str, str] | None = None,
+        serialize_key: str | None = None,
+        *,
+        on_conflict: Literal["skip"],
+    ) -> list[types.JobId | None]: ...
 
     @overload
     async def enqueue(
@@ -81,7 +83,23 @@ class QueueRepositoryPort(Protocol):
         dedupe_key: list[str | None] | None = None,
         headers: list[dict[str, str] | None] | None = None,
         serialize_key: list[str | None] | None = None,
-    ) -> list[models.JobId]: ...
+        *,
+        on_conflict: Literal["raise", "update_priority"] = "raise",
+    ) -> list[types.JobId]: ...
+
+    @overload
+    async def enqueue(
+        self,
+        entrypoint: list[str],
+        payload: list[bytes | None],
+        priority: list[int],
+        execute_after: list[timedelta | None] | None = None,
+        dedupe_key: list[str | None] | None = None,
+        headers: list[dict[str, str] | None] | None = None,
+        serialize_key: list[str | None] | None = None,
+        *,
+        on_conflict: Literal["skip"],
+    ) -> list[types.JobId | None]: ...
 
     async def enqueue(
         self,
@@ -92,7 +110,77 @@ class QueueRepositoryPort(Protocol):
         dedupe_key: str | list[str | None] | None = None,
         headers: dict[str, str] | list[dict[str, str] | None] | None = None,
         serialize_key: str | list[str | None] | None = None,
-    ) -> list[models.JobId]: ...
+        *,
+        on_conflict: OnConflict = "raise",
+    ) -> list[types.JobId] | list[types.JobId | None]: ...
+
+    async def log_jobs(
+        self,
+        job_status: list[
+            tuple[
+                models.Job,
+                types.JOB_STATUS,
+                models.TracebackRecord | None,
+            ]
+        ],
+    ) -> None: ...
+
+    async def retry_job(
+        self,
+        job: models.Job,
+        delay: timedelta,
+        traceback_record: models.TracebackRecord | None,
+    ) -> None: ...
+
+    async def requeue_jobs(self, ids: list[types.JobId], reset_attempts: bool = True) -> None: ...
+
+    async def list_failed_jobs(
+        self, limit: int = 100, order: SortOrder = "DESC"
+    ) -> list[models.Job]: ...
+
+    async def list_blocked_keys(
+        self, entrypoints: list[str] | None = None, limit: int = 100
+    ) -> list[models.BlockedKey]: ...
+
+    async def clear_queue(self, entrypoint: str | list[str] | None = None) -> None: ...
+
+    async def queue_size(self) -> list[models.QueueStatistics]: ...
+
+    async def mark_job_as_cancelled(self, ids: list[types.JobId]) -> None: ...
+
+    async def update_heartbeat(self, job_ids: list[types.JobId]) -> None: ...
+
+    async def queued_work(self, entrypoints: list[QueueEntrypoint]) -> int: ...
+
+    async def eligible_queued_work(self, entrypoints: list[QueueEntrypoint]) -> int:
+        """Like ``queued_work`` but counting only jobs whose ``execute_after`` has passed."""
+        ...
+
+    async def queue_log(self) -> list[models.Log]: ...
+
+    async def aggregate_logs(self) -> None:
+        """Fold unaggregated log rows into statistics without reading them back."""
+        ...
+
+    async def log_statistics(
+        self,
+        limit: int | None,
+        last: timedelta | None = None,
+    ) -> list[models.LogStatistics]: ...
+
+    async def job_status(
+        self,
+        ids: list[types.JobId],
+    ) -> list[tuple[types.JobId, types.JOB_STATUS]]: ...
+
+    @property
+    def driver(self) -> Driver: ...
+
+    async def clear_statistics_log(self, entrypoint: str | list[str] | None = None) -> None: ...
+
+    async def next_deferred_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
+        """Return time until the soonest deferred job becomes eligible, or None."""
+        ...
 
     async def enqueue_if_no_queued(
         self,
@@ -104,7 +192,7 @@ class QueueRepositoryPort(Protocol):
         execute_after: timedelta | None = None,
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
-    ) -> models.JobId | None:
+    ) -> types.JobId | None:
         """Enqueue iff no job for this entrypoint and serialize key is queued."""
         ...
 
@@ -118,49 +206,32 @@ class QueueRepositoryPort(Protocol):
         execute_after: timedelta | None = None,
         serialize_key: str | None = None,
         headers: dict[str, str] | None = None,
-    ) -> models.JobId | None:
+    ) -> types.JobId | None:
         """Enqueue iff no job with this dedupe key is queued or picked."""
         ...
 
-    async def log_jobs(
-        self,
-        job_status: list[
-            tuple[
-                models.Job,
-                models.JOB_STATUS,
-                models.TracebackRecord | None,
-            ]
-        ],
-    ) -> None: ...
 
-    async def retry_job(
-        self,
-        job: models.Job,
-        delay: timedelta,
-        traceback_record: models.TracebackRecord | None,
-    ) -> None: ...
-
-    async def requeue_jobs(
-        self,
-        ids: list[models.JobId],
-        reset_attempts: bool = True,
-    ) -> None: ...
-
-    async def list_failed_jobs(
-        self, limit: int = 100, order: SortOrder = "DESC"
-    ) -> list[models.Job]: ...
-
-    async def clear_queue(self, entrypoint: str | list[str] | None = None) -> None: ...
+class InsightsRepositoryPort(Protocol):
+    """Read-only queue introspection consumed by presentation layers (web, MCP, CLI)."""
 
     async def queue_size(self) -> list[models.QueueStatistics]: ...
 
-    async def mark_job_as_cancelled(self, ids: list[models.JobId]) -> None: ...
+    async def queue_age(self) -> list[models.QueueAgeStats]: ...
 
-    async def update_heartbeat(self, job_ids: list[models.JobId]) -> None: ...
+    async def job_duration_percentiles(
+        self,
+        last: timedelta,
+    ) -> list[models.JobDurationStats]: ...
 
-    async def queued_work(self, entrypoints: list[str]) -> int: ...
+    async def throughput_summary(
+        self,
+        last: timedelta | None = None,
+    ) -> list[models.ThroughputStats]: ...
 
-    async def queue_log(self) -> list[models.Log]: ...
+    async def throughput_timeseries(
+        self,
+        last: timedelta,
+    ) -> list[models.ThroughputBucket]: ...
 
     async def log_statistics(
         self,
@@ -168,36 +239,41 @@ class QueueRepositoryPort(Protocol):
         last: timedelta | None = None,
     ) -> list[models.LogStatistics]: ...
 
-    async def job_status(
+    async def active_workers(self) -> list[models.ActiveWorker]: ...
+
+    async def stale_jobs(
         self,
-        ids: list[models.JobId],
-    ) -> list[tuple[models.JobId, models.JOB_STATUS]]: ...
-
-    @property
-    def driver(self) -> Driver:
-        """Access the underlying database driver."""
-        ...
-
-    async def clear_statistics_log(self, entrypoint: str | list[str] | None = None) -> None:
-        """Clear statistics log entries."""
-        ...
-
-    async def next_deferred_eta(self, entrypoints: list[str]) -> timedelta | None:
-        """Return time until the soonest deferred job becomes eligible, or None."""
-        ...
-
-    async def list_blocked_keys(
-        self,
-        entrypoints: list[str] | None = None,
+        threshold: timedelta,
         limit: int = 100,
-    ) -> list[models.BlockedKey]:
-        """List serialize_keys with eligible queued jobs currently blocked."""
-        ...
+    ) -> list[models.StaleJob]: ...
 
+    async def exception_logs(self, limit: int = 100) -> list[models.Log]: ...
 
-# ---------------------------------------------------------------------------
-# Schedule persistence
-# ---------------------------------------------------------------------------
+    async def list_failed_jobs(
+        self, limit: int = 100, order: SortOrder = "DESC"
+    ) -> list[models.Job]: ...
+
+    async def browse_queue(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        statuses: list[types.JOB_STATUS] | None = None,
+        entrypoints: list[str] | None = None,
+    ) -> list[models.Job]: ...
+
+    async def queue_job_by_id(self, id: types.JobId) -> models.Job | None: ...
+
+    async def job_log_history(
+        self,
+        id: types.JobId,
+        limit: int = 100,
+    ) -> list[models.Log]: ...
+
+    async def unaggregated_log_count(self) -> int: ...
+
+    async def schema_info(self) -> list[models.TableInfo]: ...
+
+    async def peek_schedule(self) -> list[models.Schedule]: ...
 
 
 class ScheduleRepositoryPort(Protocol):
@@ -213,46 +289,34 @@ class ScheduleRepositoryPort(Protocol):
         entrypoints: dict[models.CronExpressionEntrypoint, timedelta],
     ) -> list[models.Schedule]: ...
 
-    async def set_schedule_queued(self, ids: set[models.ScheduleId]) -> None: ...
+    async def set_schedule_queued(self, ids: set[types.ScheduleId]) -> None: ...
 
-    async def update_schedule_heartbeat(self, ids: set[models.ScheduleId]) -> None: ...
+    async def update_schedule_heartbeat(self, ids: set[types.ScheduleId]) -> None: ...
 
     async def peek_schedule(self) -> list[models.Schedule]: ...
 
     async def delete_schedule(
         self,
-        ids: set[models.ScheduleId],
+        ids: set[types.ScheduleId],
         entrypoints: set[CronEntrypoint],
     ) -> None: ...
 
     async def clear_schedule(self) -> None: ...
 
 
-# ---------------------------------------------------------------------------
-# Notifications
-# ---------------------------------------------------------------------------
-
-
 class NotificationPort(Protocol):
     """Abstraction over PostgreSQL NOTIFY for inter-process signalling."""
 
-    async def notify_job_cancellation(self, ids: list[models.JobId]) -> None: ...
+    async def notify_job_cancellation(self, ids: list[types.JobId]) -> None: ...
 
-    async def notify_health_check(self, health_check_event_id: uuid.UUID) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# Schema management (DDL)
-# ---------------------------------------------------------------------------
+    async def notify_health_check(self, health_check_event_id: HealthCheckId) -> None: ...
 
 
 class SchemaManagementPort(Protocol):
     """DDL operations for installing, upgrading, and inspecting the schema."""
 
     @property
-    def qbe(self) -> QueryBuilderEnvironmentPort:
-        """Access the query builder environment for schema operations."""
-        ...
+    def qbe(self) -> QueryBuilderEnvironmentPort: ...
 
     async def install(self) -> None: ...
 

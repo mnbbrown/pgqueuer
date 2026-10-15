@@ -3,19 +3,22 @@ import functools
 import inspect
 from datetime import timedelta
 from multiprocessing import Process, Queue as MPQueue
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
+from unittest.mock import Mock
 
 import anyio
 import pytest
 
 from pgqueuer.db import Driver
+from pgqueuer.domain.types import QueueEntrypoint
 from pgqueuer.executors import (
     AbstractEntrypointExecutor,
     EntrypointExecutor,
     EntrypointExecutorParameters,
     is_async_callable,
+    wants_context,
 )
-from pgqueuer.models import Context, Job
+from pgqueuer.models import Context, Job, ScheduleContext
 from pgqueuer.qm import QueueManager
 from pgqueuer.queries import Queries
 from test.helpers import mocked_job
@@ -67,7 +70,7 @@ async def test_entrypoint_executor_async_with_context(apgdriver: Driver) -> None
 
     async def async_function(job: Job, ctx: Context) -> None:
         marker = ctx.resources.get("marker")
-        if marker:
+        if isinstance(marker, str):
             markers.append(marker)
 
     executor = EntrypointExecutor(
@@ -141,6 +144,111 @@ async def test_entrypoint_executor_without_context_detection(apgdriver: Driver) 
 
     await executor.execute(job, job_context)
     assert calls == [(job, None)]
+
+
+async def handler_no_context(job: Job) -> None: ...
+async def handler_positional_context(job: Job, ctx: Context) -> None: ...
+async def handler_positional_only_context(job: Job, ctx: Context, /) -> None: ...
+async def handler_string_context(job: Job, ctx: "Context") -> None: ...
+async def handler_context_first(ctx: Context) -> None: ...
+async def handler_unannotated_second(job: Job, ctx) -> None: ...  # type: ignore[no-untyped-def]
+async def handler_unrelated_second(job: Job, config: dict[str, Any] | None = None) -> None: ...
+async def handler_keyword_only_context(job: Job, *, ctx: Context) -> None: ...
+async def handler_var_positional(job: Job, *args: object) -> None: ...
+async def handler_var_keyword(job: Job, **kwargs: object) -> None: ...
+async def handler_no_params() -> None: ...
+async def handler_schedule_context(job: Job, ctx: ScheduleContext) -> None: ...
+
+
+@pytest.mark.parametrize(
+    ("func", "context_type", "expected"),
+    [
+        pytest.param(handler_no_context, Context, False, id="no-second-param"),
+        pytest.param(handler_positional_context, Context, True, id="positional-or-keyword"),
+        pytest.param(handler_positional_only_context, Context, True, id="positional-only"),
+        pytest.param(handler_string_context, Context, True, id="string-forward-ref"),
+        pytest.param(handler_context_first, Context, True, id="context-in-first-slot"),
+        pytest.param(handler_unannotated_second, Context, False, id="unannotated-second"),
+        pytest.param(handler_unrelated_second, Context, False, id="unrelated-second"),
+        pytest.param(handler_keyword_only_context, Context, False, id="keyword-only-excluded"),
+        pytest.param(handler_var_positional, Context, False, id="var-positional-excluded"),
+        pytest.param(handler_var_keyword, Context, False, id="var-keyword-excluded"),
+        pytest.param(handler_no_params, Context, False, id="no-params"),
+        pytest.param(handler_schedule_context, ScheduleContext, True, id="schedulecontext-match"),
+        pytest.param(handler_schedule_context, Context, False, id="schedulecontext-not-context"),
+        pytest.param(handler_positional_context, ScheduleContext, False, id="context-not-schedule"),
+    ],
+)
+def test_wants_context_matrix(
+    func: Callable[..., Awaitable[None]],
+    context_type: type,
+    expected: bool,
+) -> None:
+    assert wants_context(func, context_type) is expected
+
+
+def test_wants_context_unwraps_partial() -> None:
+    async def handler(prefix: str, job: Job, ctx: Context) -> None: ...
+
+    # functools.partial drops the bound leading argument; ctx stays positional.
+    assert wants_context(functools.partial(handler, "prefix"), Context)
+
+
+def test_wants_context_partial_keyword_binding_excludes_context() -> None:
+    async def handler(job: Job, ctx: Context) -> None: ...
+
+    # Binding ctx by keyword turns it keyword-only, so it is no longer positionally bindable.
+    # The bound value is never used — wants_context only inspects the signature.
+    bound = functools.partial(handler, ctx=cast(Context, object()))
+    assert not wants_context(bound, Context)
+
+
+def test_wants_context_detects_callable_object() -> None:
+    class Handler:
+        async def __call__(self, job: Job, ctx: Context) -> None: ...
+
+    assert wants_context(Handler(), Context)
+
+
+def test_wants_context_false_when_annotations_unresolvable() -> None:
+    async def handler(job: Job, ctx: Context, extra: object) -> None: ...
+
+    # eval_str fails on the unresolvable ref, so detection degrades to False even though a
+    # Context parameter is present (documents the all-or-nothing fallback in the except branch).
+    handler.__annotations__["extra"] = "Undefined_Name_For_Test"
+    assert not wants_context(handler, Context)
+
+
+def test_entrypoint_auto_detects_context() -> None:
+    qm = QueueManager(Mock())
+
+    @qm.entrypoint("with_context")
+    async def with_context(job: Job, ctx: Context) -> None: ...
+
+    @qm.entrypoint("without_context")
+    async def without_context(job: Job) -> None: ...
+
+    @qm.entrypoint("unrelated_second")
+    async def unrelated_second(job: Job, config: dict[str, Any] | None = None) -> None: ...
+
+    assert qm.entrypoint_registry[QueueEntrypoint("with_context")].parameters.accepts_context
+    assert not qm.entrypoint_registry[QueueEntrypoint("without_context")].parameters.accepts_context
+    assert not qm.entrypoint_registry[
+        QueueEntrypoint("unrelated_second")
+    ].parameters.accepts_context
+
+
+def test_entrypoint_explicit_flag_overrides_detection() -> None:
+    qm = QueueManager(Mock())
+
+    @qm.entrypoint("forced_off", accepts_context=False)
+    async def forced_off(job: Job, ctx: Context) -> None: ...
+
+    @qm.entrypoint("forced_on", accepts_context=True)
+    async def forced_on(job: Job) -> None: ...
+
+    assert not qm.entrypoint_registry[QueueEntrypoint("forced_off")].parameters.accepts_context
+    assert qm.entrypoint_registry[QueueEntrypoint("forced_on")].parameters.accepts_context
 
 
 async def test_custom_threading_executor() -> None:

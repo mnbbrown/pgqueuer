@@ -1,14 +1,14 @@
 # Quick Start
 
 This guide walks you through creating a job consumer, enqueuing work, and monitoring
-the queue -- all in under 5 minutes.
+the queue, all in under 5 minutes.
 
 **Prerequisites:** PgQueuer installed and schema created. See [Installation](installation.md)
 if you haven't done that yet.
 
 ---
 
-## 1. Define a Consumer
+## 1. Define a consumer
 
 Create a file called `myapp.py`. PgQueuer uses a factory pattern: you write an
 `@asynccontextmanager` function that yields a configured `PgQueuer` instance.
@@ -120,7 +120,7 @@ Create a file called `myapp.py`. PgQueuer uses a factory pattern: you write an
 
 ---
 
-## 2. Run the Consumer
+## 2. Run the consumer
 
 ```bash
 pgq run myapp:main
@@ -136,7 +136,7 @@ The `run` command:
 
 ---
 
-## 3. Enqueue Jobs
+## 3. Enqueue jobs
 
 From another process or script, push jobs into the queue:
 
@@ -179,7 +179,11 @@ From another process or script, push jobs into the queue:
     ```
 
 `Queries.enqueue()` accepts lists for batch enqueuing. Each list element corresponds to one
-job. The method returns the IDs of the newly created jobs.
+job. All supplied lists must have the same length. A mismatch raises `ValueError` before any
+jobs are inserted. The method returns the IDs of the newly created jobs. When deduplicating with
+`dedupe_key` and `on_conflict="skip"`, the result keeps one entry per input; `None` marks
+positions skipped as duplicates. See
+[Reliability & Failure Handling](../guides/reliability.md#idempotency).
 
 ---
 
@@ -195,14 +199,14 @@ This refreshes every 5 seconds and shows jobs per entrypoint, status counts, and
 
 ---
 
-## What's Next?
+## What's next?
 
 You now have a working PgQueuer setup. Here's where to go from here:
 
 | Goal | Page |
 |------|------|
 | Understand the mental model | [Core Concepts](core-concepts.md) |
-| Add concurrency caps | [Concurrency Control](../guides/rate-limiting.md) |
+| Add concurrency caps | [Concurrency Control](../guides/concurrency-control.md) |
 | Set up cron-style recurring tasks | [Scheduling](../guides/scheduling.md) |
 | Handle transient failures with retries | [Database-Level Retry](../guides/retry.md) |
 | Park failed jobs for human review | [Holding Failed Jobs](../guides/hold-failed-jobs.md) |

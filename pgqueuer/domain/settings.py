@@ -1,81 +1,68 @@
-"""Domain configuration types for PgQueuer.
-
-These are pure configuration / value objects with no adapter-specific
-dependencies, so they belong in the domain layer.
-"""
+"""Domain configuration types for PgQueuer."""
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
-import re
+import warnings
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Callable, Literal, TypeAlias
 
-from pydantic import Field
+from pydantic import AliasChoices, Field, StringConstraints, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from pgqueuer.domain.models import Channel
+from pgqueuer.domain.types import Channel
+
+_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+
+# Object names are interpolated into SQL unquoted (schema DDL, TRUNCATE,
+# INSERT/SELECT), so every one is constrained to identifier characters before
+# it can reach a query string (#945).
+# Prefix is prepended to the default names, so it may be empty.
+IdentifierPrefix: TypeAlias = Annotated[str, StringConstraints(pattern=rf"^({_IDENT})?$")]
+# Rendered both as an unquoted identifier (folds to lowercase) and as a nspname
+# string literal (does not fold); normalize so both agree.
+SchemaName: TypeAlias = Annotated[str, StringConstraints(pattern=rf"^{_IDENT}$", to_lower=True)]
+# A dotted chain stays allowed (the legacy "schema.table" form), but each part
+# must itself be a plain identifier.
+ObjectName: TypeAlias = Annotated[str, StringConstraints(pattern=rf"^{_IDENT}(\.{_IDENT})*$")]
+# A NOTIFY channel goes into SQL as a string literal and asyncpg quotes it for
+# LISTEN, so dashes and dots work there; quotes, spaces and semicolons do not.
+ChannelName: TypeAlias = Annotated[
+    Channel, StringConstraints(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+]
 
 
 def add_prefix(string: str) -> str:
+    """Deprecated: ``DBSettings`` applies ``PGQUEUER_PREFIX`` itself via its ``prefix`` field."""
+    warnings.warn(
+        "add_prefix is deprecated; DBSettings reads PGQUEUER_PREFIX itself "
+        "(DBSettings(prefix=...) or the PGQUEUER_PREFIX environment variable).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return f"{os.environ.get('PGQUEUER_PREFIX', '')}{string}"
+
+
+def name_env_alias(field_name: str) -> AliasChoices:
+    """Env spellings for an object-name field: ``PGQUEUER_X`` plus the legacy bare ``X``."""
+    return AliasChoices(f"pgqueuer_{field_name}", field_name)
+
+
+def prefixed_default(base: str) -> Callable[[dict[str, str]], str]:
+    """Default for an object-name field: *base* behind the already-validated ``prefix``.
+
+    Runs only when the field is not explicitly provided, so overrides are
+    never double-prefixed. Requires ``prefix`` to be declared before the name
+    fields (pydantic passes previously validated fields as ``data``).
     """
-    Append a prefix from environment variables to a given string.
-
-    This function prepends the value of the 'PGQUEUER_PREFIX' environment variable
-    to the provided string. It is typically used to add a consistent prefix to
-    database object names (e.g., tables, triggers) to avoid naming conflicts
-    or to namespace the objects.
-
-    Args:
-        string (str): The base string to which the prefix will be added.
-
-    Returns:
-        str: The string with the prefix appended.
-    """
-
-    env = os.environ.get("PGQUEUER_PREFIX", "")
-    # - Starts with a letter or underscore
-    # - Contains only letters, numbers, and underscores
-    # - No dots or special characters
-    if env and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", env):
-        raise ValueError(
-            "Invalid prefix: The 'PGQUEUER_PREFIX' environment variable must "
-            "start with a letter or underscore and contain only letters, "
-            "numbers, and underscores. It cannot contain '.', spaces, or "
-            "other special characters."
-        )
-
-    return f"{env}{string}"
+    return lambda data: f"{data['prefix']}{base}"
 
 
 @dataclasses.dataclass(frozen=True)
 class DurabilityPolicy:
-    """
-    Defines the logging configuration for PGQueuer database tables.
-
-    Attributes:
-        pgqueuer (Literal['', 'UNLOGGED']):
-            Logging configuration for the `pgqueuer` table.
-            - '' (empty string): The table is logged.
-            - 'UNLOGGED': The table is unlogged for performance optimization.
-
-        pgqueuer_log (Literal['', 'UNLOGGED']):
-            Logging configuration for the `pgqueuer_log` table.
-            - '' (empty string): The table is logged.
-            - 'UNLOGGED': The table is unlogged for performance optimization.
-
-        pgqueuer_statistics (Literal['', 'UNLOGGED']):
-            Logging configuration for the `pgqueuer_statistics` table.
-            - '' (empty string): The table is logged.
-            - 'UNLOGGED': The table is unlogged for performance optimization.
-
-        pgqueuer_schedules (Literal['', 'UNLOGGED']):
-            Logging configuration for the `pgqueuer_schedules` table.
-            Matches the configuration of the `pgqueuer` table.
-            - '' (empty string): The table is logged.
-            - 'UNLOGGED': The table is unlogged for performance optimization.
-    """
+    """Per-table persistence: ``""`` = LOGGED (WAL); ``"UNLOGGED"`` = faster, crash-lossy."""
 
     queue_table: Literal["", "UNLOGGED"]
     queue_log_table: Literal["", "UNLOGGED"]
@@ -85,7 +72,7 @@ class DurabilityPolicy:
 
 class Durability(Enum):
     """
-    Represents the durability levels for PGQueuer table installations.
+    Represents the durability levels for PgQueuer table installations.
 
     Each durability level corresponds to a specific `DurabilityPolicy` instance that defines
     the logging configuration for all database tables.
@@ -109,16 +96,7 @@ class Durability(Enum):
 
     @property
     def config(self) -> DurabilityPolicy:
-        """
-        Returns the `DurabilityPolicy` associated with the durability level.
-
-        Returns:
-            DurabilityPolicy: A configuration object specifying the logging mode for each table.
-
-        Logging Modes:
-            - '' (empty string): Indicates the table is logged.
-            - 'UNLOGGED': Indicates the table is unlogged for performance optimization.
-        """
+        """Per-table LOGGED/UNLOGGED policy for this durability level."""
         match self:
             case Durability.volatile:
                 return DurabilityPolicy(
@@ -145,50 +123,168 @@ class Durability(Enum):
                 raise ValueError(f"Unknown durability level: {self}")
 
 
-class DBSettings(BaseSettings):
-    """
-    Configuration settings for database object names with optional prefixes.
+class ConnectionSettings(BaseSettings):
+    """Connection/pool parameters, read from ``PGQUEUER_*`` env vars.
 
-    This class contains the names of various database objects used by the job queue
-    system, such as tables, functions, triggers, channels, and scheduler tables. The
-    settings allow for the generation of object names with configurable prefixes,
-    which are set via environment variables. This is useful for avoiding naming
-    conflicts and supporting multiple instances with different namespaces.
-
+    Unset optional fields are never passed to the driver, so DSN parameters
+    and libpq environment variables keep full control of connection
+    behavior (pass-through principle, #605/#701).
     """
 
     model_config = SettingsConfigDict(
-        env_prefix=add_prefix(""),
+        env_prefix="PGQUEUER_",
         extra="ignore",
+        populate_by_name=True,
     )
 
-    # Channel name for PostgreSQL LISTEN/NOTIFY used to
-    # receive notifications about changes in the queue.
-    channel: Channel = Field(default=Channel(add_prefix("ch_pgqueuer")))
+    dsn: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PGQUEUER_DSN", "PGDSN"),
+    )
+    # Size sanity (max >= min) is enforced by the drivers themselves.
+    pool_min_size: int = Field(default=1, ge=0)
+    pool_max_size: int = Field(default=5, ge=1)
+    connect_timeout: float | None = Field(default=None, gt=0)
+    application_name: str | None = Field(default=None)
 
-    # Name of the database function triggered by changes to the queue
-    # table, used to notify subscribers.
-    function: str = Field(default=add_prefix("fn_pgqueuer_changed"))
 
-    # Name of the table that logs statistics about job processing,
-    # e.g., processing times and outcomes.
-    statistics_table: str = Field(default=add_prefix("pgqueuer_statistics"))
+@dataclasses.dataclass(frozen=True)
+class QualifiedNames:
+    """Schema-qualified spellings of the schema-scoped DB objects.
 
-    # Type of ENUM defining statuses for queue jobs, such as 'queued' or 'picked'.
-    queue_status_type: str = Field(default=add_prefix("pgqueuer_status"))
+    Deliberately omits ``channel`` (NOTIFY channels are database-global),
+    ``trigger`` (trigger names are referenced unqualified, scoped by their
+    table) and index names (unqualified, they inherit the table's schema).
+    """
 
-    # Name of the main table where jobs are queued before being processed.
-    queue_table: str = Field(default=add_prefix("pgqueuer"))
+    queue_table: str
+    queue_table_log: str
+    statistics_table: str
+    schedules_table: str
+    function: str
+    queue_status_type: str
 
-    # Name of the pgqueuer log table (log of `queue_table`).
-    queue_table_log: str = Field(default=add_prefix("pgqueuer_log"))
 
-    # Name of the trigger that invokes the function to notify changes, applied
-    # after DML operations on the queue table.
-    trigger: str = Field(default=add_prefix("tg_pgqueuer_changed"))
+class DBSettings(BaseSettings):
+    """Names of PgQueuer DB objects, namespaced by ``prefix`` and placed in ``db_schema``.
 
-    # Name of scheduler table
-    schedules_table: str = Field(default=add_prefix("pgqueuer_schedules"))
+    Each name field accepts two env spellings: the ``PGQUEUER_``-prefixed one
+    (preferred) and the legacy bare one that predates it (e.g.
+    ``PGQUEUER_QUEUE_TABLE`` and ``QUEUE_TABLE``).
+    """
 
-    # Specifies the durability policy for the database schema.
-    durability: Durability = Field(default=Durability.durable)
+    model_config = SettingsConfigDict(
+        env_prefix="PGQUEUER_",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    # Prepended to every object name not explicitly overridden; lets multiple
+    # PgQueuer instances share one database. Declared first: the name-field
+    # default factories read it from the validated data.
+    prefix: IdentifierPrefix = Field(default="")
+
+    # Postgres schema holding all PgQueuer objects; None defers to the
+    # connection's search_path (env var: PGQUEUER_SCHEMA).
+    db_schema: SchemaName | None = Field(
+        default=None,
+        validation_alias=AliasChoices("db_schema", "pgqueuer_schema"),
+    )
+
+    channel: ChannelName = Field(
+        default_factory=lambda data: Channel(f"{data['prefix']}ch_pgqueuer"),
+        validation_alias=name_env_alias("channel"),
+    )
+    function: ObjectName = Field(
+        default_factory=prefixed_default("fn_pgqueuer_changed"),
+        validation_alias=name_env_alias("function"),
+    )
+    statistics_table: ObjectName = Field(
+        default_factory=prefixed_default("pgqueuer_statistics"),
+        validation_alias=name_env_alias("statistics_table"),
+    )
+    queue_status_type: ObjectName = Field(
+        default_factory=prefixed_default("pgqueuer_status"),
+        validation_alias=name_env_alias("queue_status_type"),
+    )
+    queue_table: ObjectName = Field(
+        default_factory=prefixed_default("pgqueuer"),
+        validation_alias=name_env_alias("queue_table"),
+    )
+    queue_table_log: ObjectName = Field(
+        default_factory=prefixed_default("pgqueuer_log"),
+        validation_alias=name_env_alias("queue_table_log"),
+    )
+    trigger: ObjectName = Field(
+        default_factory=prefixed_default("tg_pgqueuer_changed"),
+        validation_alias=name_env_alias("trigger"),
+    )
+    schedules_table: ObjectName = Field(
+        default_factory=prefixed_default("pgqueuer_schedules"),
+        validation_alias=name_env_alias("schedules_table"),
+    )
+    durability: Durability = Field(
+        default=Durability.durable, validation_alias=name_env_alias("durability")
+    )
+
+    # When True, `pgq upgrade` widens legacy int4 id columns/sequences to BIGINT, which takes an
+    # ACCESS EXCLUSIVE lock and rewrites each table; set False to skip it and apply it out-of-band.
+    widen_id: bool = Field(default=True, validation_alias=name_env_alias("widen_id"))
+
+    @model_validator(mode="after")
+    def reject_dotted_names_with_db_schema(self) -> DBSettings:
+        """A pre-qualified name plus db_schema would render ``schema.a.b``; refuse the mix."""
+        if not self.db_schema:
+            return self
+        # Derived from QualifiedNames so a new schema-scoped object cannot
+        # silently skip this check.
+        for field in dataclasses.fields(QualifiedNames):
+            name: str = getattr(self, field.name)
+            if "." in name:
+                raise ValueError(
+                    f"object name {name!r} already contains a schema qualifier; "
+                    "drop the dot or unset db_schema/PGQUEUER_SCHEMA"
+                )
+        return self
+
+    @property
+    def legacy_statistics_status_type(self) -> str:
+        """Pre-v0.27 enum type name, kept only so uninstall can drop it."""
+        return f"{self.prefix}pgqueuer_statistics_status"
+
+    def qualify(self, name: str) -> str:
+        """Schema-qualified reference for *name*; bare when no db_schema is set."""
+        return f"{self.db_schema}.{name}" if self.db_schema else name
+
+    # cached_property: query builders access this on every SQL render (the
+    # dequeue loop rebuilds its query each iteration). Safe because names are
+    # fixed once validation and apply_prefix have run.
+    @functools.cached_property
+    def qualified(self) -> QualifiedNames:
+        return QualifiedNames(
+            queue_table=self.qualify(self.queue_table),
+            queue_table_log=self.qualify(self.queue_table_log),
+            statistics_table=self.qualify(self.statistics_table),
+            schedules_table=self.qualify(self.schedules_table),
+            function=self.qualify(self.function),
+            queue_status_type=self.qualify(self.queue_status_type),
+        )
+
+    @property
+    def schema_expr(self) -> str:
+        """SQL expression selecting the effective schema in catalog queries.
+
+        Interpolated literal when db_schema is set (safe: identifier-validated,
+        lowercase-normalized); current_schema() otherwise, and usable inside
+        DO-blocks which cannot take bind parameters.
+        """
+        return f"'{self.db_schema}'" if self.db_schema else "current_schema()"
+
+
+@functools.cache
+def db_settings() -> DBSettings:
+    """The process-wide ``DBSettings``, read from the environment once.
+
+    Clear with ``db_settings.cache_clear()`` after changing ``PGQUEUER_*`` env vars.
+    """
+    return DBSettings()

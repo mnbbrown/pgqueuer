@@ -15,6 +15,7 @@ import pytest
 
 from pgqueuer.adapters.inmemory import InMemoryQueries
 from pgqueuer.db import Driver
+from pgqueuer.domain.types import QueueEntrypoint, QueueManagerId
 from pgqueuer.models import Job
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 from pgqueuer.qm import QueueManager
@@ -43,8 +44,10 @@ async def test_inmemory_enqueue_allows_multiple_with_same_serialize_key(
 async def test_inmemory_dispatch_serializes_per_key(queries: InMemoryQueries) -> None:
     """Same key → at most one picked at a time."""
     await queries.enqueue(["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"])
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
 
     first = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(first) == 1
@@ -68,8 +71,10 @@ async def test_inmemory_different_keys_run_in_parallel(queries: InMemoryQueries)
         [0, 0, 0],
         serialize_key=["a", "b", "c"],
     )
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     jobs = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert {j.entrypoint for j in jobs} == {"ep"}
     assert len(jobs) == 3
@@ -79,8 +84,10 @@ async def test_inmemory_different_keys_run_in_parallel(queries: InMemoryQueries)
 async def test_inmemory_null_serialize_key_unaffected(queries: InMemoryQueries) -> None:
     """Jobs with NULL serialize_key are not subject to per-key serialization."""
     await queries.enqueue(["ep", "ep"], [None, None], [0, 0])  # both NULL keys
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     jobs = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(jobs) == 2
 
@@ -89,9 +96,9 @@ async def test_inmemory_null_serialize_key_unaffected(queries: InMemoryQueries) 
 async def test_inmemory_flag_off_no_per_key_behavior(queries: InMemoryQueries) -> None:
     """With the flag off, all same-key jobs dispatch normally."""
     await queries.enqueue(["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"])
-    qm_id = uuid.uuid4()
+    qm_id = QueueManagerId(uuid.uuid4())
     # Default: serialize_dispatch_per_key=False
-    params = {"ep": EntrypointExecutionParameter(0)}
+    params = {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)}
     jobs = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(jobs) == 2
 
@@ -105,8 +112,10 @@ async def test_inmemory_fifo_within_key(queries: InMemoryQueries) -> None:
         [0, 0, 0],
         serialize_key=["k", "k", "k"],
     )
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     seen: list[int] = []
     for _ in range(3):
         picked = await queries.dequeue(
@@ -123,8 +132,10 @@ async def test_inmemory_priority_ordering_within_key(queries: InMemoryQueries) -
     """Higher priority same-key job runs first, even if enqueued later."""
     low = (await queries.enqueue("ep", None, priority=0, serialize_key="k"))[0]
     high = (await queries.enqueue("ep", None, priority=10, serialize_key="k"))[0]
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     first = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(first) == 1 and int(first[0].id) == int(high)
     await queries.log_jobs([(first[0], "successful", None)])
@@ -140,8 +151,10 @@ async def test_inmemory_list_blocked_keys(queries: InMemoryQueries) -> None:
         [0, 0, 0],
         serialize_key=["k", "k", "other"],
     )
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     # Pick the leader for "k"; "other" still has only one queued, so not blocked.
     await queries.dequeue(1, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
 
@@ -196,8 +209,10 @@ async def test_pg_dispatch_serializes_per_key(apgdriver: Driver) -> None:
     """Two same-key queued jobs → at most one picked at a time."""
     q = Queries(apgdriver)
     await q.enqueue(["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"])
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
 
     first = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(first) == 1
@@ -218,8 +233,10 @@ async def test_pg_different_keys_run_in_parallel(apgdriver: Driver) -> None:
         [0, 0, 0],
         serialize_key=["a", "b", "c"],
     )
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     jobs = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(jobs) == 3
 
@@ -228,8 +245,10 @@ async def test_pg_different_keys_run_in_parallel(apgdriver: Driver) -> None:
 async def test_pg_null_keys_unaffected(apgdriver: Driver) -> None:
     q = Queries(apgdriver)
     await q.enqueue(["ep", "ep"], [None, None], [0, 0])
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     jobs = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(jobs) == 2
 
@@ -239,8 +258,10 @@ async def test_pg_priority_ordering_within_key(apgdriver: Driver) -> None:
     q = Queries(apgdriver)
     low = (await q.enqueue("ep", None, priority=0, serialize_key="k"))[0]
     high = (await q.enqueue("ep", None, priority=10, serialize_key="k"))[0]
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
 
     first = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
     assert len(first) == 1 and int(first[0].id) == int(high)
@@ -258,8 +279,10 @@ async def test_pg_list_blocked_keys(apgdriver: Driver) -> None:
         [0, 0, 0],
         serialize_key=["k", "k", "other"],
     )
-    qm_id = uuid.uuid4()
-    params = {"ep": EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    params = {
+        QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
+    }
     await q.dequeue(1, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
 
     blocked = await q.list_blocked_keys()

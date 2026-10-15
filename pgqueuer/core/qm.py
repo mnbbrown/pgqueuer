@@ -1,15 +1,10 @@
-"""
-Queue Manager module for handling job queues and dispatching jobs.
-
-This module defines the `QueueManager` class, which manages job queues, dispatches
-jobs to registered entrypoints, and handles database connections and events.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import dataclasses
+import functools
+import random
 import sys
 import uuid
 from collections.abc import MutableMapping
@@ -22,7 +17,6 @@ import anyio
 
 from pgqueuer.core import (
     buffers,
-    cache,
     executors,
     heartbeat,
     listeners,
@@ -30,40 +24,23 @@ from pgqueuer.core import (
     tm,
 )
 from pgqueuer.domain import errors, models, types
-from pgqueuer.domain.settings import DBSettings
+from pgqueuer.domain.settings import db_settings
 from pgqueuer.ports import RepositoryPort, tracing
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 
 
 @dataclasses.dataclass
 class QueueManager:
-    """
-    Manages job queues and dispatches jobs to registered entrypoints.
+    """Dequeue jobs and dispatch them to registered entrypoint executors.
 
-    The `QueueManager` handles the lifecycle of jobs, including dequeueing,
-    dispatching to entrypoint functions, handling concurrency limits, and
-    managing cancellations.
-
-    Attributes:
-        queries (RepositoryPort): Repository for job queue operations. The underlying
-            database driver is accessed via ``queries.driver``.
-        channel (Channel): The PostgreSQL channel for notifications.
-        shutdown (asyncio.Event): Event to signal when the QueueManager is shutting down.
-        entrypoint_registry (dict[str, JobExecutor]): Registered job executors.
-        queue_manager_id (uuid.UUID): Unique identifier for each QueueManager instance.
-        job_context (dict[models.JobId, models.Context]): Contexts for jobs,
-            including cancellation scopes.
-        resources (MutableMapping[str, Any]): User-provided shared resources mapping
-            injected into each job Context. Pass at construction time to share
-            initialized pools/clients/models across jobs.
-        shutdown_on_listener_failure
-            If *True*, raise `FailingListenerError` and set the shutdown event when
-            the periodic listener health-check times out.
+    ``resources`` is a user-provided mapping (DB pools, HTTP clients, ML models,
+    etc.) propagated into every job Context. Pass at construction time to share
+    initialised objects across jobs.
     """
 
     queries: RepositoryPort
-    channel: models.Channel = dataclasses.field(
-        default=models.Channel(DBSettings().channel),
+    channel: types.Channel = dataclasses.field(
+        default_factory=lambda: types.Channel(db_settings().channel),
     )
 
     shutdown: asyncio.Event = dataclasses.field(
@@ -72,16 +49,18 @@ class QueueManager:
     )
 
     # Per entrypoint
-    entrypoint_registry: dict[str, executors.AbstractEntrypointExecutor] = dataclasses.field(
-        init=False,
-        default_factory=dict,
+    entrypoint_registry: dict[types.QueueEntrypoint, executors.AbstractEntrypointExecutor] = (
+        dataclasses.field(
+            init=False,
+            default_factory=dict,
+        )
     )
-    queue_manager_id: uuid.UUID = dataclasses.field(
+    queue_manager_id: types.QueueManagerId = dataclasses.field(
         init=False,
-        default_factory=uuid.uuid4,
+        default_factory=lambda: types.QueueManagerId(uuid.uuid4()),
     )
     # Shared resources mapping propagated into each job Context.
-    resources: MutableMapping = dataclasses.field(
+    resources: MutableMapping[str, object] = dataclasses.field(
         default_factory=dict,
     )
 
@@ -95,17 +74,22 @@ class QueueManager:
     on_listener_health_check: Callable[[bool, float], None] | None = None
 
     # Per job.
-    job_context: dict[models.JobId, models.Context] = dataclasses.field(
+    job_context: dict[types.JobId, models.Context] = dataclasses.field(
         init=False,
         default_factory=dict,
     )
 
-    pending_health_check: dict[uuid.UUID, asyncio.Future[models.HealthCheckEvent]] = (
+    pending_health_check: dict[types.HealthCheckId, asyncio.Future[models.HealthCheckEvent]] = (
         dataclasses.field(
             init=False,
             default_factory=dict,
         )
     )
+
+    # Incremented once per dispatched job; the periodic log-aggregation task
+    # only calls the database when this is nonzero, so an idle worker never
+    # round-trips an aggregation query for nothing.
+    jobs_logged: int = dataclasses.field(init=False, default=0)
 
     # Minimum sleep before re-checking the queue. Prevents busy-looping when a
     # deferred job's ETA is near zero or when the TOCTOU fallback detects
@@ -119,35 +103,26 @@ class QueueManager:
         self,
         timeout: timedelta = timedelta(seconds=10),
     ) -> models.HealthCheckEvent:
-        """
-        Perform a health check by sending a notification and waiting for a response.
-
-        Raises:
-            FailingListenerError: If the health check times out.
-        """
-        health_check_event_id = uuid.uuid4()
+        """Round-trip a NOTIFY/LISTEN probe. Raises ``FailingListenerError`` on timeout."""
+        health_check_event_id = types.HealthCheckId(uuid.uuid4())
         fut = asyncio.Future[models.HealthCheckEvent]()
         self.pending_health_check[health_check_event_id] = fut
         try:
             await self.queries.notify_health_check(health_check_event_id)
-            return await asyncio.wait_for(fut, timeout.total_seconds())
-        except (TimeoutError, asyncio.TimeoutError):
-            raise errors.FailingListenerError from None
+            done, _ = await asyncio.wait({fut}, timeout=timeout.total_seconds())
+            if not done:
+                raise errors.FailingListenerError
+            return fut.result()
         finally:
             self.pending_health_check.pop(health_check_event_id, None)
+            if not fut.done():
+                fut.cancel()
 
     async def _run_periodic_health_check(
         self,
         interval: timedelta = timedelta(seconds=10),
     ) -> None:
-        """
-        Periodically perform a health check by calling `listener_healthy`.
-
-        Args:
-            interval (timedelta): Time interval between health checks.
-            shutdown_on_failure (bool): Whether to set the shutdown event if a health check fails.
-        """
-
+        """Probe listener health every *interval*; raise on timeout via ``listener_healthy``."""
         while not self.shutdown.is_set():
             start = perf_counter()
             try:
@@ -164,44 +139,63 @@ class QueueManager:
                     timeout=interval.total_seconds(),
                 )
 
-    def get_context(self, job_id: models.JobId) -> models.Context:
-        """
-        Retrieve the context associated with a specific job ID.
+    async def _run_periodic_log_aggregation(self, interval: timedelta) -> None:
+        """Aggregate log->statistics every *interval* (jittered) until shutdown.
 
-        Args:
-            job_id (models.JobId): The unique identifier of the job.
-
-        Returns:
-            models.Context: The context object associated with the job.
+        Non-cron: mirrors ``_run_periodic_health_check``. Skipped when this worker
+        hasn't logged a job since the last tick: an idle worker has nothing new to
+        fold in, and the advisory lock in ``aggregate_logs`` already serializes real
+        work across workers. A failed attempt leaves ``jobs_logged`` set so the next
+        tick retries instead of silently dropping the backlog; only success resets it.
         """
+        while not self.shutdown.is_set():
+            if self.jobs_logged:
+                try:
+                    await self.queries.aggregate_logs()
+                except Exception:
+                    pass
+                else:
+                    self.jobs_logged = 0
+            with suppress(TimeoutError, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self.shutdown.wait(),
+                    timeout=interval.total_seconds() * random.uniform(0.8, 1.2),
+                )
+
+    def get_context(self, job_id: types.JobId) -> models.Context:
         return self.job_context[job_id]
+
+    def forget_job(
+        self,
+        job_id: types.JobId,
+        context: models.Context,
+        task: asyncio.Task[None],
+    ) -> None:
+        """Drop *job_id*'s context once its dispatch task is done, however it ended.
+
+        A retried job may already be running again under a new context; that one is kept.
+        """
+        if self.job_context.get(job_id) is context:
+            del self.job_context[job_id]
 
     def register_executor(
         self,
         name: str,
         executor: executors.AbstractEntrypointExecutor,
     ) -> None:
-        """
-        Register a job executor with a specific name.
-
-        Args:
-            name (str): The name of the entrypoint as referenced in the job queue.
-            executor (JobExecutor): The job executor instance.
-
-        Raises:
-            RuntimeError: If the entrypoint name is already registered.
-        """
-        if name in self.entrypoint_registry:
+        """Bind *name* to *executor*. Raises RuntimeError on duplicate name."""
+        entrypoint = types.QueueEntrypoint(name)
+        if entrypoint in self.entrypoint_registry:
             raise RuntimeError(f"{name} already in registry, name must be unique.")
 
-        self.entrypoint_registry[name] = executor
+        self.entrypoint_registry[entrypoint] = executor
 
     def entrypoint(
         self,
         name: str,
         *,
         concurrency_limit: int = 0,
-        accepts_context: bool = False,
+        accepts_context: bool | None = None,
         on_failure: types.OnFailure = "delete",
         serialize_dispatch_per_key: bool = False,
         executor_factory: Callable[
@@ -210,10 +204,10 @@ class QueueManager:
         ]
         | None = None,
     ) -> Callable[[executors.EntrypointTypeVar], executors.EntrypointTypeVar]:
-        """
-        Decorator to register an entrypoint for job processing.
+        """Decorator: register an entrypoint for job processing.
 
-        Users can specify a custom executor or use the default EntrypointExecutor.
+        ``concurrency_limit=0`` means unlimited; ``1`` serialises dispatch.
+        Limits are enforced at the database level across all workers.
 
         Args:
             name (str): The name of the entrypoint as referenced in the job queue.
@@ -233,15 +227,14 @@ class QueueManager:
                 ``docs/guides/per-key-serialization.md`` for caveats including
                 head-of-line blocking.
 
-        Returns:
-            Callable[[T], T]: A decorator that registers the function as an entrypoint.
+        ``accepts_context=None`` auto-detects from the handler signature (a
+        parameter annotated ``Context`` receives one); pass True/False to override.
 
-        Raises:
-            RuntimeError: If the entrypoint name is already registered.
-            ValueError: If `concurrency_limit` is negative.
+        ``on_failure='delete'`` (default) removes a terminally-failed job;
+        ``'hold'`` parks it with status ``'failed'`` for manual re-queue.
         """
 
-        if name in self.entrypoint_registry:
+        if types.QueueEntrypoint(name) in self.entrypoint_registry:
             raise RuntimeError(f"{name} already in registry, name must be unique.")
 
         if not isinstance(concurrency_limit, int):
@@ -250,8 +243,8 @@ class QueueManager:
         if concurrency_limit < 0:
             raise ValueError("Concurrency limit must be greater or eq. to zero.")
 
-        if not isinstance(accepts_context, bool):
-            raise ValueError("accepts_context must be boolean")
+        if accepts_context is not None and not isinstance(accepts_context, bool):
+            raise ValueError("accepts_context must be boolean or None")
 
         if not isinstance(serialize_dispatch_per_key, bool):
             raise ValueError("serialize_dispatch_per_key must be boolean")
@@ -262,13 +255,18 @@ class QueueManager:
         executor_factory = executor_factory or executors.EntrypointExecutor
 
         def register(func: executors.EntrypointTypeVar) -> executors.EntrypointTypeVar:
+            resolved_context = (
+                executors.wants_context(func, models.Context)
+                if accepts_context is None
+                else accepts_context
+            )
             self.register_executor(
                 name,
                 executor_factory(
                     executors.EntrypointExecutorParameters(
                         func=func,
                         concurrency_limit=concurrency_limit,
-                        accepts_context=accepts_context,
+                        accepts_context=resolved_context,
                         on_failure=on_failure,
                         serialize_dispatch_per_key=serialize_dispatch_per_key,
                     )
@@ -278,13 +276,8 @@ class QueueManager:
 
         return register
 
-    def entrypoints_below_capacity_limits(self) -> set[str]:
-        """
-        Return all registered entrypoint names.
-
-        Concurrency limits are enforced at the database level, so all
-        entrypoints are always eligible for dequeue attempts.
-        """
+    def entrypoints_below_capacity_limits(self) -> set[types.QueueEntrypoint]:
+        """All registered entrypoints; per-entrypoint limits are enforced in SQL."""
         return set(self.entrypoint_registry)
 
     async def fetch_jobs(
@@ -293,13 +286,7 @@ class QueueManager:
         global_concurrency_limit: int | None,
         heartbeat_timeout: timedelta,
     ) -> AsyncGenerator[models.Job, None]:
-        """
-        Fetch jobs from the queue that are ready for processing, yielding them one at a time.
-
-        This method retrieves a batch of jobs that match the current capacity constraints
-        of each entrypoint. It ensures that jobs are fetched only when the QueueManager
-        is operational and that concurrency controls are respected.
-        """
+        """Yield ready jobs one at a time, respecting per-entrypoint and global limits."""
 
         while not self.shutdown.is_set():
             entrypoints = {
@@ -312,17 +299,9 @@ class QueueManager:
                 for x in self.entrypoints_below_capacity_limits()
             }
 
-            # Cap batch_size to the smallest concurrency limit so a single
-            # dequeue never picks more jobs than the tightest entrypoint allows.
-            effective_batch = min(
-                (p.concurrency_limit for p in entrypoints.values() if p.concurrency_limit > 0),
-                default=batch_size,
-            )
-            effective_batch = min(batch_size, effective_batch)
-
             start = perf_counter()
             jobs = await self.queries.dequeue(
-                batch_size=effective_batch,
+                batch_size=batch_size,
                 entrypoints=entrypoints,
                 queue_manager_id=self.queue_manager_id,
                 global_concurrency_limit=global_concurrency_limit,
@@ -338,11 +317,7 @@ class QueueManager:
                 yield job
 
     async def verify_structure(self) -> None:
-        """
-        Verify the required database structure.
-
-        Checks necessary columns and user-defined types. Raises RuntimeError if missing.
-        """
+        """Assert that required tables, columns, indexes, enums, and triggers exist."""
 
         for table in (
             self.queries.qbe.settings.queue_table,
@@ -368,6 +343,7 @@ class QueueManager:
             (self.queries.qbe.settings.queue_table, "headers"),
             (self.queries.qbe.settings.queue_table, "attempts"),
             (self.queries.qbe.settings.queue_table, "serialize_key"),
+            (self.queries.qbe.settings.queue_table, "slot"),
             (self.queries.qbe.settings.queue_table_log, "traceback"),
         ):
             if not (await self.queries.table_has_column(table, column)):
@@ -398,6 +374,10 @@ class QueueManager:
                 self.queries.qbe.settings.queue_table,
                 f"{self.queries.qbe.settings.queue_table}_queued_serialize_key_idx",
             ),
+            (
+                self.queries.qbe.settings.queue_table,
+                f"{self.queries.qbe.settings.queue_table}_picked_slot_idx",
+            ),
         ):
             if not (await self.queries.table_has_index(table, index)):
                 raise RuntimeError(
@@ -409,7 +389,6 @@ class QueueManager:
         self,
         mode: types.QueueExecutionMode,
         task_manager: tm.TaskManager,
-        cached_queued_work: cache.TTLCache[int],
     ) -> None:
         """In drain mode, shut down once the queue is empty and all tasks have finished.
 
@@ -422,7 +401,9 @@ class QueueManager:
             return
         if task_manager.tasks:
             await asyncio.sleep(0)
-        if (await cached_queued_work()) == 0 and not task_manager.tasks:
+        if task_manager.tasks:
+            return
+        if await self.queries.queued_work(list(self.entrypoint_registry.keys())) == 0:
             self.shutdown.set()
 
     async def _maybe_health_shutdown(
@@ -442,14 +423,20 @@ class QueueManager:
             await periodic_health_check_task
 
     async def _effective_dequeue_timeout(self, dequeue_timeout: timedelta) -> timedelta:
-        """Return a potentially shortened timeout if a deferred job is about to become eligible."""
+        """Return a potentially shortened timeout if work is ready or a deferred job is due soon."""
         entrypoints = list(self.entrypoint_registry.keys())
+        # A job may have become eligible between the preceding dequeue and this
+        # check (TOCTOU), and its notification may already have been consumed by
+        # the per-dispatch drain. Eligible work always warrants a fast re-poll,
+        # even when deferred jobs exist.
+        if await self.queries.eligible_queued_work(entrypoints) > 0:
+            return self.min_dequeue_poll_interval
         eta = await self.queries.next_deferred_eta(entrypoints)
         if eta is not None and eta < dequeue_timeout:
             return max(eta, self.min_dequeue_poll_interval)
-        # When eta is None there are no future-deferred jobs, but a job may have
-        # become eligible between the preceding dequeue and this check (TOCTOU).
-        # If queued work exists, wake up quickly so the next iteration picks it up.
+        # A deferred job can cross its execute_after between the two probes
+        # above: the eligibility probe still saw it as deferred, the eta probe
+        # no longer sees it as future. queued_work counts both, closing the gap.
         if eta is None and await self.queries.queued_work(entrypoints) > 0:
             return self.min_dequeue_poll_interval
         return dequeue_timeout
@@ -462,32 +449,28 @@ class QueueManager:
         max_concurrent_tasks: int | None = None,
         shutdown_on_listener_failure: bool = False,
         heartbeat_timeout: timedelta = timedelta(seconds=30),
+        log_aggregation_interval: timedelta = timedelta(seconds=30),
     ) -> None:
+        """Process jobs until shutdown.
+
+        ``mode=drain`` exits once the queue is empty and in-flight tasks finish.
+        ``max_concurrent_tasks`` is a hard cap on this worker's picked jobs,
+        enforced by the dequeue query. Per-entrypoint concurrency limits are
+        likewise enforced in SQL, so batches keep their full size regardless
+        of the tightest registered limit.
+        ``heartbeat_timeout`` is the staleness threshold for re-picking a job;
+        heartbeats are emitted at half this interval.
+        ``log_aggregation_interval`` drives a background task that folds
+        ``pgqueuer_log`` into ``pgqueuer_statistics`` on a timer instead of only
+        on stats reads; pass ``timedelta(0)`` to disable (pure on-demand).
         """
-        Run the main loop to process jobs from the queue.
-
-        Continuously listens for events and dispatches jobs, managing connections
-        and tasks, logging timeouts, and resetting connections upon termination.
-
-        Args:
-            dequeue_timeout (timedelta): Timeout duration for waiting to dequeue jobs.
-            batch_size (int): Number of jobs to retrieve in each batch.
-            mode (QueueExecutionMode): Whether to run in `continuous` or `drain` until
-                queue is empty then shutdown.
-            max_concurrent_tasks (int|None, default=None): Limit the total number of tasks that
-                can run at the same time. If unspecified or None, there is no limit.
-            heartbeat_timeout (timedelta): Duration after which a picked job with a stale
-                heartbeat becomes eligible for re-pickup by another worker. Heartbeats
-                are sent automatically at half this interval. Defaults to 30 seconds.
-        Raises:
-            RuntimeError: If required database columns or types are missing.
-        """
-
         await self.verify_structure()
 
-        max_concurrent_tasks = max_concurrent_tasks or sys.maxsize
+        # 0 has always meant unlimited; keep unlimited as None all the way to
+        # the dequeue query so it composes without the worker-budget CTEs.
+        max_concurrent_tasks = max_concurrent_tasks or None
 
-        if max_concurrent_tasks < 2 * batch_size:
+        if max_concurrent_tasks is not None and max_concurrent_tasks < 2 * batch_size:
             raise RuntimeError("max_concurrent_tasks must be at least twice the batch size.")
 
         async with (
@@ -499,14 +482,30 @@ class QueueManager:
                 # Flush will be mainly driven by timeouts, but allow flush if
                 # backlog becomes too large.
                 max_size=batch_size**2,
-                timeout=heartbeat_timeout / 4,
+                # With beats at T/2, T/8 keeps a live job within 0.8 T through one failed
+                # flush; see docs/guides/heartbeat.md.
+                timeout=heartbeat_timeout / 8,
                 repository=self.queries,
             ) as hbuff,
-            tm.TaskManager() as task_manager,
             self.queries.driver,
+            # Inside the driver so draining jobs can still receive cancel NOTIFYs.
+            tm.TaskManager() as task_manager,
+            # Listed after the driver so they are cancelled before it closes;
+            # a failing loop body must not leak tasks probing a closing driver.
+            tm.cancel_on_exit(
+                asyncio.create_task(self._run_periodic_health_check())
+            ) as periodic_health_check_task,
+            (
+                tm.cancel_on_exit(
+                    asyncio.create_task(
+                        self._run_periodic_log_aggregation(log_aggregation_interval)
+                    )
+                )
+                if log_aggregation_interval.total_seconds() > 0
+                else nullcontext()
+            ),
+            tm.cancel_on_exit(asyncio.create_task(self.shutdown.wait())) as shutdown_task,
         ):
-            periodic_health_check_task = asyncio.create_task(self._run_periodic_health_check())
-
             notice_event_listener = listeners.PGNoticeEventListener()
             await listeners.initialize_notice_event_listener(
                 self.queries.driver,
@@ -518,56 +517,77 @@ class QueueManager:
                 ),
             )
 
-            shutdown_task = asyncio.create_task(self.shutdown.wait())
-            event_task: None | asyncio.Task[None | models.TableChangedEvent] = None
-            cached_queued_work = cache.TTLCache.create(
-                ttl=timedelta(seconds=0.250),
-                on_expired=lambda: self.queries.queued_work(list(self.entrypoint_registry.keys())),
-            )
-
             while not self.shutdown.is_set():
                 async for job in self.fetch_jobs(
                     batch_size, max_concurrent_tasks, heartbeat_timeout
                 ):
-                    self.job_context[job.id] = models.Context(
+                    # A late heartbeat lets our own dequeue re-pick a job still running here.
+                    if job.id in self.job_context:
+                        continue
+                    context = models.Context(
                         cancellation=anyio.CancelScope(),
                         resources=self.resources,
                     )
-                    task_manager.add(
-                        asyncio.create_task(self._dispatch(job, jbuff, hbuff, heartbeat_timeout))
-                    )
+                    self.job_context[job.id] = context
+                    task = asyncio.create_task(self._dispatch(job, jbuff, hbuff, heartbeat_timeout))
+                    task.add_done_callback(functools.partial(self.forget_job, job.id, context))
+                    task_manager.add(task)
                     if self.on_dispatch is not None:
-                        self.on_dispatch(len(task_manager.tasks), max_concurrent_tasks)
+                        self.on_dispatch(
+                            len(task_manager.tasks), max_concurrent_tasks or sys.maxsize
+                        )
 
                     with contextlib.suppress(asyncio.QueueEmpty):
                         notice_event_listener.get_nowait()
 
-                    if self.shutdown.is_set():
-                        break
-
-                await self._maybe_drain_shutdown(mode, task_manager, cached_queued_work)
+                await self._maybe_drain_shutdown(mode, task_manager)
                 await self._maybe_health_shutdown(
                     periodic_health_check_task, mode, shutdown_on_listener_failure
                 )
 
-                event_task = listeners.wait_for_notice_event(
-                    notice_event_listener,
-                    await self._effective_dequeue_timeout(dequeue_timeout),
+                # A failed health check ends the wait at once, not at the next
+                # dequeue_timeout. Only when it shuts us down: a finished task
+                # would otherwise wake every wait and spin the loop.
+                wake_on_listener_failure = (
+                    shutdown_on_listener_failure and mode is not types.QueueExecutionMode.drain
                 )
-                await asyncio.wait(
-                    (shutdown_task, event_task),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                async with tm.cancel_on_exit(
+                    listeners.wait_for_notice_event(
+                        notice_event_listener,
+                        await self._effective_dequeue_timeout(dequeue_timeout),
+                    )
+                ) as event_task:
+                    wake_on: set[asyncio.Task[object]] = {shutdown_task, event_task}
+                    if wake_on_listener_failure:
+                        wake_on.add(periodic_health_check_task)
+                    await asyncio.wait(wake_on, return_when=asyncio.FIRST_COMPLETED)
 
-            periodic_health_check_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await periodic_health_check_task
-
-        if event_task and not event_task.done():
-            event_task.cancel()
-
-        if not shutdown_task.done():
-            shutdown_task.cancel()
+    async def log_failure(
+        self,
+        job: models.Job,
+        executor: executors.AbstractEntrypointExecutor,
+        exc: Exception,
+        jbuff: buffers.JobStatusLogBuffer,
+    ) -> None:
+        """Log *exc* and record *job* as failed, honouring the entrypoint's on_failure."""
+        logconfig.logger.exception(
+            "Exception while processing entrypoint/job-id: %s/%s",
+            job.entrypoint,
+            job.id,
+            exc_info=exc,
+        )
+        tbr = models.TracebackRecord.from_exception(
+            exc=exc,
+            job_id=job.id,
+            additional_context={
+                "entrypoint": job.entrypoint,
+                "queue_manager_id": self.queue_manager_id,
+            },
+        )
+        status: types.JOB_STATUS = (
+            "failed" if executor.parameters.on_failure == "hold" else "exception"
+        )
+        await jbuff.add((job, status, tbr))
 
     async def _dispatch(
         self,
@@ -576,17 +596,7 @@ class QueueManager:
         hbuff: buffers.HeartbeatBuffer,
         heartbeat_timeout: timedelta,
     ) -> None:
-        """
-        Dispatch a job to its associated entrypoint executor.
-
-        Handles asynchronous job execution, logs exceptions, updates job status,
-        and manages job context including cancellation.
-
-        Args:
-            job (models.Job): The job to dispatch.
-            jbuff (buffers.JobStatusLogBuffer): Buffer to log job completion status.
-            hbuff (buffers.HeartbeatBuffer): Buffer to manage heartbeats.
-        """
+        """Run *job*'s executor, route retries/cancels/failures, log final status."""
 
         logconfig.logger.debug(
             "Dispatching entrypoint/id: %s/%s",
@@ -609,7 +619,13 @@ class QueueManager:
             try:
                 ctx = self.get_context(job.id)
                 if not ctx.cancellation.cancel_called:
-                    await executor.execute(job, ctx)
+                    try:
+                        await executor.execute(job, ctx)
+                    except Exception as e:
+                        # A TaskGroup wraps a child's RetryRequested in an ExceptionGroup.
+                        if (retry := errors.retry_request(e)) is not None and retry is not e:
+                            raise retry from e
+                        raise
             except errors.RetryRequested as retry_exc:
                 logconfig.logger.info(
                     "Retry requested for entrypoint/job-id: %s/%s (attempt=%d, delay=%s)",
@@ -629,25 +645,23 @@ class QueueManager:
                         "reason": retry_exc.reason,
                     },
                 )
-                await self.queries.retry_job(job, retry_exc.delay, tbr)
-            except Exception as e:
-                logconfig.logger.exception(
-                    "Exception while processing entrypoint/job-id: %s/%s",
+                # Release before re-queueing, or our own dequeue skips the re-picked row.
+                self.job_context.pop(job.id, None)
+                try:
+                    await self.queries.retry_job(job, retry_exc.delay, tbr)
+                except Exception as e:
+                    await self.log_failure(job, executor, e, jbuff)
+            except asyncio.CancelledError:
+                logconfig.logger.debug(
+                    "Job canceled mid-flight for entrypoint/id: %s/%s",
                     job.entrypoint,
                     job.id,
                 )
-                tbr = models.TracebackRecord.from_exception(
-                    exc=e,
-                    job_id=job.id,
-                    additional_context={
-                        "entrypoint": job.entrypoint,
-                        "queue_manager_id": self.queue_manager_id,
-                    },
-                )
-                status: types.JOB_STATUS = (
-                    "failed" if executor.parameters.on_failure == "hold" else "exception"
-                )
-                await jbuff.add((job, status, tbr))
+                # shield: same cancel would otherwise abort the log write.
+                await asyncio.shield(jbuff.add((job, "canceled", None)))
+                raise
+            except Exception as e:
+                await self.log_failure(job, executor, e, jbuff)
             else:
                 logconfig.logger.debug(
                     "Dispatching entrypoint/id: %s/%s - successful",
@@ -657,4 +671,4 @@ class QueueManager:
                 canceled = ctx.cancellation.cancel_called
                 await jbuff.add((job, "canceled" if canceled else "successful", None))
             finally:
-                self.job_context.pop(job.id, None)
+                self.jobs_logged += 1

@@ -1,7 +1,7 @@
 # Upgrading from 0.x to 1.0
 
 PgQueuer 1.0 is the first stable release. From this point on, the project
-follows [semantic versioning](https://semver.org/) strictly — patch releases
+follows [semantic versioning](https://semver.org/) strictly: patch releases
 for bug fixes, minor releases for backward-compatible features, major releases
 only when a break is unavoidable.
 
@@ -23,7 +23,7 @@ The full list of 23 numbered breaking changes lives in
    `DatabaseRetryEntrypointExecutor`.
 7. Construct `QueueManager` / `SchedulerManager` /  `CompletionWatcher` with a
    `Queries` instance rather than a raw driver.
-8. Run your test suite — most breakages surface at decoration or startup time.
+8. Run your test suite; most breakages surface at decoration or startup time.
 
 ## 1. Database schema
 
@@ -36,6 +36,80 @@ ALTER TYPE pgqueuer_status ADD VALUE IF NOT EXISTS 'failed';
 
 `pgq upgrade` and `pgq install` apply these automatically. If you own the
 schema, apply them before starting upgraded workers.
+
+### `id` columns widened to `BIGINT` (#671)
+
+The `queue`, `statistics`, and `schedules` primary keys were `int4 SERIAL`,
+capped at ~2.1 billion. Since the sequence never reuses values, a long-lived
+deployment could exhaust it and start failing every `enqueue`. Fresh installs
+now use `BIGSERIAL`; `pgq upgrade` widens the existing `int4` columns and their
+legacy sequences to `BIGINT` in place. The migration is idempotent (guarded on
+the column/sequence type) and safe to re-run.
+
+!!! warning "This migration takes an `ACCESS EXCLUSIVE` lock"
+    Widening `int4` → `BIGINT` rewrites the table and rebuilds its indexes.
+    Postgres holds an `ACCESS EXCLUSIVE` lock for the whole rewrite, blocking
+    enqueues, dequeues, and plain `SELECT`s. The rewrite time scales with row
+    count, so on a large or bloated `queue` table this can stall the queue for
+    seconds to minutes. **Run `pgq upgrade` during a maintenance window or
+    low-traffic period**, or run `pgq upgrade --no-widen-id` to apply every
+    other migration while skipping the widen, then widen the table out-of-band.
+
+    For a zero-downtime widen on a large table, see the
+    [discussion on #671](https://github.com/janbjorge/pgqueuer/issues/671#issuecomment-4809834464)
+    and the postgres.ai runbook
+    [How to redefine a PK without downtime](https://github.com/postgres-ai/postgres-howtos/blob/main/0033_how_to_redefine_a_PK_without_downtime.md#the-whole-recipe).
+
+With `--no-widen-id`, `pgq upgrade` applies everything else and prints a `note:`
+for each narrow id column and a second for the sequence behind it. Widen both:
+`ALTER TABLE ... ALTER COLUMN id TYPE bigint` leaves the sequence capped at
+int4, and the sequence is the half that runs out. The notes reappear on every
+upgrade until you do.
+
+### `time_in_queue` on databases from v0.18 and earlier
+
+`pgqueuer_statistics.time_in_queue` was `INTERVAL NOT NULL` and nothing has
+written it since v0.19. On a database that old, statistics aggregation failed
+twice over: the not-null constraint rejected the insert, and the unique index
+still keyed on the column, so nothing backed the `ON CONFLICT` target.
+
+`pgq upgrade` rebuilds the index and drops the `NOT NULL`. Rows that differed
+only by `time_in_queue` share a bucket under the new key, so the upgrade folds
+each bucket into its oldest row, summing `count`, before it builds the index --
+what aggregation would have done had the index been right all along. It does **not** drop
+the column -- that is data, and discarding it is your call. It prints a note
+instead, on every run, until you do:
+
+```sql
+ALTER TABLE pgqueuer_statistics DROP COLUMN time_in_queue;
+```
+
+### Statistics `created` preserves the instant (#807)
+
+Inserts that omit `created` stored a shifted instant whenever the session
+`TimeZone` was not UTC. The old default,
+
+```sql
+date_trunc('sec', timezone('UTC', now()))
+```
+
+truncates a `timestamp without time zone`. PostgreSQL then reads that wall
+clock in the session `TimeZone` while assigning it to the
+`timestamp with time zone` column, so `America/New_York`, `Asia/Tokyo`, or
+`Asia/Kathmandu` records a different moment than `now()`. Log aggregation does
+not take this path: it inserts `date_trunc('sec', created)` itself. Only
+inserts that leave `created` out were affected.
+
+Run `pgq upgrade`. It is required. It replaces that default with
+`date_trunc('sec', now())`, which stays `timestamp with time zone` and keeps
+the instant. The alteration is catalog-only: statistics rows stay in place and
+the unique index is not rebuilt. A fresh `pgq install` already has the
+corrected default.
+
+Rows already stored stay as they are. A stored instant does not record which
+session `TimeZone` wrote it, and aggregation or an explicit `created` may
+already hold the right instant, so shifting history would guess. `pgq upgrade`
+changes the default for later inserts only.
 
 ## 2. Async-only job handlers
 
@@ -55,7 +129,7 @@ async def resize_image(job: Job) -> None:
 ```
 
 Wrap blocking calls with `asyncio.to_thread`. Drop imports of `SyncEntrypoint`
-and `SyncContextEntrypoint` — both are removed.
+and `SyncContextEntrypoint`: both are removed.
 
 ## 3. Factory functions are async context managers
 
@@ -63,7 +137,7 @@ and `SyncContextEntrypoint` — both are removed.
 functions that return a value, and `@contextmanager` factories, are rejected.
 
 ```python
-# Before — any of these worked
+# Before: any of these worked
 async def factory() -> PgQueuer:
     return PgQueuer(...)
 
@@ -87,7 +161,7 @@ async def factory():
 ```
 
 Replace any `from pgqueuer.factories import run_factory` with
-`validate_factory_result` — the new name validates the type but does not
+`validate_factory_result`: the new name validates the type but does not
 convert it.
 
 ## 4. CLI connection options
@@ -104,11 +178,16 @@ pgq --pg-host db.internal --pg-user app --pg-database queue install
 # After
 PGHOST=db.internal PGUSER=app PGDATABASE=queue pgq install
 
-# Custom schema — use PGOPTIONS
-PGOPTIONS="-csearch_path=myschema" pgq install
+# Custom schema
+pgq --schema myschema install
 ```
 
 What stays: `--pg-dsn` / `PGDSN` and `--prefix` / `PGQUEUER_PREFIX`.
+
+An existing install placed in a schema via `PGOPTIONS="-csearch_path=..."`
+needs no DDL changes: set `--schema` / `PGQUEUER_SCHEMA` to that same schema
+and drop the `PGOPTIONS` workaround. All SQL then references the objects
+through their schema-qualified names.
 
 The `dsn()` helper in `pgqueuer.adapters.drivers` / `pgqueuer.db` is also
 removed; call `asyncpg.connect()` with no args and let it read the env vars
@@ -212,7 +291,7 @@ sm = SchedulerManager(queries)
 watcher = CompletionWatcher(driver, queries=queries)
 ```
 
-`PgQueuer(driver)` is **unchanged** — it still accepts a driver and constructs
+`PgQueuer(driver)` is **unchanged**: it still accepts a driver and constructs
 `Queries` internally. Most user code only touches `PgQueuer`.
 
 Replace `qm.connection` / `sm.connection` accesses with `qm.queries.driver`.
@@ -238,6 +317,9 @@ imported from any of these paths, update to the canonical location:
 | `pgqueuer.supervisor` | `pgqueuer.adapters.cli.supervisor` |
 | `pgqueuer.tm` | `pgqueuer.core.tm` |
 | `pgqueuer.tracing` | `pgqueuer.ports.tracing` + `pgqueuer.adapters.tracing.*` |
+
+`pgqueuer.core.cache` (`TTLCache`) was later removed; drain shutdown probes
+`queued_work` directly.
 
 Public API shims (`pgqueuer.db`, `pgqueuer.queries`, `pgqueuer.qm`,
 `pgqueuer.sm`, `pgqueuer.executors`, `pgqueuer.errors`, `pgqueuer.applications`,
@@ -267,7 +349,7 @@ async def notify(self, channel: str, payload: str) -> None:
 ```
 
 Remove any imports of `build_notify_query` from
-`pgqueuer.adapters.persistence.qb` — the helper is gone.
+`pgqueuer.adapters.persistence.qb`: the helper is gone.
 
 ## 11. Other API renames and removals
 
@@ -286,11 +368,11 @@ Remove any imports of `build_notify_query` from
 
 ## New features worth adopting
 
-- `RetryRequested` for transient errors — see [Database-Level Retry](../guides/retry.md).
-- `on_failure="hold"` to park failed jobs instead of deleting them — see
+- `RetryRequested` for transient errors; see [Database-Level Retry](../guides/retry.md).
+- `on_failure="hold"` to park failed jobs instead of deleting them; see
   [Holding Failed Jobs](../guides/hold-failed-jobs.md). Pairs with `pgq failed`
   and `pgq requeue`.
-- MCP server for read-only queue introspection — see
+- MCP server for read-only queue introspection; see
   [MCP Server](../integrations/mcp-server.md).
 - `ScheduleContext` gives scheduled tasks access to the same shared `resources`
   mapping as queue handlers.

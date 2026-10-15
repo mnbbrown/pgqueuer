@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
 import uuid
 from datetime import timedelta
+from typing import Any
 
 import anyio
 import async_timeout
+import pytest
 
 from pgqueuer.adapters.inmemory import InMemoryQueries
 from pgqueuer.core.applications import PgQueuer
@@ -17,8 +21,14 @@ from pgqueuer.core.executors import (
 from pgqueuer.core.qm import QueueManager
 from pgqueuer.db import AsyncpgDriver
 from pgqueuer.domain.errors import RetryException, RetryRequested
-from pgqueuer.domain.models import Context, Job, JobId, TracebackRecord
-from pgqueuer.domain.types import QueueExecutionMode
+from pgqueuer.domain.models import Context, Job, TracebackRecord
+from pgqueuer.domain.types import (
+    JobId,
+    OnFailure,
+    QueueEntrypoint,
+    QueueExecutionMode,
+    QueueManagerId,
+)
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 from pgqueuer.queries import Queries
 
@@ -58,10 +68,10 @@ def test_retry_requested_is_retry_exception() -> None:
 
 async def test_inmemory_retry_job_updates_state(queries: InMemoryQueries) -> None:
     ids = await queries.enqueue("ep", b"payload", priority=5)
-    qm_id = uuid.uuid4()
+    qm_id = QueueManagerId(uuid.uuid4())
     jobs = await queries.dequeue(
         10,
-        {"ep": EntrypointExecutionParameter(0)},
+        {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
         qm_id,
         None,
         heartbeat_timeout=timedelta(seconds=30),
@@ -82,7 +92,7 @@ async def test_inmemory_retry_job_updates_state(queries: InMemoryQueries) -> Non
     # Verify via dequeue that the job is eligible again and has attempts=1
     jobs_again = await queries.dequeue(
         10,
-        {"ep": EntrypointExecutionParameter(0)},
+        {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
         qm_id,
         None,
         heartbeat_timeout=timedelta(seconds=30),
@@ -95,10 +105,10 @@ async def test_inmemory_retry_job_updates_state(queries: InMemoryQueries) -> Non
 
 async def test_inmemory_retry_job_writes_log_entry(queries: InMemoryQueries) -> None:
     ids = await queries.enqueue("ep", b"x", priority=0)
-    qm_id = uuid.uuid4()
+    qm_id = QueueManagerId(uuid.uuid4())
     jobs = await queries.dequeue(
         10,
-        {"ep": EntrypointExecutionParameter(0)},
+        {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
         qm_id,
         None,
         heartbeat_timeout=timedelta(seconds=30),
@@ -121,11 +131,13 @@ async def test_inmemory_retry_job_writes_log_entry(queries: InMemoryQueries) -> 
 # ---------------------------------------------------------------------------
 
 
-async def test_retry_requested_requeues_and_succeeds() -> None:
+@pytest.mark.parametrize(("n_jobs", "batch_size"), ((1, 10), (2, 1)))
+async def test_retry_requested_requeues_and_succeeds(n_jobs: int, batch_size: int) -> None:
     """Handler raises RetryRequested once, then succeeds on the second execution.
 
     Because retry uses UPDATE (same row, same id), call_count tracks attempts
-    by job.id — the id is stable across retries.
+    by job.id — the id is stable across retries. With batch_size=1 our own
+    dequeue re-picks a retried row before its first dispatch has finished (#882).
     """
     pq = PgQueuer.in_memory()
     call_count: dict[int, int] = {}
@@ -136,23 +148,39 @@ async def test_retry_requested_requeues_and_succeeds() -> None:
         if call_count[job.id] == 1:
             raise RetryRequested(delay=timedelta(0), reason="transient failure")
 
-    await pq.qm.queries.enqueue("retry_ep", b"data", priority=0)
+    await pq.qm.queries.enqueue(["retry_ep"] * n_jobs, [b"data"] * n_jobs, [0] * n_jobs)
 
-    await pq.qm.run(
-        batch_size=10,
-        mode=QueueExecutionMode.drain,
-        max_concurrent_tasks=100,
-        dequeue_timeout=timedelta(seconds=1),
-    )
+    async with async_timeout.timeout(5):
+        await pq.qm.run(
+            batch_size=batch_size,
+            mode=QueueExecutionMode.drain,
+            max_concurrent_tasks=100,
+            dequeue_timeout=timedelta(seconds=1),
+        )
 
-    # Called exactly twice: first raises RetryRequested, second succeeds
-    assert sum(call_count.values()) == 2
+    # Each job is called exactly twice: first raises RetryRequested, second succeeds
+    assert sorted(call_count.values()) == [2] * n_jobs
 
     logs = await pq.qm.queries.queue_log()
-    assert sum(1 for log in logs if log.status == "successful") == 1
+    assert sum(1 for log in logs if log.status == "successful") == n_jobs
 
     # Queue is empty after success
     assert await pq.qm.queries.queue_size() == []
+
+
+async def test_forget_job_keeps_context_of_rerun(queries: InMemoryQueries) -> None:
+    """A finished dispatch does not drop the context of its job's re-run (#882)."""
+    qm = QueueManager(queries)
+    first, rerun = (Context(cancellation=anyio.CancelScope(), resources={}) for _ in range(2))
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+
+    qm.job_context[JobId(1)] = rerun
+    qm.forget_job(JobId(1), first, task)
+    assert qm.job_context[JobId(1)] is rerun
+
+    qm.forget_job(JobId(1), rerun, task)
+    assert JobId(1) not in qm.job_context
 
 
 async def test_unhandled_exception_remains_terminal() -> None:
@@ -180,6 +208,120 @@ async def test_unhandled_exception_remains_terminal() -> None:
 
     # Job removed from queue
     assert await pq.qm.queries.queue_size() == []
+
+
+@pytest.mark.parametrize(
+    ("on_failure", "status", "queue_status"),
+    (("delete", "exception", None), ("hold", "failed", "failed")),
+)
+async def test_failing_retry_job_records_the_job_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    on_failure: OnFailure,
+    status: str,
+    queue_status: str | None,
+) -> None:
+    """A retry_job error goes down the failure path instead of leaving the row picked (#883)."""
+    pq = PgQueuer.in_memory()
+
+    @pq.entrypoint("retry_ep", on_failure=on_failure)
+    async def handler(job: Job) -> None:
+        raise RetryRequested
+
+    async def failing_retry_job(*_: object) -> None:
+        raise ConnectionError("retry write failed")
+
+    monkeypatch.setattr(pq.qm.queries, "retry_job", failing_retry_job)
+    await pq.qm.queries.enqueue("retry_ep", b"data", priority=0)
+
+    async with async_timeout.timeout(5):
+        await pq.qm.run(
+            batch_size=10,
+            mode=QueueExecutionMode.drain,
+            max_concurrent_tasks=100,
+            dequeue_timeout=timedelta(seconds=1),
+        )
+
+    (log,) = [log for log in await pq.qm.queries.queue_log() if log.status == status]
+    assert log.traceback is not None
+    assert log.traceback.exception_type == "ConnectionError"
+    assert [row.status for row in await pq.qm.queries.queue_size()] == (
+        [queue_status] if queue_status else []
+    )
+
+
+needs_exception_groups = pytest.mark.skipif(
+    sys.version_info < (3, 11), reason="asyncio.TaskGroup and ExceptionGroup need Python 3.11"
+)
+
+
+async def raise_from_task_group(*errors: Exception) -> None:
+    async def fail(error: Exception) -> None:
+        raise error
+
+    async with asyncio.TaskGroup() as group:  # type: ignore[attr-defined,unused-ignore]
+        for error in errors:
+            group.create_task(fail(error))
+
+
+@needs_exception_groups
+@pytest.mark.parametrize(
+    ("with_other_error", "status"), ((False, "successful"), (True, "exception"))
+)
+async def test_retry_requested_from_task_group(with_other_error: bool, status: str) -> None:
+    """A TaskGroup of only RetryRequested retries the job; a mixed group fails it (#899)."""
+    pq = PgQueuer.in_memory()
+    calls = 0
+
+    @pq.entrypoint("group_ep")
+    async def handler(job: Job) -> None:
+        nonlocal calls
+        calls += 1
+        if job.attempts == 0:
+            other = [ValueError("boom")] if with_other_error else []
+            await raise_from_task_group(RetryRequested(), *other)
+
+    await pq.qm.queries.enqueue("group_ep", b"data", priority=0)
+
+    async with async_timeout.timeout(5):
+        await pq.qm.run(
+            batch_size=10,
+            mode=QueueExecutionMode.drain,
+            max_concurrent_tasks=100,
+            dequeue_timeout=timedelta(seconds=1),
+        )
+
+    assert calls == (1 if with_other_error else 2)
+    assert [log.status for log in await pq.qm.queries.queue_log()][-1] == status
+
+
+@needs_exception_groups
+async def test_database_retry_executor_honours_retry_from_task_group() -> None:
+    """A grouped RetryRequested stays an explicit retry, outside max_attempts (#899)."""
+    pq = PgQueuer.in_memory()
+
+    @pq.entrypoint(
+        "group_retry_ep",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=1,
+            initial_delay=timedelta(0),
+        ),
+    )
+    async def handler(job: Job) -> None:
+        if job.attempts < 2:
+            await raise_from_task_group(RetryRequested())
+
+    await pq.qm.queries.enqueue("group_retry_ep", b"data", priority=0)
+
+    async with async_timeout.timeout(5):
+        await pq.qm.run(
+            batch_size=10,
+            mode=QueueExecutionMode.drain,
+            max_concurrent_tasks=100,
+            dequeue_timeout=timedelta(seconds=1),
+        )
+
+    assert [log.status for log in await pq.qm.queries.queue_log()][-1] == "successful"
 
 
 async def test_attempts_visible_to_handler_on_retry() -> None:
@@ -544,7 +686,7 @@ async def test_retry_preserves_priority() -> None:
 async def test_retry_preserves_headers() -> None:
     """Headers survive retry — UPDATE keeps the row intact."""
     pq = PgQueuer.in_memory()
-    seen_headers: list[dict | None] = []
+    seen_headers: list[dict[str, Any] | None] = []
 
     @pq.entrypoint("headers_ep")
     async def handler(job: Job) -> None:
@@ -572,8 +714,8 @@ async def test_retry_with_delay_prevents_immediate_dequeue(
 ) -> None:
     """A retried job with non-zero delay is not dequeued until execute_after passes."""
     await queries.enqueue("ep", b"x", priority=0)
-    qm_id = uuid.uuid4()
-    ep_params = {"ep": EntrypointExecutionParameter(0)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    ep_params = {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)}
 
     jobs = await queries.dequeue(
         10, ep_params, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
@@ -631,19 +773,21 @@ async def test_multiple_jobs_only_one_retries() -> None:
 
 async def test_inmemory_retry_job_nonexistent_is_noop(queries: InMemoryQueries) -> None:
     """Calling retry_job on a nonexistent job is a silent no-op."""
-    fake_job = Job(
-        id=99999,
-        priority=0,
-        created="2024-01-01T00:00:00Z",
-        updated="2024-01-01T00:00:00Z",
-        heartbeat="2024-01-01T00:00:00Z",
-        execute_after="2024-01-01T00:00:00Z",
-        status="picked",
-        entrypoint="ghost",
-        payload=None,
-        attempts=0,
-        queue_manager_id=None,
-        headers=None,
+    fake_job = Job.model_validate(
+        {
+            "id": JobId(99999),
+            "priority": 0,
+            "created": "2024-01-01T00:00:00Z",
+            "updated": "2024-01-01T00:00:00Z",
+            "heartbeat": "2024-01-01T00:00:00Z",
+            "execute_after": "2024-01-01T00:00:00Z",
+            "status": "picked",
+            "entrypoint": QueueEntrypoint("ghost"),
+            "payload": None,
+            "attempts": 0,
+            "queue_manager_id": None,
+            "headers": None,
+        }
     )
     # Should not raise
     await queries.retry_job(fake_job, timedelta(0), None)
@@ -656,10 +800,10 @@ async def test_inmemory_retry_job_nonexistent_is_noop(queries: InMemoryQueries) 
 async def test_inmemory_retry_job_stores_traceback(queries: InMemoryQueries) -> None:
     """Traceback record is stored as JSON in the retry log entry."""
     await queries.enqueue("ep", b"x", priority=0)
-    qm_id = uuid.uuid4()
+    qm_id = QueueManagerId(uuid.uuid4())
     jobs = await queries.dequeue(
         10,
-        {"ep": EntrypointExecutionParameter(0)},
+        {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
         qm_id,
         None,
         heartbeat_timeout=timedelta(seconds=30),
@@ -745,19 +889,21 @@ async def test_database_retry_executor_chains_cause() -> None:
 
     original = ValueError("the root cause")
 
-    fake_job = Job(
-        id=1,
-        priority=0,
-        created="2024-01-01T00:00:00Z",
-        updated="2024-01-01T00:00:00Z",
-        heartbeat="2024-01-01T00:00:00Z",
-        execute_after="2024-01-01T00:00:00Z",
-        status="picked",
-        entrypoint="cause_ep",
-        payload=None,
-        attempts=0,
-        queue_manager_id=None,
-        headers=None,
+    fake_job = Job.model_validate(
+        {
+            "id": JobId(1),
+            "priority": 0,
+            "created": "2024-01-01T00:00:00Z",
+            "updated": "2024-01-01T00:00:00Z",
+            "heartbeat": "2024-01-01T00:00:00Z",
+            "execute_after": "2024-01-01T00:00:00Z",
+            "status": "picked",
+            "entrypoint": QueueEntrypoint("cause_ep"),
+            "payload": None,
+            "attempts": 0,
+            "queue_manager_id": None,
+            "headers": None,
+        }
     )
 
     # Monkey-patch the executor's func to raise

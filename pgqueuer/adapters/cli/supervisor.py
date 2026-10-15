@@ -1,42 +1,21 @@
-"""
-This module provides functionality to dynamically load and run queue management components.
-It includes the ability to load a factory function for creating instances of
-QueueManager, Scheduler and PgQueuer, manage their lifecycle, and handle graceful shutdowns.
-The module is designed to support asynchronous queue processing and scheduling
-using configurable factory paths.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import signal
-from contextlib import AbstractAsyncContextManager, suppress
+from contextlib import suppress
 from datetime import timedelta
 from typing import Callable, TypeAlias
 
 from pgqueuer.adapters.cli import factories
-from pgqueuer.core import applications, logconfig, qm, sm
+from pgqueuer.core import applications, logconfig, qm, sm, tm
 from pgqueuer.domain import types
 
 Manager: TypeAlias = qm.QueueManager | sm.SchedulerManager | applications.PgQueuer
-ManagerFactory: TypeAlias = Callable[[], AbstractAsyncContextManager[Manager]]
+ManagerFactory: TypeAlias = Callable[[], object]
 
 
-def setup_shutdown_handlers(manager: Manager, shutdown: asyncio.Event) -> Manager:
-    """
-    Create and configure a queue management instance.
-
-    Args:
-        factory_fn (FactoryType): The factory function to create the instance.
-        shutdown (asyncio.Event): The event used to signal shutdown.
-
-    Returns:
-        qm.QueueManager | sm.SchedulerManager | applications.PgQueuer:
-            The configured instance.
-
-    Raises:
-        Exception: If an error occurs during instance creation or configuration.
-    """
+def setup_shutdown_handlers(manager: object, shutdown: asyncio.Event) -> Manager:
+    """Wire *shutdown* into *manager* so cancellation propagates to inner managers."""
 
     if isinstance(manager, qm.QueueManager | sm.SchedulerManager):
         manager.shutdown = shutdown
@@ -53,20 +32,12 @@ def setup_shutdown_handlers(manager: Manager, shutdown: asyncio.Event) -> Manage
 
 
 def setup_signal_handlers(shutdown: asyncio.Event) -> None:
-    """
-    Setup signal handlers for clean shutdown on SIGINT or SIGTERM.
-
-    Args:
-        shutdown: Event to signal shutdown.
-    """
+    """Set *shutdown* on SIGINT/SIGTERM; silently skip on platforms without async signal support."""
 
     def set_shutdown(signum: int) -> None:
         logconfig.logger.info("Signal %d received, shutting down.", signum)
         shutdown.set()
 
-    # Adding signal handlers ensures the application can gracefully
-    # handle shutdown signals (SIGINT, SIGTERM).The try/except block is
-    # necessary because some platforms, like Windows, do not support adding async signal handlers.
     loop = asyncio.get_event_loop()
     try:
         loop.add_signal_handler(signal.SIGINT, set_shutdown, signal.SIGINT)
@@ -76,6 +47,12 @@ def setup_signal_handlers(shutdown: asyncio.Event) -> None:
             "Async signal handlers are not supported on this platform; "
             "KeyboardInterrupt will still stop the worker."
         )
+
+
+async def forward_shutdown(source: asyncio.Event, target: asyncio.Event) -> None:
+    """Set *target* once *source* is set so a process signal stops the current cycle."""
+    await source.wait()
+    target.set()
 
 
 async def runit(
@@ -89,34 +66,30 @@ async def runit(
     max_concurrent_tasks: int | None,
     shutdown_on_listener_failure: bool,
     heartbeat_timeout: timedelta = timedelta(seconds=30),
+    handle_signals: bool = True,
 ) -> None:
-    """
-    Supervise and manage the lifecycle of a queue management instance.
+    """Supervise a manager lifecycle; optionally restart after *restart_delay* on failure.
 
-    Args:
-        factory (ManagerFactory): Factory function or path to create an instance.
-        dequeue_timeout (timedelta): Timeout duration for dequeuing jobs.
-        batch_size (int): Number of jobs to process in each batch.
-        restart_delay (timedelta): Delay before restarting on failure.
-        restart_on_failure (bool): Whether to restart after a failure.
-        shutdown (asyncio.Event): The event to signal shutdown.
-        mode (types.QueueExecutionMode): What mode to start the execution on
-        max_concurrent_tasks (int | None): How many concurrent tasks to allow.
-        shutdown_on_listener_failure (bool): Automatically shutdown if a listener fails
-        heartbeat_timeout (timedelta): Stale-heartbeat threshold for job re-pickup.
+    Each cycle gets its own shutdown event so a manager that sets ``shutdown`` on
+    exit (e.g. ``PgQueuer.run``'s ``finally``) cannot latch the process-level
+    event and defeat ``restart_on_failure``. Process signals still stop the
+    current cycle via :func:`forward_shutdown`.
 
-    Raises:
-        ValueError: If restart_delay is negative.
+    Raises ValueError when ``restart_delay`` is negative.
     """
     if restart_delay < timedelta(0):
         raise ValueError(f"'restart_delay' must be >= 0. Got {restart_delay!r}")
 
-    setup_signal_handlers(shutdown)
+    if handle_signals:
+        setup_signal_handlers(shutdown)
 
     while not shutdown.is_set():
+        cycle_shutdown = asyncio.Event()
+        forward_task = asyncio.create_task(forward_shutdown(shutdown, cycle_shutdown))
+        failed = False
         try:
-            async with factories.validate_factory_result(factory()) as manager:
-                setup_shutdown_handlers(manager, shutdown)
+            async with factories.validate_factory_result(factory()) as entered:
+                manager = setup_shutdown_handlers(entered, cycle_shutdown)
                 await run_manager(
                     manager,
                     dequeue_timeout,
@@ -129,13 +102,56 @@ async def runit(
         except Exception as exc:
             if not restart_on_failure:
                 raise
+            failed = True
             logconfig.logger.exception(
                 "Error during instance execution.",
                 exc_info=exc,
             )
+        finally:
+            await tm.cancel_and_wait(forward_task)
 
-        if not shutdown.is_set():
-            await await_shutdown_or_timeout(shutdown, restart_delay)
+        # Clean completion (drain / signal) ends the supervisor; only failures restart.
+        if shutdown.is_set() or not failed:
+            break
+
+        await await_shutdown_or_timeout(shutdown, restart_delay)
+
+
+async def run(
+    factory: str | ManagerFactory,
+    *,
+    dequeue_timeout: timedelta = timedelta(seconds=30),
+    batch_size: int = 10,
+    heartbeat_timeout: timedelta = timedelta(seconds=30),
+    mode: types.QueueExecutionMode = types.QueueExecutionMode.continuous,
+    max_concurrent_tasks: int | None = None,
+    shutdown_on_listener_failure: bool = False,
+    restart_on_failure: bool = False,
+    restart_delay: timedelta = timedelta(seconds=5),
+    shutdown: asyncio.Event | None = None,
+) -> None:
+    """Run a worker from *factory*, as ``pgq run`` does, without the CLI.
+
+    *factory* is a ``module:attr`` path or the factory itself. Without *shutdown*,
+    SIGINT/SIGTERM stop the worker; with it, signal handling is left to the caller.
+
+    Usage example::
+
+        asyncio.run(pgqueuer.run("myapp:create_pgqueuer"))
+    """
+    await runit(
+        factories.load_factory(factory) if isinstance(factory, str) else factory,
+        dequeue_timeout=dequeue_timeout,
+        batch_size=batch_size,
+        restart_delay=restart_delay if restart_on_failure else timedelta(0),
+        restart_on_failure=restart_on_failure,
+        shutdown=shutdown or asyncio.Event(),
+        mode=mode,
+        max_concurrent_tasks=max_concurrent_tasks,
+        shutdown_on_listener_failure=shutdown_on_listener_failure,
+        heartbeat_timeout=heartbeat_timeout,
+        handle_signals=shutdown is None,
+    )
 
 
 async def run_manager(
@@ -147,17 +163,9 @@ async def run_manager(
     shutdown_on_listener_failure: bool,
     heartbeat_timeout: timedelta = timedelta(seconds=30),
 ) -> None:
-    """
-    Run a queue management instance.
+    """Dispatch ``run()`` on the concrete manager type.
 
-    Args:
-        manager: The instance to run (QueueManager, SchedulerManager, or PgQueuer).
-        dequeue_timeout: Timeout duration for dequeuing jobs.
-        batch_size: Number of jobs to process per batch.
-        heartbeat_timeout: Stale-heartbeat threshold for job re-pickup.
-
-    Raises:
-        NotImplementedError: If the instance type is unsupported.
+    Raises NotImplementedError if *manager* is not a recognised manager class.
     """
     logconfig.logger.debug("Running: %s", type(manager).__name__)
     if isinstance(manager, qm.QueueManager):
@@ -188,14 +196,7 @@ async def await_shutdown_or_timeout(
     shutdown: asyncio.Event,
     restart_delay: timedelta,
 ) -> None:
-    """
-    Wait for shutdown or until ``restart_delay`` elapses.
-
-    Args:
-        shutdown: Event indicating shutdown.
-        restart_delay: Delay duration before restarting.
-    """
-
+    """Wait for *shutdown* or up to *restart_delay*, whichever comes first."""
     logconfig.logger.info("Waiting %r before restarting.", restart_delay)
 
     with suppress(TimeoutError, asyncio.TimeoutError):

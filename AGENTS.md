@@ -24,11 +24,15 @@ tools/                 Benchmarking and monitoring scripts
 
 ## Build, Lint, and Test Commands
 
-All commands use `uv` as the package manager. Install deps first: `uv sync --all-extras --frozen`
+All commands use `uv` as the package manager. Install deps first: `uv sync --frozen`
+
+Dev-only dependencies go in `[dependency-groups]` in `pyproject.toml` (see
+[Dependency groups](docs/development/development.md#dependency-groups)); runtime
+integrations go in `[project.optional-dependencies]`.
 
 ```bash
 # Run ALL checks (recommended before any PR)
-make check                  # runs: sync + lint + import-lint + typecheck + pytest
+uv sync --frozen && uv run ruff check . && uv run ruff format . --check && uv run lint-imports && uv run mypy . && uv run pytest
 
 # Individual checks
 uv run ruff check .         # Lint (ruff)
@@ -36,8 +40,11 @@ uv run ruff format . --check  # Format check
 uv run lint-imports         # Hexagonal architecture boundary validation
 uv run mypy .               # Type checking (strict, targets Python 3.10)
 
-# Run all tests
+# Run all tests (parallel by default: 2 xdist workers, one Postgres container each)
 uv run pytest
+
+# Run tests serially (disable pytest-xdist)
+uv run pytest -n 0
 
 # Run a single test file
 uv run pytest test/test_queries.py
@@ -66,11 +73,26 @@ To use docker-compose instead: `docker compose up db populate` (and `docker comp
 
 ```bash
 pgq install              # Create tables, triggers, functions
-pgq install --dry-run    # Preview SQL without applying
+pgq sql install          # Emit SQL to stdout without connecting (pipe to psql, etc.)
 pgq uninstall            # Remove all PgQueuer objects
-pgq upgrade              # Apply migrations after a library upgrade
+pgq upgrade --plan       # Print the delta this database needs; apply nothing
+pgq upgrade              # Converge the schema onto the declaration
 pgq verify --expect present  # Check schema exists (exit 1 on mismatch)
 ```
+
+The schema is declared once, in `pgqueuer/domain/schema/` — **the only place to
+edit when the schema changes.** Install renders from it, upgrade diffs the
+catalog against it, and there is no migration list to append to (ADR-0016).
+
+Definitions use PostgreSQL's own spelling (`format_type`, `pg_get_expr`,
+`pg_get_indexdef`, `pg_proc.prosrc`) so comparison is string equality. Get one
+wrong and `test_schema_inspect.py` fails with the spelling to paste in. That
+test and `test_schema_convergence.py` (upgrades a fixture of every old release)
+keep the model honest; both must pass on PG 14–18.
+
+The planner never emits `DROP TABLE` or `DROP COLUMN`. A column the schema no
+longer declares goes in `retired()`: `NOT NULL` relaxed, drop left to the
+operator as a note.
 
 ### Additional Test Flags
 
@@ -95,10 +117,10 @@ PgQueuer follows **hexagonal (ports & adapters) architecture** enforced by `impo
   - `buffers.py` — Batched async buffers for heartbeats, job status logs
   - `listeners.py` — PG NOTIFY event routing
   - `tm.py` — `TaskManager` for background task lifecycle
-  - `heartbeat.py`, `cache.py`, `helpers.py`, `logconfig.py`
+  - `heartbeat.py`, `helpers.py`, `logconfig.py`
 - **`adapters/`** — Concrete implementations:
   - `drivers/` — `asyncpg.py` (AsyncpgDriver, AsyncpgPoolDriver), `psycopg.py` (PsycopgDriver, SyncPsycopgDriver)
-  - `persistence/` — `queries.py` (SQL queries), `qb.py` (query builder + DBSettings), `query_helpers.py`
+  - `persistence/` — `queries.py` (SQL queries), `qb.py` (query builder + DBSettings), `query_helpers.py`, `schema_ddl.py` (render the model as DDL), `schema_inspect.py` (read the installed schema), `schema_plan.py` (diff the two)
   - `inmemory/` — In-memory driver and queries for testing without Postgres
   - `tracing/` — Logfire, Sentry, OpenTelemetry integrations
   - `cli/` — CLI commands (run, install, dashboard, etc.)
@@ -106,7 +128,7 @@ PgQueuer follows **hexagonal (ports & adapters) architecture** enforced by `impo
 ### Import Rules (enforced by lint-imports)
 
 1. **Domain** (`pgqueuer/domain/`) must NOT import from adapters or core
-2. **Ports** (`pgqueuer/ports/`) must NOT import from adapters or core (one exception: `ports.driver -> core.tm`)
+2. **Ports** (`pgqueuer/ports/`) must NOT import from adapters or core
 3. **Core** (`pgqueuer/core/`) must NOT import from adapters (several temporary exceptions listed in `pyproject.toml`)
 
 Port protocols: `QueueRepositoryPort`, `ScheduleRepositoryPort`, `NotificationPort`, `SchemaManagementPort`. The `Queries` class satisfies all four via structural subtyping. Core code should depend on protocols, not `Queries` directly.
@@ -139,7 +161,7 @@ When deprecating dataclass fields, use a module-level `_SENTINEL = object()` def
 - **Formatter/linter**: ruff (line-length=100)
 - **Lint rules**: C, E, F, I, PIE, Q, RET, RSE, SIM, W, C90 (max-complexity=15)
 - **isort**: combined-as-imports, furthest-to-closest relative imports
-- **Mypy** strict mode with Pydantic plugin, targets Python 3.10.
+- **Mypy** `strict = true` plus `warn_unreachable` and the error codes `truthy-bool`, `truthy-iterable`, `redundant-expr`, `unused-awaitable`, `possibly-undefined`, `ignore-without-code`; Pydantic plugin with `init_typed`; targets Python 3.10. Inside `pgqueuer/`, `tools/` and `examples/` the overrides add `disallow_any_explicit` and `disallow_any_unimported`. Run it as `uv run mypy . --no-incremental`; the incremental cache has reported green on stale signatures.
 
 ### Import Rules
 
@@ -152,15 +174,68 @@ When deprecating dataclass fields, use a module-level `_SENTINEL = object()` def
 
 ### Type Annotations
 
-- **Always annotate** all function/method signatures (`mypy: disallow_untyped_defs = true`)
-- Use **native Python types**: `list[int]`, `dict[str, Any]`, `int | None` (not `Optional`)
+- **Always annotate** all function/method signatures (`strict = true` implies `disallow_untyped_defs`)
+- Use **native Python types**: `list[int]`, `dict[str, object]`, `int | None` (not `Optional`)
 - Use `NewType` for domain primitives: `JobId = NewType("JobId", int)`
 - Use `Literal` for string unions: `Literal["queued", "picked", "successful"]`
+- **Exhaustive dispatch.** When branching on a `Literal` or `Enum` value, handle every member in an explicit `if`/`elif` chain and terminate with `else: assert_never(value)` (`typing_extensions.assert_never`) so mypy proves totality. No bare fallthroughs, no catch-all `else` doing real work — adding a new member must produce a type error at every dispatch site.
 - Use `Protocol` for structural subtyping (port interfaces)
 - Use `TypeAlias` for complex callable types
-- **Avoid `Any`** at nearly all cost. The codebase only uses it on driver protocol boundaries for variadic `*args` in SQL query methods -- nowhere else. Use proper types, generics, protocols, or `object` instead.
+- **`Any` is banned in `pgqueuer/`, `tools/` and `examples/`** (`disallow_any_explicit`). Use `object` and narrow with `isinstance`. Driver `*args` are `object`; rows come back as `dict[str, object]` and scalars are read through `query_helpers.cell(row, key, kind)`, multi-column rows through a pydantic model. User-owned bags (`Context.resources`) are `MutableMapping[str, object]`. `Callable[..., X]` counts as `Any`; declare a `Protocol` with `__call__(self, *args: object)` instead. Untyped third-party values are assigned to an `object`-annotated name before an `isinstance` check. Test code under `test/` may use `Any`.
+- **Import domain types from `pgqueuer.domain.types`**, never via `models.JobId`; `no_implicit_reexport` is on and only the top-level shims re-export.
 - **Generic constructors over type-annotated assignments** for typed stdlib objects: `fut = asyncio.Future[MyType]()` not `fut: asyncio.Future[MyType] = asyncio.Future()`.
+- **No bare tuples as records.** A tuple whose elements mean different things needs a `NamedTuple` at minimum, a frozen dataclass when it grows behaviour. `tuple[X, ...]` as a homogeneous collection is fine; `tuple[str, str]` standing in for a record is not — the caller unpacks by position, a swap type-checks, and the meaning lives only in the variable name at the call site.
+
+```python
+# Bad — what is [0], and what happens when a third element appears?
+def column_kind_and_default(row: Row) -> tuple[ColumnKind, str | None]: ...
+retired_columns: tuple[tuple[str, str], ...]
+
+# Good
+class ColumnRef(NamedTuple):
+    table: TableName
+    column: ColumnName
+
+retired_columns: tuple[ColumnRef, ...]
+```
 - **No `# type: ignore` in production code.** `type: ignore` comments are forbidden in `pgqueuer/`. Fix the underlying type issue instead (use `dataclasses.KW_ONLY`, protocols, generics, overloads, etc.). `# type: ignore` is acceptable in test code only.
+
+### Dynamic Attribute Access
+
+**`getattr`, `setattr`, `hasattr`, and `delattr` are banned in `pgqueuer/`.** They defeat the type checker: mypy cannot verify a name passed as a string, so every use is an untyped hole in an otherwise strict codebase, and a typo becomes a runtime `None` instead of an error.
+
+The common temptation is probing an object for an attribute to decide what it is. Declare a `runtime_checkable` `Protocol` in `pgqueuer/ports/` and use `isinstance` — the shape gets a name, a docstring, and a type mypy narrows on:
+
+```python
+# Bad — the type checker learns nothing, and "sqlstate" is unverifiable
+code = getattr(exc, "sqlstate", None)
+
+# Good — the shape is declared once and checked structurally
+@runtime_checkable
+class SqlStateError(Protocol):
+    """Driver exception carrying a PostgreSQL SQLSTATE code."""
+
+    @property
+    def sqlstate(self) -> str | None: ...
+
+
+if isinstance(exc, SqlStateError) and isinstance(exc.sqlstate, str):
+    return exc.sqlstate
+```
+
+Three grandfathered call sites remain: `domain/settings.py` iterating declared dataclass fields, `core/executors.py` probing `__call__`, and `adapters/cli/factories.py` resolving a `module:attr` path. Add no more; replace them when the code is next touched.
+
+**`operator.attrgetter`, `operator.itemgetter` and `operator.methodcaller` are banned outright.** They are `getattr`, a subscript and a method call wearing a functional hat: the name stays a string mypy cannot check, so `attrgetter("naem")` type-checks and blows up at runtime. Being stdlib does not redeem them. A lambda says the same thing and is checked:
+
+```python
+# Bad — "name" is unverifiable, and the sort key's type is unknown
+tuple(sorted(tables, key=operator.attrgetter("name")))
+
+# Good — mypy resolves the attribute and its type
+tuple(sorted(tables, key=lambda table: table.name))
+```
+
+Test code may use reflection where the test is *about* reflection. `monkeypatch.setattr` is pytest's API, not the builtin, and is unaffected.
 
 ### Naming Conventions
 
@@ -174,17 +249,94 @@ When deprecating dataclass fields, use a module-level `_SENTINEL = object()` def
 
 **No leading-underscore prefixes.** Python has no real public/private distinction. Use plain `snake_case` for all methods and attributes — pick a descriptive name instead of hiding it behind a prefix.
 
+### String Literals
+
+**Multi-line string content uses triple quotes.** Never build it from implicitly concatenated adjacent literals or `+`-joined pieces with embedded `\n` escapes.
+
+```python
+# Bad
+comment=(
+    "Entrypoints with free capacity; remaining is NULL for\n"
+    "unlimited entrypoints."
+)
+
+# Good
+comment="""
+    Entrypoints with free capacity; remaining is NULL for
+    unlimited entrypoints.
+"""
+```
+
+When surrounding indentation would leak into the string, normalize with `textwrap.dedent` (or accept dedent at the consuming end, as `SqlComposer.cte` does for its `comment` parameter). Joining *dynamic* parts (`", ".join(items)`) is fine — the rule is about literals.
+
+### SQL Style
+
+**No single-letter table or CTE aliases** (`q`, `a`, `p`, `pk`). The SQL here is dense enough already — use the full table/CTE name, or a descriptive alias (`candidate`, `stale`, `job`) when the name is parameterized or shadowed.
+
+### `__all__`
+
+`__all__` belongs only in re-export modules: package `__init__.py` files and the top-level backward-compatibility shims. Internal modules do not declare it — everything is importable, per the no-underscore rule above.
+
+### Module-Level State
+
+**No globals. Ever.** Globals are banned outright — mutable *and* immutable data structures alike. No module-level registries, lookup tables, caches, collections, config objects, or singletons that hold program data. Runtime state and data live on an instance and are passed explicitly; if something must be shared, thread it through a constructor or method argument, never a module attribute.
+
+A module-level `list`/`dict`/`set`/`tuple`/dataclass instance used as a registry, table, or accumulator **is a global — forbidden.** Put it on a class (class attribute or instance) and pass it explicitly.
+
+The only module-level names permitted are those the type system or a framework structurally requires, none of which hold program data:
+
+- Type-level declarations: `NewType`, `TypeAlias`, `Literal` aliases, `Protocol`/`TypeVar` definitions, `__all__`.
+- Scalar literal constants (`UPPER_SNAKE_CASE` `int`/`str`/`bytes`/`bool`) and the deprecation `_SENTINEL = object()`.
+- Framework-mandated singletons that hold no mutable state (`app = typer.Typer(...)`).
+
+The grandfathered `tracing.TRACER` is the sole legacy exception; add no more, and migrate it off module level when the code is next touched.
+
 ### Error Handling
 
 - Custom exceptions inherit from `PgqException` (in `pgqueuer/domain/errors.py`)
-- Hierarchy: `PgqException > RetryException > MaxRetriesExceeded | MaxTimeExceeded`; also `DuplicateJobError`, `FailingListenerError`
+- Hierarchy: `PgqException > RetryException > RetryRequested`; also `DuplicateJobError`, `FailingListenerError`, `SchemaDriftError`
 - Use `logconfig.logger.exception(...)` for logging errors in job dispatch
 - Use `contextlib.suppress(...)` for non-critical errors
 - Use `pytest.raises` in tests for expected exceptions
 
 ### Docstrings
 
-Google-style when present: `Args:`, `Returns:`, `Raises:` sections. Not every method needs one -- omit for trivial/private methods.
+Follow [PEP 257](https://peps.python.org/pep-0257/) for format. Keep them tight.
+
+- **One-liner**: triple-quoted on the same line, period at the end. `"""Return the picked job."""`
+- **Multi-line**: summary line, blank line, body. Closing `"""` on its own line.
+- **Don't restate the signature.** Type annotations already say what the args and return type are. Only mention a parameter when something non-obvious matters (units, constraints, ownership, side effects).
+- **Skip docstrings on trivial or private helpers.** A descriptive name beats a docstring that repeats it.
+- **Test docstrings**: one line describing the behavior under test. Skip when the test name is self-evident.
+- **Module docstrings**: optional. When present, one sentence. No "This module defines..." preambles.
+- **External-schema docstrings exempt.** Where a docstring is the canonical, externally-published description of a function -- specifically `@mcp.tool()` and `@mcp.prompt()` handlers in `pgqueuer/adapters/mcp/`, whose docstrings are surfaced verbatim to MCP clients as the tool's schema -- the verbosity rules above do not apply. Document return columns, parameter semantics, and usage patterns at whatever length the consumer needs.
+- **Usage examples recommended on public APIs.** Public classes and functions exported from `pgqueuer/__init__.py` (or otherwise documented for end users) should include a short `Usage example::` block in the docstring -- one realistic call, placed after the summary/body. Skip the example when the API is trivial and the call site is self-evident from the signature (e.g. simple getters, one-arg helpers, obvious one-liners). Judgement call: if a new user would not need to look at the example, don't write one.
+
+### Comments
+
+Default to no comments. Code with descriptive names is more durable than comments that rot.
+
+Only add a comment when the **why** is non-obvious:
+
+- A hidden invariant or constraint that the code relies on
+- A workaround for a specific bug, library quirk, or platform behavior
+- A subtle ordering or concurrency requirement
+- Something that would surprise a reader who understood the code
+
+**Do not write:**
+
+- Comments that restate what the code does (`# increment counter`)
+- Caller references (`# used by X`, `# called from Y`) — they go stale and `git grep` is faster
+- Task or issue refs in inline comments — link them in the PR description instead. Exception: regression tests may reference the issue ID in their docstring or `xfail` reason, because the issue is the test's reason to exist.
+- Banner section headers (`# ----- Layer 2 -----`) — let function names and module structure do the work
+- TODOs without an owner and a tracking link
+- Step-by-step narration of a block — a comment per step retells the code in prose. Annotate only the step that would surprise a reader.
+
+When a comment explains a non-obvious workaround, keep it short and put it adjacent to the line it explains. Prefer one line.
+
+**Two lines is the cap.** Not a target to fill — a ceiling. A comment that wants a third line is a comment that has stopped explaining a surprise and started teaching a subject; the subject belongs in an ADR (`docs/adr/`) or the PR description, and the comment cites it in one line. This applies hardest above a SQL literal or a long function, where an essay is easy to write and rarely read.
+
+If the comment prose in a function is a noticeable fraction of its code, that is a defect regardless of whether any single comment obeys the cap. Cut until each surviving line earns its place.
 
 ### Guiding Principles
 
@@ -195,7 +347,9 @@ Google-style when present: `Args:`, `Returns:`, `Raises:` sections. Not every me
 
 ## Testing Conventions
 
-- **pytest config**: `asyncio_mode = "auto"`, 20s timeout per test, `--durations=15`
+- **pytest config**: `asyncio_mode = "auto"`, 20s timeout per test, `--durations=15`, `-n 2` (pytest-xdist)
+- Tests run in parallel via **pytest-xdist**: session-scoped fixtures are per-worker, so each worker starts its own Postgres container and template database. Pass `-n 0` to run serially, or `-n <N>` to change worker count.
+- Keep tests xdist-safe: no fixed ports, no shared files, no cross-test state. Database isolation comes from the per-test `CREATE DATABASE ... TEMPLATE` fixture.
 - Declare async tests as `async def test_...` -- no `@pytest.mark.asyncio` decorator needed
 - Annotate all test function parameters: `async def test_foo(apgdriver: db.Driver, N: int) -> None:`
 - Use `@pytest.mark.parametrize` for multi-value testing
@@ -211,6 +365,14 @@ PgQueuer follows **strict semantic versioning** (SemVer) from v1.0.0 onward:
 - **Major** (x.0.0): Breaking changes — reserved for when there is no alternative.
 
 Never introduce a breaking change in a patch or minor release. If a change would break any public API (function signatures, class fields, import paths, CLI behavior, database schema), it requires a major version bump.
+
+## Issues and Pull Requests
+
+Every issue or pull request an agent writes **must** carry the `Agentic` label ("Issue or PR written mainly by an AI agent. Required on all agent-authored contributions."). See [CONTRIBUTING.md](CONTRIBUTING.md#agentic-contributions).
+
+- Apply the label when creating it, e.g. `gh pr create --label Agentic` or `gh issue create --label Agentic`.
+- If the label can't be set (no triage permission), put "Agentic" on the first line of the description so a maintainer can add it.
+- Fill in the issue or PR template like any other contribution.
 
 ## Commit Conventions
 
@@ -254,4 +416,4 @@ chore: bump ruff to 0.8 (#101)
 
 ## CI Matrix
 
-Python 3.10--3.14 x Postgres 13--18 on Ubuntu. Windows tests run only `test/windows/test_shutdown.py`.
+Python 3.10--3.14 x Postgres 14--18 on Ubuntu. Windows tests run only `test/windows/test_shutdown.py`.

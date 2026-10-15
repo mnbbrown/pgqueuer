@@ -3,48 +3,59 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import json
 import os
 import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
-from typing import Callable, Coroutine
+from typing import TYPE_CHECKING, AsyncGenerator, Callable, Coroutine, TypeVar
 
 import typer
+from pydantic_core import to_json
 from tabulate import tabulate
 from typer import Context
-from typing_extensions import AsyncGenerator
+from typing_extensions import assert_never
 
-from pgqueuer.adapters.cli import factories, supervisor
-from pgqueuer.adapters.persistence import qb, queries
+from pgqueuer.adapters.cli import factories, sql_cmd, supervisor
+from pgqueuer.adapters.persistence import qb, queries, schema_ddl
 from pgqueuer.core import listeners, logconfig
-from pgqueuer.domain import models, types
+from pgqueuer.core.insights import InsightsService
+from pgqueuer.domain import errors, models, types
+from pgqueuer.domain.schema import model as schema_model
+from pgqueuer.domain.settings import db_settings
 from pgqueuer.ports.driver import Driver
 
+if TYPE_CHECKING:
+    import uvloop
+
 try:
-    from uvloop import run as _asyncio_run
+    import uvloop  # noqa: F811
+
+    HAS_UVLOOP = True
 except ImportError:
-    from asyncio import run as _asyncio_run  # type: ignore[assignment]
+    HAS_UVLOOP = False
 
 
-def asyncio_run(coro: Coroutine[object, object, object]) -> None:
-    if sys.platform != "win32":
-        _asyncio_run(coro)
-        return
+T = TypeVar("T")
 
-    # psycopg async rejects ProactorEventLoop (Windows default).
-    if sys.version_info >= (3, 12):
-        asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)
-        return
 
-    if sys.version_info >= (3, 11):
-        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
-            runner.run(coro)
-        return
-
-    # Python 3.10: no Runner, no loop_factory; mutate policy.
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    _asyncio_run(coro)
+def asyncio_run(coro: Coroutine[object, object, T]) -> T:
+    """Run *coro* on the best event loop for this platform and return its result."""
+    if sys.platform == "win32":
+        # psycopg async rejects ProactorEventLoop (Windows default); force the
+        # selector loop on every supported Windows + Python combination.
+        if sys.version_info >= (3, 12):
+            return asyncio.run(coro, loop_factory=asyncio.SelectorEventLoop)
+        if sys.version_info >= (3, 11):
+            with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+                return runner.run(coro)
+        # Python 3.10: no Runner, no loop_factory; mutate policy.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        return asyncio.run(coro)
+    if HAS_UVLOOP:
+        return uvloop.run(coro)
+    return asyncio.run(coro)
 
 
 app = typer.Typer(
@@ -57,26 +68,42 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
     add_completion=False,
 )
+app.add_typer(sql_cmd.sql_app, name="sql")
+
+
+def emit_deprecated_dry_run(ctx: Context, sql: str) -> None:
+    typer.secho(
+        "Warning: --dry-run is deprecated and will be removed in v2.0; "
+        f"use 'pgq sql {ctx.command.name}'.",
+        err=True,
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo(sql)
 
 
 class VerifyMode(Enum):
-    """Enumeration for expected object state in verification."""
-
     PRESENT = "present"
     ABSENT = "absent"
 
 
+class OnConflictChoice(Enum):
+    RAISE = "raise"
+    SKIP = "skip"
+
+
 @dataclass
 class AppConfig:
-    """Application configuration for PGQueuer CLI."""
-
     prefix: str = ""
+    schema: str = ""
     pg_dsn: str = ""
     factory_fn_ref: str | None = None
 
     def setup_env(self) -> None:
         if self.prefix:
             os.environ["PGQUEUER_PREFIX"] = self.prefix
+        if self.schema:
+            os.environ["PGQUEUER_SCHEMA"] = self.schema
+        db_settings.cache_clear()
 
 
 @app.callback()
@@ -87,13 +114,18 @@ def main(
         help="Prefix for pgqueuer objects.",
         envvar="PGQUEUER_PREFIX",
     ),
+    schema: str = typer.Option(
+        "",
+        help="Postgres schema holding all pgqueuer objects.",
+        envvar="PGQUEUER_SCHEMA",
+    ),
     pg_dsn: str = typer.Option(
         "",
         help=(
             "PostgreSQL connection string (DSN). "
-            "When omitted, standard libpq env vars "
+            "When omitted, PGQUEUER_DSN and standard libpq env vars "
             "(PGHOST, PGUSER, PGPASSWORD, PGDATABASE, PGPORT) are used. "
-            "Use PGOPTIONS for search_path."
+            "Use --schema/PGQUEUER_SCHEMA to target a Postgres schema."
         ),
         envvar="PGDSN",
     ),
@@ -103,9 +135,9 @@ def main(
         help="A reference to a function that returns an instance of Queries",
     ),
 ) -> None:
-    """Main Typer callback to set up shared configuration."""
     config = AppConfig(
         prefix=prefix,
+        schema=schema,
         pg_dsn=pg_dsn,
         factory_fn_ref=factory_fn_ref,
     )
@@ -116,39 +148,34 @@ def main(
 def create_default_queries_factory(
     config: AppConfig,
     settings: qb.DBSettings,
-) -> Callable[..., contextlib.AbstractAsyncContextManager[queries.Queries]]:
-    """
-    This is the default implementation of a factory that returns an instance of Queries.
-    It attempts asyncpg first, then psycopg.
-    """
+) -> Callable[[], contextlib.AbstractAsyncContextManager[queries.Queries]]:
+    """Default Queries factory: try asyncpg, fall back to psycopg."""
 
     @contextlib.asynccontextmanager
     async def factory() -> AsyncGenerator[queries.Queries, None]:
         with contextlib.suppress(ImportError):
-            import asyncpg
-
+            from pgqueuer.adapters.connections import connect_asyncpg
             from pgqueuer.adapters.drivers.asyncpg import AsyncpgDriver
 
-            yield queries.Queries(
-                AsyncpgDriver(await asyncpg.connect(dsn=config.pg_dsn or None)),
-                qbe=qb.QueryBuilderEnvironment(settings),
-                qbq=qb.QueryQueueBuilder(settings),
-                qbs=qb.QuerySchedulerBuilder(settings),
-            )
+            async with connect_asyncpg(dsn=config.pg_dsn or None) as connection:
+                yield queries.Queries(
+                    AsyncpgDriver(connection),
+                    qbe=qb.QueryBuilderEnvironment(settings),
+                    qbq=qb.QueryQueueBuilder(settings),
+                    qbs=qb.QuerySchedulerBuilder(settings),
+                )
             return
         with contextlib.suppress(ImportError):
-            import psycopg
-
+            from pgqueuer.adapters.connections import connect_psycopg
             from pgqueuer.adapters.drivers.psycopg import PsycopgDriver
 
-            yield queries.Queries(
-                PsycopgDriver(
-                    await psycopg.AsyncConnection.connect(config.pg_dsn or "", autocommit=True)
-                ),
-                qbe=qb.QueryBuilderEnvironment(settings),
-                qbq=qb.QueryQueueBuilder(settings),
-                qbs=qb.QuerySchedulerBuilder(settings),
-            )
+            async with connect_psycopg(dsn=config.pg_dsn or None) as connection:
+                yield queries.Queries(
+                    PsycopgDriver(connection),
+                    qbe=qb.QueryBuilderEnvironment(settings),
+                    qbq=qb.QueryQueueBuilder(settings),
+                    qbs=qb.QuerySchedulerBuilder(settings),
+                )
             return
         raise RuntimeError("Neither asyncpg nor psycopg could be imported.")
 
@@ -160,17 +187,22 @@ async def yield_queries(
     ctx: Context,
     settings: qb.DBSettings,
 ) -> AsyncGenerator[queries.Queries, None]:
-    """
-    Async context manager that yields a Queries instance from either a user-supplied
-    factory function or the default factory.
-    """
+    """Yield Queries from the user-supplied factory or the built-in default."""
     config: AppConfig = ctx.obj
+    factory_fn: Callable[[], object]
     if config.factory_fn_ref:
         factory_fn = factories.load_factory(config.factory_fn_ref)
     else:
         factory_fn = create_default_queries_factory(config, settings)
-    async with factories.validate_factory_result(factory_fn()) as q:
-        yield q
+    async with factories.validate_factory_result(factory_fn()) as entered:
+        if not isinstance(entered, queries.Queries):
+            raise TypeError(f"Factory must yield Queries, got {type(entered).__name__}")
+        yield entered
+
+
+def tablefmt() -> str:
+    """Tabulate table format; PGQUEUER_TABLEFMT preferred, legacy TABLEFMT honored."""
+    return os.environ.get("PGQUEUER_TABLEFMT", os.environ.get("TABLEFMT", "pretty"))
 
 
 async def display_stats(log_stats: list[models.LogStatistics]) -> None:
@@ -187,14 +219,14 @@ async def display_stats(log_stats: list[models.LogStatistics]) -> None:
                 for stat in log_stats
             ],
             headers=["Created", "Count", "Entrypoint", "Status", "Priority"],
-            tablefmt=os.environ.get(qb.add_prefix("TABLEFMT"), "pretty"),
+            tablefmt=tablefmt(),
         )
     )
 
 
 async def display_pg_channel(
     connection: Driver,
-    channel: models.Channel,
+    channel: types.Channel,
 ) -> None:
     queue = asyncio.Queue[models.AnyEvent]()
     await listeners.initialize_notice_event_listener(
@@ -214,10 +246,10 @@ async def display_schedule(schedules: list[models.Schedule]) -> None:
                 (
                     x.id,
                     x.expression,
-                    x.heartbeat.astimezone() if x.heartbeat else "",
-                    x.created.astimezone() if x.created else "",
-                    x.updated.astimezone() if x.updated else "",
-                    x.next_run.astimezone() if x.next_run else "",
+                    x.heartbeat.astimezone(),
+                    x.created.astimezone(),
+                    x.updated.astimezone(),
+                    x.next_run.astimezone(),
                     x.last_run.astimezone() if x.last_run else "",
                     x.status,
                     x.entrypoint,
@@ -235,7 +267,7 @@ async def display_schedule(schedules: list[models.Schedule]) -> None:
                 "status",
                 "entrypoint",
             ],
-            tablefmt=os.environ.get(qb.add_prefix("TABLEFMT"), "pretty"),
+            tablefmt=tablefmt(),
         )
     )
 
@@ -254,31 +286,49 @@ async def fetch_and_display(
         await asyncio.sleep(interval.total_seconds())
 
 
-@app.command(help="Install the necessary database schema for PGQueuer.")
+def located(settings: qb.DBSettings) -> str:
+    """Which installation a message is about, when several share a database."""
+    where = settings.db_schema or "the connection's search_path"
+    return f"prefix={settings.prefix!r}, schema={where}"
+
+
+@app.command(help="Install the necessary database schema for PgQueuer.")
 def install(
     ctx: Context,
     dry_run: bool = typer.Option(
         False,
-        help="Print SQL only.",
+        "--dry-run",
+        hidden=True,
+        help="Deprecated: use 'pgq sql install'.",
     ),
-    durability: qb.Durability = typer.Option(
-        qb.Durability.durable.value,
-        "--durability",
-        "-d",
-        help="Durability level for tables.",
-    ),
+    durability: sql_cmd.DurabilityOption = qb.Durability.durable,
+    create_schema: sql_cmd.CreateSchemaOption = True,
 ) -> None:
-    print(qb.QueryBuilderEnvironment(qb.DBSettings(durability=durability)).build_install_query())
+    settings = qb.DBSettings(durability=durability)
+    if dry_run:
+        emit_deprecated_dry_run(
+            ctx, schema_ddl.render_install(settings, create_schema=create_schema)
+        )
+        return
 
-    async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings(durability=durability)) as q:
-            await q.install()
+    async def run() -> bool:
+        async with yield_queries(ctx, settings) as q:
+            if await q.schema_is_installed():
+                return False
+            await q.install(create_schema=create_schema)
+            return True
 
-    if not dry_run:
-        asyncio_run(run())
+    if not asyncio_run(run()):
+        typer.secho(
+            f"PgQueuer is already installed ({located(settings)}). "
+            "Run 'pgq upgrade' to bring it up to date.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    typer.secho(f"Installed PgQueuer schema (durability={durability.value}).", err=True)
 
 
-@app.command(help="Verify PGQueuer database objects.")
+@app.command(help="Verify PgQueuer database objects.")
 def verify(
     ctx: Context,
     expect: VerifyMode = typer.Option(
@@ -287,7 +337,7 @@ def verify(
     ),
 ) -> None:
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
+        async with yield_queries(ctx, db_settings()) as q:
             expect_present = expect == VerifyMode.PRESENT
             divergence = list[str]()
 
@@ -318,55 +368,102 @@ def verify(
                 print("\n".join(divergence))
             else:
                 if expect == VerifyMode.PRESENT:
-                    print("All required PGQueuer database objects are present.")
+                    print("All required PgQueuer database objects are present.")
                 else:
-                    print("No PGQueuer database objects found")
+                    print("No PgQueuer database objects found")
 
-            exit(1 if divergence else 0)
+            raise typer.Exit(code=1 if divergence else 0)
 
     asyncio_run(run())
 
 
-@app.command(help="Remove the PGQueuer schema from the database.")
+@app.command(help="Remove the PgQueuer schema from the database.")
 def uninstall(
     ctx: Context,
     dry_run: bool = typer.Option(
         False,
-        help="Print SQL only.",
+        "--dry-run",
+        hidden=True,
+        help="Deprecated: use 'pgq sql uninstall'.",
     ),
 ) -> None:
-    print(qb.QueryBuilderEnvironment().build_uninstall_query())
+    if dry_run:
+        emit_deprecated_dry_run(ctx, schema_ddl.render_uninstall(db_settings()))
+        return
 
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
+        async with yield_queries(ctx, db_settings()) as q:
             await q.uninstall()
 
-    if not dry_run:
-        asyncio_run(run())
+    asyncio_run(run())
+    typer.secho("Uninstalled PgQueuer schema.", err=True)
 
 
-@app.command(help="Apply upgrades to the existing PGQueuer database schema.")
+def report_upgrade(applied: schema_model.Plan, planned_only: bool) -> None:
+    """Summary and notes on stderr, so ``--plan`` can be redirected as SQL."""
+    for note in applied.notes:
+        typer.secho(f"note: {note}", err=True)
+    if not applied.statements:
+        typer.secho("PgQueuer schema is already up to date.", err=True)
+        return
+    count = len(applied.statements)
+    verb = "Would apply" if planned_only else "Applied"
+    typer.secho(f"{verb} {count} statement{'' if count == 1 else 's'}.", err=True)
+
+
+@app.command(
+    help=(
+        "Bring the schema up to what this release declares. "
+        "Use --plan to see the delta this database needs without applying it."
+    )
+)
 def upgrade(
     ctx: Context,
     dry_run: bool = typer.Option(
         False,
-        help="Print SQL only.",
+        "--dry-run",
+        hidden=True,
+        help="Deprecated: use 'pgq sql upgrade'.",
     ),
-    durability: qb.Durability = typer.Option(
-        qb.Durability.durable.value,
+    plan: bool = typer.Option(
+        False,
+        "--plan",
+        help="Print the exact delta this database needs and exit without applying it.",
+    ),
+    widen_id: sql_cmd.WidenIdOption = True,
+    durability: qb.Durability | None = typer.Option(
+        None,
         "--durability",
         "-d",
-        help="Durability level for tables.",
+        hidden=True,
+        help="Deprecated and ignored: upgrade never changes durability.",
     ),
 ) -> None:
-    print(f"\n{'-' * 50}\n".join(qb.QueryBuilderEnvironment().build_upgrade_queries()))
+    if durability is not None:
+        typer.secho(
+            "Warning: --durability is ignored by upgrade and will be removed in v2.0; "
+            "use 'pgq durability' to change it.",
+            err=True,
+            fg=typer.colors.YELLOW,
+        )
+    settings = qb.DBSettings(widen_id=widen_id)
+    if dry_run:
+        emit_deprecated_dry_run(ctx, sql_cmd.render_upgrade(settings))
+        return
 
-    async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings(durability=durability)) as q:
-            await q.upgrade()
+    async def run() -> schema_model.Plan:
+        async with yield_queries(ctx, settings) as q:
+            return await q.plan_upgrade() if plan else await q.apply_upgrade()
 
-    if not dry_run:
-        asyncio_run(run())
+    try:
+        applied = asyncio_run(run())
+    except errors.SchemaDriftError as drift:
+        # The one failure here addressed to an operator rather than a developer.
+        typer.secho(f"error: {drift}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1) from None
+    if plan and (rendered := sql_cmd.render_plan(applied.statements, settings)):
+        typer.echo(rendered)
+    report_upgrade(applied, planned_only=plan)
 
 
 @app.command(help="Display a live dashboard showing job statistics.")
@@ -386,28 +483,58 @@ def dashboard(
     interval_td = timedelta(seconds=interval) if interval is not None else None
 
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
+        async with yield_queries(ctx, db_settings()) as q:
             await fetch_and_display(q, interval_td, limit)
 
     asyncio_run(run())
+
+
+@app.command(help="Serve the web dashboard (requires the 'web' extra).")
+def web(
+    ctx: Context,
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        envvar="PGQUEUER_WEB_HOST",
+        help="Bind address. Use 0.0.0.0 to expose beyond localhost.",
+    ),
+    port: int = typer.Option(
+        8080,
+        "--port",
+        envvar="PGQUEUER_WEB_PORT",
+    ),
+) -> None:
+    try:
+        import uvicorn
+
+        from pgqueuer.adapters.web.app import create_web_app
+    except ImportError as exc:
+        raise typer.BadParameter(
+            "The web dashboard requires extra dependencies. "
+            "Install with: pip install pgqueuer[web,asyncpg]"
+        ) from exc
+
+    logconfig.setup_fancy_logger(logconfig.LogLevel.INFO)
+    config: AppConfig = ctx.obj
+    uvicorn.run(create_web_app(config.pg_dsn or None), host=host, port=port)
 
 
 @app.command(help="Listen to a PostgreSQL NOTIFY channel for debug purposes.")
 def listen(
     ctx: Context,
     channel: str = typer.Option(
-        qb.DBSettings().channel,
+        db_settings().channel,
         "--channel",
     ),
 ) -> None:
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
-            await display_pg_channel(q.driver, models.Channel(channel))
+        async with yield_queries(ctx, db_settings()) as q:
+            await display_pg_channel(q.driver, types.Channel(channel))
 
     asyncio_run(run())
 
 
-@app.command(help="Start a PGQueuer.")
+@app.command(help="Start a PgQueuer.")
 def run(
     factory_fn: str = typer.Argument(
         ...,
@@ -426,6 +553,11 @@ def run(
         10,
         "--batch-size",
         help="Number of jobs to pull from the queue at once.",
+    ),
+    heartbeat_timeout: float = typer.Option(
+        30.0,
+        "--heartbeat-timeout",
+        help="Seconds without a heartbeat before a job is re-picked by another worker.",
     ),
     restart_delay: float = typer.Option(
         5.0,
@@ -458,17 +590,6 @@ def run(
         "--shutdown-on-listener-failure",
         help="Shutdown the manager if the listener fails.",
     ),
-    heartbeat_timeout: float = typer.Option(
-        30.0,
-        "--heartbeat-timeout",
-        help=(
-            "Seconds after which a 'picked' job with a stale heartbeat becomes "
-            "eligible for re-pickup by another worker. Heartbeats are sent "
-            "automatically at half this interval. Tune above your longest "
-            "expected event-loop stall (NOT longest handler runtime — async "
-            "handlers stay healthy as long as the loop keeps spinning)."
-        ),
-    ),
 ) -> None:
     """
     Run the job manager, pulling tasks from the queue and handling them with workers.
@@ -482,13 +603,12 @@ def run(
         factory = functools.partial(factory, factory_args)
 
     asyncio_run(
-        supervisor.runit(
+        supervisor.run(
             factory,
             dequeue_timeout=timedelta(seconds=dequeue_timeout),
             batch_size=batch_size,
-            restart_delay=timedelta(seconds=restart_delay if restart_on_failure else 0),
+            restart_delay=timedelta(seconds=restart_delay),
             restart_on_failure=restart_on_failure,
-            shutdown=asyncio.Event(),
             mode=mode,
             max_concurrent_tasks=max_concurrent_tasks,
             shutdown_on_listener_failure=shutdown_on_listener_failure,
@@ -497,7 +617,7 @@ def run(
     )
 
 
-@app.command(help="Manage schedules in the PGQueuer system.")
+@app.command(help="Manage schedules in the PgQueuer system.")
 def schedules(
     ctx: Context,
     remove: list[str] = typer.Option(
@@ -508,9 +628,9 @@ def schedules(
     ),
 ) -> None:
     async def run_async() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
+        async with yield_queries(ctx, db_settings()) as q:
             if remove:
-                schedule_ids = {models.ScheduleId(int(x)) for x in remove if x.isdigit()}
+                schedule_ids = {types.ScheduleId(int(x)) for x in remove if x.isdigit()}
                 schedule_names = {types.CronEntrypoint(x) for x in remove if not x.isdigit()}
                 await q.delete_schedule(schedule_ids, schedule_names)
             await display_schedule(await q.peek_schedule())
@@ -518,7 +638,7 @@ def schedules(
     asyncio_run(run_async())
 
 
-@app.command(help="Manually enqueue a job into the PGQueuer system.")
+@app.command(help="Manually enqueue a job into the PgQueuer system.")
 def queue(
     ctx: Context,
     entrypoint: str = typer.Argument(
@@ -529,15 +649,39 @@ def queue(
         None,
         help="Optional payload for the job, can be any serialized data.",
     ),
+    dedupe_key: str | None = typer.Option(
+        None,
+        "--dedupe-key",
+        help="Deduplication key; an active ('queued'/'picked') job with the same key blocks it.",
+    ),
+    on_conflict: OnConflictChoice = typer.Option(
+        OnConflictChoice.RAISE,
+        "--on-conflict",
+        help="On dedupe-key conflict: 'raise' exits with an error, 'skip' exits 0 silently.",
+    ),
 ) -> None:
     async def run_async() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
-            await q.enqueue(
+        # For a single job, skip mode subsumes raise mode: a None result is
+        # exactly the duplicate case, so on_conflict only decides the exit.
+        async with yield_queries(ctx, db_settings()) as q:
+            (job_id,) = await q.enqueue(
                 entrypoint,
                 None if payload is None else payload.encode(),
                 priority=0,
                 execute_after=timedelta(seconds=0),
+                dedupe_key=dedupe_key,
+                on_conflict="skip",
             )
+
+        if job_id is not None:
+            print(f"Enqueued job {job_id}.")
+        elif on_conflict is OnConflictChoice.SKIP:
+            print(f"Skipped: duplicate dedupe_key {dedupe_key!r}.")
+        elif on_conflict is OnConflictChoice.RAISE:
+            typer.secho(f"Error: duplicate dedupe_key {dedupe_key!r}.", err=True)
+            raise typer.Exit(code=1)
+        else:
+            assert_never(on_conflict)
 
     asyncio_run(run_async())
 
@@ -546,10 +690,26 @@ def queue(
 def failed(
     ctx: Context,
     limit: int = typer.Option(25, "-n", "--limit", help="Maximum number of jobs to display."),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the jobs as a JSON array on stdout. Payloads are reported by size only.",
+    ),
 ) -> None:
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
+        async with yield_queries(ctx, db_settings()) as q:
             jobs = await q.list_failed_jobs(limit=limit)
+            if as_json:
+                print(
+                    json.dumps(
+                        [
+                            j.model_dump(mode="json", exclude={"payload"})
+                            | {"payload_bytes": len(j.payload) if j.payload else 0}
+                            for j in jobs
+                        ]
+                    )
+                )
+                return
             if not jobs:
                 print("No failed jobs.")
                 return
@@ -567,7 +727,7 @@ def failed(
                 tabulate(
                     rows,
                     headers=["ID", "Entrypoint", "Attempts", "Created", "Payload bytes"],
-                    tablefmt=os.environ.get(qb.add_prefix("TABLEFMT"), "pretty"),
+                    tablefmt=tablefmt(),
                 )
             )
 
@@ -590,7 +750,7 @@ def requeue(
     ),
 ) -> None:
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
+        async with yield_queries(ctx, db_settings()) as q:
             typed_ids = [types.JobId(i) for i in ids]
             await q.requeue_jobs(typed_ids, reset_attempts=not preserve_attempts)
             print(f"Re-queued {len(typed_ids)} job(s).")
@@ -598,68 +758,192 @@ def requeue(
     asyncio_run(run())
 
 
-@app.command(help="Alter the logging durability for PGQueuer tables.")
-def durability(
+@app.command(help="List picked jobs whose heartbeat is older than the threshold.")
+def stale(
     ctx: Context,
-    durability: qb.Durability = typer.Argument(
-        ...,
-        help=(
-            "The durability mode to set: 'volatile' (all unlogged), "
-            "'balanced' (main table logged, others unlogged), 'durable' (all logged)."
-        ),
+    threshold: float = typer.Option(
+        300,
+        "-t",
+        "--threshold",
+        help="Seconds since the last heartbeat before a picked job counts as stale.",
     ),
-    dry_run: bool = typer.Option(
-        False,
-        help="Print SQL commands without executing them.",
+    limit: int = typer.Option(25, "-n", "--limit", help="Maximum number of jobs to display."),
+    as_json: bool = typer.Option(False, "--json", help="Print the jobs as a JSON array on stdout."),
+) -> None:
+    async def run() -> None:
+        async with yield_queries(ctx, db_settings()) as q:
+            jobs = await InsightsService(q).stale_jobs(timedelta(seconds=threshold), limit)
+            if as_json:
+                print(to_json(jobs).decode())
+                return
+            if not jobs:
+                print("No stale jobs.")
+                return
+            rows = [
+                [
+                    j.id,
+                    j.entrypoint,
+                    j.queue_manager_id,
+                    j.heartbeat.strftime("%Y-%m-%d %H:%M:%S"),
+                    round(j.seconds_since_heartbeat),
+                ]
+                for j in jobs
+            ]
+            print(
+                tabulate(
+                    rows,
+                    headers=[
+                        "ID",
+                        "Entrypoint",
+                        "Queue manager",
+                        "Heartbeat",
+                        "Seconds since heartbeat",
+                    ],
+                    tablefmt=tablefmt(),
+                )
+            )
+
+    asyncio_run(run())
+
+
+@app.command(help="List queue managers currently holding picked jobs.")
+def workers(
+    ctx: Context,
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the workers as a JSON array on stdout."
     ),
 ) -> None:
-    """
-    Command to alter the durability level of the tables in PGQueuer without data loss.
+    async def run() -> None:
+        async with yield_queries(ctx, db_settings()) as q:
+            active = await InsightsService(q).active_workers()
+            if as_json:
+                print(to_json(active).decode())
+                return
+            if not active:
+                print("No workers are holding picked jobs.")
+                return
+            rows = [
+                [
+                    w.queue_manager_id,
+                    w.active_jobs,
+                    w.oldest_heartbeat.strftime("%Y-%m-%d %H:%M:%S"),
+                    w.newest_heartbeat.strftime("%Y-%m-%d %H:%M:%S"),
+                    ", ".join(w.entrypoints),
+                ]
+                for w in active
+            ]
+            print(
+                tabulate(
+                    rows,
+                    headers=[
+                        "Queue manager",
+                        "Picked jobs",
+                        "Oldest heartbeat",
+                        "Newest heartbeat",
+                        "Entrypoints",
+                    ],
+                    tablefmt=tablefmt(),
+                )
+            )
 
-    Args:
-        ctx: Context object with configuration information.
-        durability: The desired durability level ('volatile', 'balanced', or 'durable').
-        dry_run: Whether to print SQL commands without executing them.
-    """
-    print(
-        "\n".join(
-            qb.QueryBuilderEnvironment(
-                qb.DBSettings(durability=durability)
-            ).build_alter_durability_query()
-        )
-    )
+    asyncio_run(run())
+
+
+@app.command(help="Show how many jobs wait in 'queued' per entrypoint, and how old they are.")
+def backlog(
+    ctx: Context,
+    as_json: bool = typer.Option(
+        False, "--json", help="Print one object per entrypoint as a JSON array on stdout."
+    ),
+) -> None:
+    async def run() -> None:
+        async with yield_queries(ctx, db_settings()) as q:
+            ages = await InsightsService(q).queue_age()
+            if as_json:
+                print(to_json(ages).decode())
+                return
+            if not ages:
+                print("No queued jobs.")
+                return
+            rows = [
+                [
+                    a.entrypoint,
+                    a.queued_count,
+                    a.oldest_created.strftime("%Y-%m-%d %H:%M:%S"),
+                    round(a.oldest_age_seconds),
+                    round(a.avg_age_seconds),
+                ]
+                for a in ages
+            ]
+            print(
+                tabulate(
+                    rows,
+                    headers=[
+                        "Entrypoint",
+                        "Queued",
+                        "Oldest created",
+                        "Oldest age (s)",
+                        "Average age (s)",
+                    ],
+                    tablefmt=tablefmt(),
+                )
+            )
+
+    asyncio_run(run())
+
+
+@app.command(help="Alter the logging durability for PgQueuer tables.")
+def durability(
+    ctx: Context,
+    durability: sql_cmd.DurabilityArgument,
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        hidden=True,
+        help="Deprecated: use 'pgq sql durability'.",
+    ),
+) -> None:
+    """Switch durability level of PgQueuer tables without data loss."""
+    settings = qb.DBSettings(durability=durability)
+    if dry_run:
+        emit_deprecated_dry_run(ctx, sql_cmd.render_durability(settings))
+        return
 
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings(durability=durability)) as q:
+        async with yield_queries(ctx, settings) as q:
             await q.alter_durability()
 
-    if not dry_run:
-        asyncio_run(run())
+    asyncio_run(run())
+    typer.secho(f"Set PgQueuer durability to {durability.value}.", err=True)
 
 
-@app.command(name="autovac", help="Optimize autovacuum settings for PGQueuer tables.")
+@app.command(name="autovac", help="Optimize autovacuum settings for PgQueuer tables.")
 def optimize_autovacuum(
     ctx: Context,
-    dry_run: bool = typer.Option(False, help="Print SQL commands only."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        hidden=True,
+        help="Deprecated: use 'pgq sql autovac'.",
+    ),
     rollback: bool = typer.Option(False, help="Reset to defaults instead."),
 ) -> None:
     """Apply or revert recommended autovacuum settings."""
-
-    qbe = qb.QueryBuilderEnvironment()
-    query = (
-        qbe.build_optimize_autovacuum_rollback_query()
-        if rollback
-        else qbe.build_optimize_autovacuum_query()
-    )
-
-    print(query)
+    if dry_run:
+        emit_deprecated_dry_run(ctx, sql_cmd.render_autovac(rollback))
+        return
 
     async def run() -> None:
-        async with yield_queries(ctx, qb.DBSettings()) as q:
+        async with yield_queries(ctx, db_settings()) as q:
             await (q.optimize_autovacuum_rollback() if rollback else q.optimize_autovacuum())
 
-    if not dry_run:
-        asyncio_run(run())
+    asyncio_run(run())
+    typer.secho(
+        "Reset autovacuum settings to defaults."
+        if rollback
+        else "Applied recommended autovacuum settings.",
+        err=True,
+    )
 
 
 if __name__ == "__main__":

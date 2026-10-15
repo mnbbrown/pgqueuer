@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from pgqueuer.core.tm import TaskManager
+from pgqueuer.core.tm import TaskManager, cancel_on_exit
 
 
 @pytest.mark.parametrize("N", (1, 2, 3, 5, 64))
@@ -12,7 +12,7 @@ async def test_task_manager(N: int) -> None:
     tm = TaskManager()
     assert len(tm.tasks) == 0
 
-    async def waiter(future: asyncio.Future) -> None:
+    async def waiter(future: asyncio.Future[None]) -> None:
         return await future
 
     for _ in range(N):
@@ -27,7 +27,7 @@ async def test_task_manager(N: int) -> None:
 
 @pytest.mark.parametrize("N", (1, 2, 3, 5, 64))
 async def test_task_manager_ctx_mngr(N: int) -> None:
-    async def waiter(future: asyncio.Future) -> None:
+    async def waiter(future: asyncio.Future[None]) -> None:
         return await future
 
     future = asyncio.Future[None]()
@@ -98,3 +98,79 @@ async def test_task_manager_no_log_on_cancel(
         task.cancel()
 
     assert len(caplog.messages) == 0
+
+
+async def test_task_manager_can_add_same_task_twice() -> None:
+    loop = asyncio.get_running_loop()
+    callback_errors: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: callback_errors.append(context))
+
+    async def done() -> None:
+        return None
+
+    task = asyncio.create_task(done())
+    tm = TaskManager()
+    try:
+        tm.add(task)
+        tm.add(task)
+        await task
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert not tm.tasks
+    assert not callback_errors
+
+
+async def test_cancel_on_exit_cancels_pending_task() -> None:
+    async with cancel_on_exit(asyncio.create_task(asyncio.Event().wait())) as task:
+        assert not task.done()
+    assert task.cancelled()
+
+
+async def test_cancel_on_exit_swallows_task_exception() -> None:
+    async def raises() -> None:
+        raise RuntimeError("boom")
+
+    async with cancel_on_exit(asyncio.create_task(raises())) as task:
+        await asyncio.sleep(0)
+    assert task.done()
+
+
+async def test_cancel_on_exit_leaves_completed_result() -> None:
+    async def result() -> int:
+        return 42
+
+    async with cancel_on_exit(asyncio.create_task(result())) as task:
+        assert await task == 42
+    assert task.result() == 42
+
+
+async def test_cancel_on_exit_propagates_caller_cancel() -> None:
+    """A cancel aimed at the caller while the child unwinds is not swallowed (#889)."""
+    unwinding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_to_unwind() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            unwinding.set()
+            await release.wait()
+
+    child = asyncio.create_task(slow_to_unwind())
+
+    async def caller() -> None:
+        async with cancel_on_exit(child):
+            pass
+
+    task = asyncio.create_task(caller())
+    await unwinding.wait()
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        await asyncio.wait({child})

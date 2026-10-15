@@ -1,11 +1,14 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import MutableMapping
 from unittest.mock import Mock
 
 import pytest
 
-from pgqueuer.db import AsyncpgDriver, Driver
+from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
+from pgqueuer.db import AsyncpgDriver
 from pgqueuer.domain.settings import DBSettings
+from pgqueuer.domain.types import ScheduleId
 from pgqueuer.executors import (
     ScheduleExecutor,
     ScheduleExecutorFactoryParameters,
@@ -21,14 +24,19 @@ from pgqueuer.queries import Queries
 from pgqueuer.sm import SchedulerManager
 
 
-async def inspect_schedule(connection: Driver) -> list[Schedule]:
+async def inspect_schedule(
+    scheduler_or_driver: SchedulerManager | AsyncpgDriver,
+) -> list[Schedule]:
+    if isinstance(scheduler_or_driver, SchedulerManager):
+        return await scheduler_or_driver.queries.peek_schedule()
+    # Legacy path for integration tests that inspect raw DB
     query = f"SELECT * FROM {DBSettings().schedules_table} ORDER BY id"
-    return [Schedule.model_validate(dict(x)) for x in await connection.fetch(query)]
+    return [Schedule.model_validate(dict(x)) for x in await scheduler_or_driver.fetch(query)]
 
 
 @pytest.fixture
-async def scheduler(apgdriver: AsyncpgDriver) -> SchedulerManager:
-    return SchedulerManager(Queries(apgdriver))
+def scheduler(queries: InMemoryQueries) -> SchedulerManager:
+    return SchedulerManager(queries)
 
 
 async def shutdown_Scheduler_after(
@@ -57,6 +65,35 @@ async def test_scheduler_register(scheduler: SchedulerManager) -> None:
     key = next(itr)
     assert key.entrypoint == "sample_task"
     assert scheduler.registry[key].parameters.expression == "2 * * * *"
+
+
+def test_scheduler_auto_detects_context() -> None:
+    scheduler = SchedulerManager(Mock())
+
+    async def with_context(schedule: Schedule, ctx: ScheduleContext) -> None:
+        pass
+
+    async def without_context(schedule: Schedule) -> None:
+        pass
+
+    scheduler.schedule("with_context", "1 * * * *")(with_context)
+    scheduler.schedule("without_context", "2 * * * *")(without_context)
+
+    by_entrypoint = {str(key.entrypoint): ex for key, ex in scheduler.registry.items()}
+    assert by_entrypoint["with_context"].parameters.accepts_context
+    assert not by_entrypoint["without_context"].parameters.accepts_context
+
+
+def test_scheduler_explicit_flag_overrides_detection() -> None:
+    scheduler = SchedulerManager(Mock())
+
+    async def with_context(schedule: Schedule, ctx: ScheduleContext) -> None:
+        pass
+
+    scheduler.schedule("forced_off", "1 * * * *", accepts_context=False)(with_context)
+
+    key = next(iter(scheduler.registry.keys()))
+    assert not scheduler.registry[key].parameters.accepts_context
 
 
 async def test_scheduler_register_raises_invalid_expression(scheduler: SchedulerManager) -> None:
@@ -153,6 +190,121 @@ async def test_scheduler_runs_tasks(scheduler: SchedulerManager, mocker: Mock) -
     assert executed
 
 
+@pytest.mark.parametrize("fails", (False, True))
+async def test_scheduler_releases_schedule_before_driver_exit(mocker: Mock, fails: bool) -> None:
+    """In-flight schedules are released before the driver exits (#897)."""
+    events: list[str] = []
+
+    class RecordingDriver(InMemoryDriver):
+        async def __aexit__(self, *_: object) -> None:
+            events.append("driver exit")
+
+    queries = InMemoryQueries(driver=RecordingDriver())
+    scheduler = SchedulerManager(queries)
+    mocked_now = datetime.now(timezone.utc) + timedelta(hours=1)
+    mocker.patch("pgqueuer.core.executors.utc_now", return_value=mocked_now)
+    mocker.patch(
+        "pgqueuer.core.executors.croniter",
+        return_value=mocker.Mock(get_next=mocker.Mock(return_value=mocked_now.timestamp() - 60)),
+    )
+
+    started = asyncio.Event()
+
+    async def slow_task(schedule: Schedule) -> None:
+        started.set()
+        await asyncio.sleep(0.2)
+        if fails:
+            raise ValueError
+
+    scheduler.schedule("slow_task", "* * * * *")(slow_task)
+
+    release = queries.set_schedule_queued
+
+    async def recording_release(ids: set[ScheduleId]) -> None:
+        events.append("release")
+        await release(ids)
+
+    mocker.patch.object(queries, "set_schedule_queued", side_effect=recording_release)
+
+    run = asyncio.create_task(scheduler.run())
+    await started.wait()
+    scheduler.shutdown.set()
+    await run
+
+    assert events == ["release", "driver exit"]
+
+
+@pytest.mark.parametrize("trigger", ("error", "cancel"))
+async def test_scheduler_run_exits_when_body_stops(
+    scheduler: SchedulerManager,
+    mocker: Mock,
+    trigger: str,
+) -> None:
+    """run() fails fast when its loop raises or is cancelled with shutdown unset (#881)."""
+    fetching = asyncio.Event()
+
+    async def fetch_schedule(_: object) -> list[Schedule]:
+        fetching.set()
+        if trigger == "error":
+            raise RuntimeError("fetch failed")
+        await asyncio.Future()
+        return []
+
+    mocker.patch.object(scheduler.queries, "fetch_schedule", side_effect=fetch_schedule)
+
+    run = asyncio.create_task(scheduler.run())
+    await fetching.wait()
+    if trigger == "cancel":
+        run.cancel()
+    done, _ = await asyncio.wait({run}, timeout=2)
+    if run not in done:
+        run.cancel()
+        pytest.fail("run() hung after its loop stopped")
+    expected = RuntimeError if trigger == "error" else asyncio.CancelledError
+    with pytest.raises(expected):
+        run.result()
+
+
+async def test_scheduler_run_beats_while_draining_after_error(
+    scheduler: SchedulerManager,
+    mocker: Mock,
+) -> None:
+    """A failing loop drains running schedules with their heartbeat still going."""
+    mocked_now = datetime.now(timezone.utc) + timedelta(hours=1)
+    mocker.patch("pgqueuer.core.executors.utc_now", return_value=mocked_now)
+    mocker.patch(
+        "pgqueuer.core.executors.croniter",
+        return_value=mocker.Mock(get_next=mocker.Mock(return_value=mocked_now.timestamp() - 60)),
+    )
+    failed = asyncio.Event()
+    beats_after_failure = 0
+
+    async def slow_task(schedule: Schedule) -> None:
+        await asyncio.sleep(1.5)
+
+    scheduler.schedule("slow_task", "* * * * *")(slow_task)
+    fetch_schedule = scheduler.queries.fetch_schedule
+
+    async def fail_after_first(entrypoints: object) -> list[Schedule]:
+        if scheduler.active_heartbeat_ids:
+            failed.set()
+            raise RuntimeError("fetch failed")
+        return await fetch_schedule(entrypoints)  # type: ignore[arg-type]
+
+    async def count_heartbeat(ids: set[ScheduleId]) -> None:
+        nonlocal beats_after_failure
+        if failed.is_set():
+            beats_after_failure += 1
+
+    mocker.patch.object(scheduler.queries, "fetch_schedule", side_effect=fail_after_first)
+    mocker.patch.object(scheduler.queries, "update_schedule_heartbeat", side_effect=count_heartbeat)
+
+    with pytest.raises(RuntimeError, match="fetch failed"):
+        await asyncio.wait_for(scheduler.run(), timeout=5)
+
+    assert beats_after_failure >= 1
+
+
 async def test_heartbeat_updates(scheduler: SchedulerManager, mocker: Mock) -> None:
     mocked_now = datetime.now(timezone.utc) + timedelta(hours=1)
     mocker.patch(
@@ -170,14 +322,14 @@ async def test_heartbeat_updates(scheduler: SchedulerManager, mocker: Mock) -> N
 
     scheduler.schedule("sample_task", "* * * * *")(sample_task)
 
-    before = await inspect_schedule(scheduler.queries.driver)
+    before = await inspect_schedule(scheduler)
     await asyncio.gather(
         *[
             scheduler.run(),
             shutdown_Scheduler_after(scheduler, timedelta(seconds=1)),
         ],
     )
-    after = await inspect_schedule(scheduler.queries.driver)
+    after = await inspect_schedule(scheduler)
 
     assert all(a.heartbeat > b.heartbeat for a, b in zip(after, before))
 
@@ -375,8 +527,8 @@ async def test_schedule_executor_without_context() -> None:
         received_schedules.append(schedule)
 
     params = ScheduleExecutorFactoryParameters(
-        entrypoint="no_ctx",
-        expression="* * * * *",
+        entrypoint=CronEntrypoint("no_ctx"),
+        expression=CronExpression("* * * * *"),
         func=handler,
         clean_old=False,
         accepts_context=False,
@@ -384,7 +536,7 @@ async def test_schedule_executor_without_context() -> None:
     executor = ScheduleExecutor(parameters=params)
 
     fake_schedule = Schedule(
-        id=1,
+        id=ScheduleId(1),
         expression=CronExpression("* * * * *"),
         heartbeat=datetime.now(timezone.utc),
         created=datetime.now(timezone.utc),
@@ -408,8 +560,8 @@ async def test_schedule_executor_with_context() -> None:
         received.append((schedule, ctx))
 
     params = ScheduleExecutorFactoryParameters(
-        entrypoint="with_ctx",
-        expression="* * * * *",
+        entrypoint=CronEntrypoint("with_ctx"),
+        expression=CronExpression("* * * * *"),
         func=handler,
         clean_old=False,
         accepts_context=True,
@@ -417,7 +569,7 @@ async def test_schedule_executor_with_context() -> None:
     executor = ScheduleExecutor(parameters=params)
 
     fake_schedule = Schedule(
-        id=1,
+        id=ScheduleId(1),
         expression=CronExpression("* * * * *"),
         heartbeat=datetime.now(timezone.utc),
         created=datetime.now(timezone.utc),
@@ -449,7 +601,7 @@ async def test_schedule_context_resources_via_scheduler(
     )
 
     scheduler.resources = {"shared_key": "shared_value"}
-    received_resources: list[dict] = []
+    received_resources: list[MutableMapping[str, object]] = []
 
     async def handler(schedule: Schedule, ctx: ScheduleContext) -> None:
         received_resources.append(dict(ctx.resources))

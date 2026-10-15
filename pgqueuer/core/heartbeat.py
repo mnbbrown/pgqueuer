@@ -1,5 +1,3 @@
-# heartbeat.py
-
 from __future__ import annotations
 
 import asyncio
@@ -10,14 +8,14 @@ from datetime import timedelta
 from typing_extensions import Self
 
 from pgqueuer.core import buffers, logconfig
-from pgqueuer.domain import models
+from pgqueuer.domain import types
 
 
 @dataclass
 class Heartbeat:
     """Async context manager that sends periodic heartbeats to a buffer."""
 
-    job_id: models.JobId
+    job_id: types.JobId
     interval: timedelta
     buffer: buffers.HeartbeatBuffer
     shutdown: asyncio.Event = field(
@@ -37,8 +35,8 @@ class Heartbeat:
     async def __aexit__(self, *_: object) -> None:
         self.shutdown.set()
         if self.heartbeat_task is not None:
-            with suppress(asyncio.CancelledError):
-                await self.heartbeat_task
+            # A cancel of the caller is forwarded to the heartbeat task and re-raised here.
+            await self.heartbeat_task
 
     async def send_heartbeat(self) -> None:
         while not self.shutdown.is_set():

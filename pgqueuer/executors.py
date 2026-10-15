@@ -1,5 +1,7 @@
 """Backward-compatibility shim. Canonical: pgqueuer.core.executors"""
 
+from __future__ import annotations
+
 from pgqueuer.core.executors import (
     AbstractEntrypointExecutor,
     AbstractScheduleExecutor,
@@ -16,6 +18,7 @@ from pgqueuer.core.executors import (
     ScheduleExecutor,
     ScheduleExecutorFactoryParameters,
     is_async_callable,
+    wants_context,
 )
 
 __all__ = [
@@ -34,4 +37,5 @@ __all__ = [
     "ScheduleExecutor",
     "ScheduleExecutorFactoryParameters",
     "is_async_callable",
+    "wants_context",
 ]

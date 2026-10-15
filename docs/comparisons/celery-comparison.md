@@ -1,6 +1,6 @@
 # PgQueuer vs Celery
 
-Celery and PgQueuer solve the same core problem -- reliable background job processing --
+Celery and PgQueuer solve the same core problem (reliable background job processing)
 with different trade-offs. This page compares them side by side so you can pick the
 right tool for your situation.
 
@@ -9,7 +9,7 @@ right tool for your situation.
 | Feature | Celery | PgQueuer |
 |---------|--------|---------|
 | Message broker | Redis, RabbitMQ, SQS, etc. | PostgreSQL |
-| Recurring tasks | Separate `celery-beat` process | Built-in `@schedule` decorator |
+| Recurring tasks | Separate `celery-beat` process | Built-in `@pgq.schedule` decorator |
 | Architecture | App + broker + optional beat | App + PostgreSQL |
 | Job delivery | Broker-dependent | Real-time via `LISTEN/NOTIFY` |
 | Transactional enqueue | Separate from app data | Same PostgreSQL transaction |
@@ -39,6 +39,7 @@ celery -A celery_app worker -l info
 
 ```python
 # pgqueuer_app.py
+import json
 import asyncpg
 from contextlib import asynccontextmanager
 from pgqueuer import PgQueuer
@@ -53,8 +54,8 @@ async def create_pgq():
 
     @pgq.entrypoint("add")
     async def add(job: Job):
-        x, y = job.payload
-        return x + y
+        data = json.loads(job.payload)
+        return data["x"] + data["y"]
 
     yield pgq
 ```
@@ -169,21 +170,13 @@ async def wait_for_job() -> None:
         print(status)
 ```
 
-## When PgQueuer Is a Good Fit
+## Choosing Between Them
 
-- You're already using PostgreSQL and want to avoid an extra broker service
-- You value stack simplicity and reduced operational overhead
-- You need lightweight recurring jobs without running `celery-beat`
-- Your workload fits within PostgreSQL's throughput characteristics
-- You want transactional enqueuing (enqueue a job in the same transaction as your app data)
+Celery is a mature project with a long history. Its advantages over PgQueuer are
+canvas primitives for task composition, brokers that are not tied to one language,
+and throughput beyond a single PostgreSQL instance. PgQueuer's advantages are the
+ones visible in the examples above: no broker, no beat process, and enqueuing inside
+the transaction that writes your application data.
 
-## When Celery May Be Better
-
-Celery is a mature project with a long history. It may be the better choice when:
-
-- You need complex multi-step workflows (chains, chords, groups)
-- You require canvas primitives for task composition
-- Your system spans multiple languages or needs a non-Python broker
-- You need very high throughput beyond what a single PostgreSQL instance can deliver
-
-For more details on PgQueuer's throughput characteristics, see [Benchmarks](benchmarks.md).
+[When to use PgQueuer](../getting-started/when-to-use.md) works through the fit
+question in full, and [Benchmarks](benchmarks.md) covers throughput.

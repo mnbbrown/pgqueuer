@@ -5,33 +5,16 @@ import signal
 import subprocess
 import sys
 import time
-from urllib.parse import urlparse
+from datetime import timedelta
 
+import psycopg
 import pytest
 from typer.testing import CliRunner
 
+from pgqueuer.adapters.cli import supervisor
 from pgqueuer.adapters.cli.cli import app
-
-
-def _env_from_dsn(dsn: str) -> dict[str, str]:
-    """
-    Build the PG* environment variables required by asyncpg.connect()
-    from a PostgreSQL DSN.
-    """
-    parsed = urlparse(dsn)
-    # Scheme can be postgres / postgresql; path starts with /dbname
-    dbname = parsed.path.lstrip("/") or ""
-    host = parsed.hostname or "localhost"
-    port = str(parsed.port or 5432)
-    user = parsed.username or ""
-    password = parsed.password or ""
-    return {
-        "PGHOST": host,
-        "PGPORT": port,
-        "PGUSER": user,
-        "PGPASSWORD": password,
-        "PGDATABASE": dbname,
-    }
+from pgqueuer.domain.settings import DBSettings
+from test.helpers import env_from_dsn
 
 
 @pytest.mark.skipif(
@@ -46,7 +29,7 @@ def test_cli_run_handles_sigint_gracefully(dsn: str) -> None:
     flakiness across environments while still asserting proper signal handling.
     """
     env = os.environ.copy()
-    env.update(_env_from_dsn(dsn))
+    env.update(env_from_dsn(dsn))
     # Unbuffered so logs appear promptly (mirrors CI step)
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -105,7 +88,7 @@ def test_cli_install_upgrade_uninstall_cycle(dsn: str) -> None:
     """
     Exercise the full install -> verify present -> upgrade -> uninstall -> verify absent flow.
 
-    The test DB provided by the 'dsn' fixture starts with PGQueuer objects
+    The test DB provided by the 'dsn' fixture starts with PgQueuer objects
     already installed (template cloning). To mirror the exact CI sequence
     (which starts clean), we first perform an uninstall + verify absent, then
     proceed with the normal cycle.
@@ -122,11 +105,10 @@ def test_cli_install_upgrade_uninstall_cycle(dsn: str) -> None:
     runner = CliRunner()
 
     # Build base PG* env for each CLI invocation
-    base_env = os.environ.copy()
-    base_env.update(_env_from_dsn(dsn))
+    base_env = env_from_dsn(dsn)
 
     # Helper to invoke and assert success
-    def invoke_ok(args: list[str], env: dict[str, str]) -> None:
+    def invoke_ok(args: list[str], env: dict[str, str]) -> str:
         result = runner.invoke(app, args, env=env)
         if result.exit_code != 0:
             pytest.fail(
@@ -134,9 +116,10 @@ def test_cli_install_upgrade_uninstall_cycle(dsn: str) -> None:
                 f"args={args}\nexit_code={result.exit_code}\n"
                 f"stdout={result.stdout}\nexc={result.exception}"
             )
+        return result.stdout
 
-    # 1. Ensure absent (uninstall). If uninstall fails due to objects missing,
-    #    it should still exit 0 (implementation prints SQL + runs uninstall).
+    # 1. Ensure absent (uninstall). All objects are dropped with IF EXISTS,
+    #    so this exits 0 even when nothing is installed.
     result_uninstall_initial = runner.invoke(app, ["uninstall"], env=base_env)
     # Accept exit_code 0 only.
     if result_uninstall_initial.exit_code != 0:
@@ -153,17 +136,126 @@ def test_cli_install_upgrade_uninstall_cycle(dsn: str) -> None:
             f"stdout={result_verify_absent.stdout}\nexc={result_verify_absent.exception}"
         )
 
-    # 3. install
-    invoke_ok(["install"], base_env)
+    # 3. install (real execution keeps stdout free of SQL; use 'pgq sql install' for that)
+    assert "CREATE TABLE" not in invoke_ok(["install"], base_env)
 
     # 4. verify present
     invoke_ok(["verify", "--expect", "present"], base_env)
 
     # 5. upgrade (should succeed even if no changes)
-    invoke_ok(["upgrade"], base_env)
+    assert "ALTER TABLE" not in invoke_ok(["upgrade"], base_env)
 
     # 6. uninstall
-    invoke_ok(["uninstall"], base_env)
+    assert "DROP TABLE" not in invoke_ok(["uninstall"], base_env)
 
     # 7. verify absent again
     invoke_ok(["verify", "--expect", "absent"], base_env)
+
+
+def test_cli_install_refuses_an_installed_database(dsn: str) -> None:
+    """Re-running install used to surface a raw DuplicateObjectError traceback.
+
+    The dsn fixture arrives with PgQueuer already installed, which is the state
+    a provisioning script that runs install twice would find.
+    """
+    env = env_from_dsn(dsn)
+
+    result = CliRunner().invoke(app, ["install"], env=env)
+
+    assert result.exit_code == 1
+    assert "already installed" in result.stderr
+    assert "pgq upgrade" in result.stderr
+
+
+def test_cli_upgrade_reports_drift_without_a_traceback(dsn: str) -> None:
+    """Drift is the one failure here addressed to an operator, not a developer.
+
+    It used to arrive on line 145 of a rich traceback through uvloop and asyncpg.
+    """
+    env = env_from_dsn(dsn)
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        table = DBSettings().queue_table
+        connection.execute(f"ALTER TABLE {table} ALTER COLUMN payload TYPE text".encode())
+
+    result = CliRunner().invoke(app, ["upgrade"], env=env)
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.stderr
+    assert "no supported conversion" in result.stderr
+    assert result.stdout.strip() == ""
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "warned"),
+    [([], False), (["--durability", "volatile"], True), (["-d", "volatile"], True)],
+)
+def test_cli_upgrade_ignores_a_durability_flag(
+    dsn: str,
+    extra_args: list[str],
+    warned: bool,
+) -> None:
+    """v1.4.0 scripts pass it; it never applied, so it warns and the upgrade runs.
+
+    No ``note:`` means the declared level stayed durable rather than volatile.
+    """
+    env = env_from_dsn(dsn)
+
+    result = CliRunner().invoke(app, ["upgrade", *extra_args], env=env)
+
+    assert result.exit_code == 0
+    assert ("--durability is ignored" in result.stderr) is warned
+    assert "note:" not in result.stderr
+    assert "already up to date" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        ([], timedelta(seconds=30)),
+        (["--heartbeat-timeout", "7"], timedelta(seconds=7)),
+    ],
+)
+def test_cli_run_forwards_heartbeat_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    extra_args: list[str],
+    expected: timedelta,
+) -> None:
+    """`pgq run` forwards --heartbeat-timeout (default 30s) to supervisor.runit (#674)."""
+    captured: dict[str, object] = {}
+
+    async def fake_runit(factory: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(supervisor, "runit", fake_runit)
+    result = CliRunner().invoke(app, ["run", "examples.consumer:main", *extra_args])
+    assert result.exit_code == 0, result.output
+    assert captured["heartbeat_timeout"] == expected
+
+
+def test_cli_upgrade_reports_converged_and_plans_the_delta(dsn: str) -> None:
+    """`pgq upgrade` reports what it did on stderr; `--plan` prints only the delta on stdout."""
+    runner = CliRunner()
+    env = env_from_dsn(dsn)
+
+    converged = runner.invoke(app, ["upgrade"], env=env)
+    assert converged.exit_code == 0, converged.stdout
+    assert "already up to date" in converged.stderr
+    assert converged.stdout.strip() == ""
+
+    name = f"{DBSettings().queue_table}_ep_ea_idx"
+    with psycopg.connect(dsn, autocommit=True) as connection:
+        connection.execute(f"DROP INDEX {name}".encode())
+
+    planned = runner.invoke(app, ["upgrade", "--plan"], env=env)
+    assert planned.exit_code == 0, planned.stdout
+    assert planned.stdout.count("CREATE INDEX") == 1
+    assert name in planned.stdout
+    assert planned.stdout.startswith("-- pgqueuer ")
+    assert "Would apply 1 statement." in planned.stderr
+
+    applied = runner.invoke(app, ["upgrade"], env=env)
+    assert applied.exit_code == 0, applied.stdout
+    assert "Applied 1 statement." in applied.stderr
+    assert applied.stdout.strip() == ""
+
+    assert "already up to date" in runner.invoke(app, ["upgrade"], env=env).stderr

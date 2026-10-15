@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import sys
 from datetime import timedelta
+
+from pgqueuer.domain.types import ColumnName, SqlType, TableName
 
 
 class PgqException(Exception):
-    """Base class for all exceptions raised by PGQueuer."""
+    """Base class for all exceptions raised by PgQueuer."""
 
 
 class RetryException(PgqException):
-    """Exception raised for retry-related errors in PGQueuer."""
+    """Exception raised for retry-related errors in PgQueuer."""
 
 
 class RetryRequested(RetryException):
@@ -42,6 +45,23 @@ class NonRetryableError(PgqException):
     """
 
 
+def retry_request(exc: BaseException) -> RetryRequested | None:
+    """Return the retry *exc* asks for, or ``None``.
+
+    That is *exc* itself, or, for an exception group made only of retries (such as
+    a TaskGroup whose children raised RetryRequested), the one with the longest delay.
+    """
+    if isinstance(exc, RetryRequested):
+        return exc
+    if sys.version_info >= (3, 11):
+        if isinstance(exc, BaseExceptionGroup):  # noqa: F821 -- builtin from 3.11, gated above
+            found = [retry_request(inner) for inner in exc.exceptions]
+            retries = [retry for retry in found if retry is not None]
+            if retries and len(retries) == len(found):
+                return max(retries, key=lambda retry: retry.delay)
+    return None
+
+
 class DuplicateJobError(PgqException):
     """Raised when enqueue violates a deduplication constraint."""
 
@@ -52,3 +72,24 @@ class DuplicateJobError(PgqException):
 
 class FailingListenerError(PgqException):
     """Raised when a listener fails to process a job."""
+
+
+class SchemaDriftError(PgqException):
+    """Raised when an upgrade meets a schema change it cannot safely convert."""
+
+    def __init__(
+        self,
+        *,
+        table: TableName,
+        column: ColumnName,
+        installed: SqlType,
+        declared: SqlType,
+    ) -> None:
+        super().__init__(
+            f"{table}.{column} is {installed} in the database but declared {declared}; "
+            "no supported conversion. Alter the column by hand, then re-run upgrade."
+        )
+        self.table = table
+        self.column = column
+        self.installed = installed
+        self.declared = declared

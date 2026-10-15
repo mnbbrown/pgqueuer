@@ -1,10 +1,10 @@
-# Contributing to PGQueuer
+# Contributing to PgQueuer
 
-First off, thank you for considering contributing to PGQueuer.
+First off, thank you for considering contributing to PgQueuer.
 
 ## How to Contribute
 
-There are many ways you can contribute to PGQueuer, from writing tutorials or blog posts, improving the documentation, submitting bug reports and feature requests, or writing code which can be incorporated into PGQueuer itself.
+There are many ways you can contribute to PgQueuer, from writing tutorials or blog posts, improving the documentation, submitting bug reports and feature requests, or writing code which can be incorporated into PgQueuer itself.
 
 Below you will find a set of guidelines to follow when contributing. These are mostly guidelines, not rules, so use your best judgement and feel free to propose changes to this document.
 
@@ -23,10 +23,19 @@ Please follow these steps to have your contribution considered by the maintainer
 1. Follow all instructions in the template.
 2. Follow the [style guides](#style-guides) for Python.
 3. After you submit your pull request, verify that all status checks are passing.
-4. Ensure `make check` runs successfully locally. This command executes linting,
-   type checking, dependency checks, and the full test suite.
+4. Ensure the following run successfully locally: `uv sync --frozen`, `uv run ruff check .`, `uv run ruff format . --check`, `uv run lint-imports`, `uv run mypy .`, and `uv run pytest`.
 
 While the prerequisites above must be satisfied prior to having your pull request reviewed, the reviewer(s) may ask you to complete additional design work, tests, or other changes before your pull request can be ultimately accepted.
+
+### Agentic Contributions
+
+Issues and pull requests written mainly by an AI agent or coding assistant are welcome. They **must** carry the `Agentic` label.
+
+* Apply the `Agentic` label when you open the issue or pull request. If you don't have permission to set labels, write "Agentic" on the first line of the description and a maintainer will add the label.
+* A human is responsible for every agentic contribution. Read what the agent produced, check that it is correct, and be ready to answer review comments yourself.
+* Agentic pull requests follow the same rules as any other pull request, including the template, the style guides, and the local checks listed above.
+
+Maintainers may close agentic issues or pull requests that are missing the label.
 
 ## Style Guides
 
@@ -55,11 +64,10 @@ Adhere to the [PEP 8](https://pep8.org/) style guide, using `ruff` for automatic
 
 ### Testing
 
-Before opening a pull request run the full test suite locally. The easiest way
-is to execute `make check`, which sets up the required environment variables and
-runs `ruff`, `mypy`, `uv sync --all-extras --frozen`, and `pytest`.
+Before opening a pull request run the full test suite locally by executing:
+`uv sync --frozen && uv run ruff check . && uv run ruff format . --check && uv run lint-imports && uv run mypy . && uv run pytest`
 
 ## Community
 
-Discussions about PGQueuer take place on this repository's [Issues](https://github.com/janbjorge/pgqueuer/issues) and [Pull Requests](https://github.com/janbjorge/pgqueuer/pulls) sections. Anybody is welcome to join these conversations.
+Discussions about PgQueuer take place on this repository's [Issues](https://github.com/janbjorge/pgqueuer/issues) and [Pull Requests](https://github.com/janbjorge/pgqueuer/pulls) sections. Anybody is welcome to join these conversations.
 All participants are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).

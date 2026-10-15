@@ -3,7 +3,7 @@
 This page explains how PgQueuer handles failures, ensures jobs are not lost, supports
 idempotent enqueuing, and provides an audit trail of every completed job.
 
-## Failure Handling
+## Failure handling
 
 When a job raises an unhandled exception, PgQueuer:
 
@@ -11,9 +11,9 @@ When a job raises an unhandled exception, PgQueuer:
 2. Captures the full traceback, exception type, and message into a **TracebackRecord**.
 3. Moves the record from the active queue (`pgqueuer`) to the log table (`pgqueuer_log`).
 
-The job is **not** automatically retried at this point — it is considered definitively failed
-for this execution attempt. The traceback is persisted for inspection via `pgq dashboard`
-or a direct query:
+The job is **not** automatically retried at this point; it is considered definitively failed
+for this execution attempt. The traceback is persisted in `pgqueuer_log` for inspection
+via a direct query:
 
 ```sql
 SELECT job_id, entrypoint,
@@ -26,15 +26,16 @@ ORDER BY created DESC
 LIMIT 20;
 ```
 
-## Retry Strategies
+## Retry strategies
 
 PgQueuer provides three complementary retry mechanisms.
 
 ### Database-level retry: durable re-queuing
 
 Raise `RetryRequested` from your handler to re-queue the job in the database. The job row is
-updated in-place — the `id`, `payload`, and all metadata are preserved. Any worker can pick
-up the retried job.
+updated in-place: the `id`, `payload`, and all metadata are preserved. Any worker can pick
+up the retried job. If the re-queue write itself fails, the job is recorded as failed like
+any other handler error, following the entrypoint's `on_failure`.
 
 ```python
 from datetime import timedelta
@@ -119,8 +120,9 @@ WHERE status IN ('queued', 'picked') AND dedupe_key IS NOT NULL
 ```
 
 If a job with the same `dedupe_key` already exists in `queued` or `picked` state, a
-`DuplicateJobError` is raised. Once the job reaches a terminal state (`successful`,
-`exception`, `canceled`, `deleted`), the key is released and the same key can be used again.
+`DuplicateJobError` is raised. The constraint only covers `queued` and `picked`. Once the
+job moves to `successful`, `exception`, `canceled`, `deleted`, or `failed`
+(held), the key is released and the same key can be used again.
 
 Use `enqueue_if_no_dedupe()` when duplicate requests should be skipped instead of
 reported as exceptions:
@@ -151,15 +153,69 @@ enqueue attempts and prevent concurrent work for the same resource. See
 [Per-Key Dispatch Serialization](per-key-serialization.md#serialize_key-vs-dedupe_key)
 for examples.
 
-## Poison Jobs
+**Choosing a dedupe key:** Use a stable, business-meaningful identifier, for example
+`f"invoice-{order_id}"` or `f"report-{date}-{user_id}"`. This turns enqueue into an
+idempotent operation: calling it twice with the same key and payload is safe.
+
+### Skipping duplicates instead of raising
+
+By default a duplicate fails the whole enqueue call: in a batch, nothing is inserted.
+Pass `on_conflict="skip"` to insert the non-duplicate jobs and skip the rest:
+
+```python
+job_ids = await queries.enqueue(
+    ["send_invoice", "send_invoice", "send_invoice"],
+    [b"1", b"2", b"3"],
+    [0, 0, 0],
+    dedupe_key=["invoice-1", "invoice-2", "invoice-3"],
+    on_conflict="skip",
+)
+# One entry per input: JobId for inserted jobs, None for skipped duplicates,
+# e.g. [JobId(11), None, JobId(12)] if "invoice-2" was already active.
+```
+
+The result keeps its 1:1 positional mapping with the inputs, so callers always know which
+jobs were inserted and which were skipped. Skipped jobs are not created at all: they get no
+job id and no `queued` entry in the log table. The same flag is available on the CLI via
+`pgq queue --dedupe-key ... --on-conflict skip`.
+
+**Duplicates within a single batch:** if the same `dedupe_key` appears more than once in one
+`enqueue` call, even with different payloads, the **first occurrence by input order** is
+enqueued and every later occurrence is treated as a conflict. Under `on_conflict="skip"` the
+later positions come back as `None`; under the default they fail the call. Order your inputs
+so the payload you want kept comes first.
+
+### Raising the priority of a duplicate
+
+Pass `on_conflict="update_priority"` to raise the priority of the job that already holds the
+key, for when the same work has become more urgent:
+
+```python
+(job_id,) = await queries.enqueue(
+    "process_report",
+    payload,
+    priority=100,
+    dedupe_key="report:42",
+    on_conflict="update_priority",
+)
+```
+
+- With no `queued` or `picked` job for the key, the job is inserted as usual.
+- With one, nothing is inserted. That job's priority becomes the higher of the two, so a
+  duplicate never lowers it, and `job_id` is its id. A `picked` job is already running, so
+  its new priority changes nothing.
+- Only inserted jobs get a `queued` entry in the log table.
+- Each key may appear at most once per call; a repeat raises `ValueError`.
+
+## Poison jobs
 
 A "poison job" is one that consistently causes worker crashes or hangs without updating its
 heartbeat. PgQueuer does not include a built-in dead-letter queue, but you can detect and
 handle poison jobs with a query:
 
 ```sql
--- Jobs that have been re-picked more than 3 times (indicative of repeated failure)
--- Adjust threshold based on your heartbeat_timeout and expected job runtime
+-- Jobs stuck in 'picked' with a long-stale heartbeat (indicative of repeated crashes/hangs)
+-- Adjust the interval based on your heartbeat_timeout and expected job runtime
 SELECT id, entrypoint, status, heartbeat, updated
 FROM pgqueuer
 WHERE status = 'picked'
@@ -170,14 +226,15 @@ ORDER BY heartbeat ASC;
 **Recommended pattern:** route these to a separate monitoring alert or move them to a
 dedicated "quarantine" entrypoint by updating their entrypoint column and re-queuing.
 
-## Audit Trail
+## Audit trail
 
 Every job that leaves the active queue is written to `pgqueuer_log`:
 
 | Event | Status in log |
 |-------|--------------|
 | Job completes without error | `successful` |
-| Job raises an exception | `exception` (with traceback) |
+| Job raises an exception (`on_failure="delete"`, the default) | `exception` (with traceback) |
+| Job raises an exception (`on_failure="hold"`) | `failed` (with traceback) |
 | Job is canceled | `canceled` |
 | Job is deleted without running | `deleted` |
 
@@ -188,6 +245,36 @@ or use `pgq dashboard` from the CLI.
     PgQueuer does not automatically prune `pgqueuer_log`. Add a periodic `DELETE` job or
     PostgreSQL table partition policy to manage log growth in high-throughput systems.
 
+## Statistics aggregation
+
+Rows in `pgqueuer_log` are rolled up into per-second counts in `pgqueuer_statistics`
+(grouped by entrypoint, priority, and status). `QueueManager` runs this aggregation on a
+timer while it processes jobs, so statistics stay current without anyone reading them:
+
+```python
+await pgq.run(log_aggregation_interval=timedelta(seconds=30))
+```
+
+- Default interval is 30 seconds. The task only calls the database when this worker has
+  actually dispatched a job since the last tick; an idle worker never round-trips an
+  aggregation query for nothing.
+- The task runs on every worker, but a Postgres advisory lock lets only one worker
+  aggregate at a time, so counts are never doubled.
+- Pass `timedelta(0)` to disable the background task. Aggregation then happens only
+  on-demand, the first time statistics are read (CLI `pgq dashboard`, Prometheus metrics,
+  or the MCP server).
+- Aggregation never deletes log rows; it flags them `aggregated = TRUE`. Log retention is
+  still your responsibility (see the note above).
+
+!!! warning "Large pre-existing backlog"
+    The aggregation query folds every currently-unaggregated `pgqueuer_log` row in one
+    unbatched transaction; there is no `LIMIT`/chunking yet. If `pgqueuer_log` has built
+    up a large backlog before this runs for the first time (e.g. upgrading onto this
+    feature on a long-running deployment that never read statistics before), the first
+    tick that touches it can be a long-running transaction with matching lock/WAL
+    impact. Check `SELECT count(*) FROM pgqueuer_log WHERE NOT aggregated` before
+    upgrading a high-throughput deployment so this isn't a surprise.
+
 ## Summary
 
 | Concern | Mechanism |
@@ -196,5 +283,9 @@ or use `pgq dashboard` from the CLI.
 | Worker crash recovery | `heartbeat_timeout` |
 | Terminal failure parking | `on_failure="hold"` |
 | Duplicate enqueue prevention | `dedupe_key` unique constraint / `enqueue_if_no_dedupe()` |
+
+| Duplicate enqueue prevention | `dedupe_key` unique constraint |
+| Graceful duplicate handling in batches | `enqueue(..., on_conflict="skip")` |
 | Failure inspection | `pgqueuer_log` with traceback |
 | Audit trail | `pgqueuer_log` for all terminal states |
+| Up-to-date statistics | periodic `log_aggregation_interval` |

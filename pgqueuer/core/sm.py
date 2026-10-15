@@ -10,26 +10,17 @@ from typing import Callable
 import croniter
 
 from pgqueuer.core import executors, logconfig, tm
-from pgqueuer.domain import models
+from pgqueuer.domain import models, types
 from pgqueuer.domain.types import ScheduleId
 from pgqueuer.ports import RepositoryPort
 
 
 @dataclasses.dataclass
 class SchedulerManager:
-    """
-    Scheduler class responsible for managing and scheduling jobs using cron expressions.
-
-    Attributes:
-        queries (RepositoryPort): Repository for schedule operations. The underlying
-            database driver is accessed via ``queries.driver``.
-        resources (MutableMapping): Shared resources propagated to scheduled task contexts.
-        registry (dict[models.CronExpressionEntrypoint, executors.AbstractScheduleExecutor]):
-            Registered job executors mapped to cron entrypoints and expressions.
-    """
+    """Cron-driven scheduler. ``resources`` is propagated into each ScheduleContext."""
 
     queries: RepositoryPort
-    resources: MutableMapping = dataclasses.field(default_factory=dict)
+    resources: MutableMapping[str, object] = dataclasses.field(default_factory=dict)
     shutdown: asyncio.Event = dataclasses.field(
         init=False,
         default_factory=asyncio.Event,
@@ -55,32 +46,18 @@ class SchedulerManager:
         ]
         | None = None,
         clean_old: bool = False,
-        accepts_context: bool = False,
+        accepts_context: bool | None = None,
     ) -> Callable[[executors.ScheduleCrontab], executors.ScheduleCrontab]:
-        """
-        Register a new job with a cron schedule.
+        """Decorator: register a cron-scheduled job.
 
-        Args:
-            entrypoint (str): The entrypoint identifier for the job to be scheduled.
-            expression (str): The cron expression defining the schedule.
-            executor_factory (Callable[[ScheduleExecutorFactoryParameters],
-                executors.AbstractScheduleExecutor]): A factory function to
-                create the executor for the job.
-
-        Returns:
-            Callable[[executors.AsyncCrontab], executors.AsyncCrontab]:
-                A decorator function that registers the provided function as a job.
-
-        Raises:
-            ValueError: If the provided cron expression is invalid.
-            RuntimeError: If the entrypoint and expression are already registered.
+        Raises ValueError on invalid cron, RuntimeError on duplicate (entrypoint, expression).
         """
 
         if not croniter.croniter.is_valid(expression):
             raise ValueError(f"Invalid cron expression: {expression}")
 
-        expression = models.CronExpression(" ".join(croniter.croniter(expression).expressions))
-        entrypoint = models.CronEntrypoint(entrypoint)
+        expression = types.CronExpression(" ".join(croniter.croniter(expression).expressions))
+        entrypoint = types.CronEntrypoint(entrypoint)
 
         key = models.CronExpressionEntrypoint(
             entrypoint=entrypoint,
@@ -94,13 +71,18 @@ class SchedulerManager:
         executor_factory = executor_factory or executors.ScheduleExecutor
 
         def register(func: executors.ScheduleCrontab) -> executors.ScheduleCrontab:
+            resolved_context = (
+                executors.wants_context(func, models.ScheduleContext)
+                if accepts_context is None
+                else accepts_context
+            )
             self.registry[key] = executor_factory(
                 executors.ScheduleExecutorFactoryParameters(
                     entrypoint=entrypoint,
                     expression=expression,
                     func=func,
                     clean_old=clean_old,
-                    accepts_context=accepts_context,
+                    accepts_context=resolved_context,
                 )
             )
             return func
@@ -108,12 +90,7 @@ class SchedulerManager:
         return register
 
     async def run(self) -> None:
-        """
-        Run the Scheduler, executing registered jobs based on their cron schedules.
-
-        Continuously polls for jobs that need to be executed and dispatches them accordingly.
-        Also waits for shutdown events and manages the scheduling loop.
-        """
+        """Poll for due schedules and dispatch them until shutdown."""
         if not (await self.queries.has_table(self.queries.qbe.settings.schedules_table)):
             raise RuntimeError(
                 f"The {self.queries.qbe.settings.schedules_table} table is missing "
@@ -126,17 +103,17 @@ class SchedulerManager:
                 "please run 'pgq upgrade'"
             )
 
-        # Identify entrypoints that need to be removed based on the 'clean_old' parameter
         if to_clean := {k.entrypoint for k, v in self.registry.items() if v.parameters.clean_old}:
             await self.queries.delete_schedule(ids=set(), entrypoints=to_clean)
 
         await self.queries.insert_schedule({k: v.next_in() for k, v in self.registry.items()})
 
         async with (
-            tm.TaskManager() as task_manager,
             self.queries.driver,
+            # Outside the TaskManager so it keeps beating until running schedules drain.
+            tm.cancel_on_exit(asyncio.create_task(self._heartbeat_loop())),
+            tm.TaskManager() as task_manager,
         ):
-            task_manager.add(asyncio.create_task(self._heartbeat_loop()))
             while not self.shutdown.is_set():
                 scheduled = await self.queries.fetch_schedule(
                     {k: v.next_in() for k, v in self.registry.items()}
@@ -174,15 +151,7 @@ class SchedulerManager:
         executor: executors.AbstractScheduleExecutor,
         schedule: models.Schedule,
     ) -> None:
-        """
-        Dispatch a scheduled job for execution.
-
-        Args:
-            executor (executors.AbstractScheduleExecutor): The executor instance
-                responsible for running the job.
-            schedule (models.Schedule): The schedule object containing details
-                of the job to be executed.
-        """
+        """Run *executor* against *schedule*; always release the schedule back to queued."""
         logconfig.logger.debug(
             "Dispatching entrypoint/expression: %s/%s",
             schedule.entrypoint,
@@ -212,12 +181,22 @@ class SchedulerManager:
             )
 
     async def _heartbeat_loop(self) -> None:
-        """Send batched heartbeat updates for all active schedules."""
-        while not self.shutdown.is_set():
+        """Send batched heartbeat updates for all active schedules.
+
+        Runs past shutdown while dispatches are in flight; a schedule whose
+        heartbeat goes stale can be picked again and run twice.
+        """
+        while not self.shutdown.is_set() or self.active_heartbeat_ids:
             if self.active_heartbeat_ids:
-                await self.queries.update_schedule_heartbeat(
-                    set(self.active_heartbeat_ids),
-                )
+                try:
+                    await self.queries.update_schedule_heartbeat(
+                        set(self.active_heartbeat_ids),
+                    )
+                except Exception:
+                    logconfig.logger.exception("Failed to update schedule heartbeat")
+            if self.shutdown.is_set():
+                await asyncio.sleep(1.0)
+                continue
             with suppress(TimeoutError, asyncio.TimeoutError):
                 await asyncio.wait_for(
                     self.shutdown.wait(),

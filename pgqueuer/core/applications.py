@@ -1,10 +1,3 @@
-"""
-This module defines the `PgQueuer` class, which orchestrates job scheduling and queue management
-using PostgreSQL as a backend. The `PgQueuer` class is designed to combine the functionalities
-of `QueueManager` and `SchedulerManager` to provide a unified interface for managing job queues
-and scheduling periodic tasks efficiently.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -16,6 +9,7 @@ from pgqueuer.adapters.drivers.asyncpg import AsyncpgDriver, AsyncpgPoolDriver
 from pgqueuer.adapters.drivers.psycopg import PsycopgDriver
 from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
 from pgqueuer.adapters.persistence.queries import Queries
+from pgqueuer.core import logconfig
 from pgqueuer.core.executors import (
     AbstractEntrypointExecutor,
     AbstractScheduleExecutor,
@@ -26,9 +20,8 @@ from pgqueuer.core.executors import (
 )
 from pgqueuer.core.qm import QueueManager
 from pgqueuer.core.sm import SchedulerManager
-from pgqueuer.domain.models import Channel
-from pgqueuer.domain.settings import DBSettings
-from pgqueuer.domain.types import OnFailure, QueueExecutionMode
+from pgqueuer.domain.settings import db_settings
+from pgqueuer.domain.types import Channel, OnFailure, QueueExecutionMode
 from pgqueuer.ports import RepositoryPort
 from pgqueuer.ports.driver import Driver
 
@@ -53,10 +46,10 @@ class PgQueuer:
 
     connection: Driver
     channel: Channel = dataclasses.field(
-        default=Channel(DBSettings().channel),
+        default_factory=lambda: Channel(db_settings().channel),
     )
     # Shared resources mapping passed to QueueManager and propagated into each job Context.
-    resources: MutableMapping = dataclasses.field(
+    resources: MutableMapping[str, object] = dataclasses.field(
         default_factory=dict,
     )
     queries: RepositoryPort | None = dataclasses.field(default=None)
@@ -91,19 +84,9 @@ class PgQueuer:
         cls,
         connection: "asyncpg.Connection",
         channel: Channel | None = None,
-        resources: MutableMapping | None = None,
+        resources: MutableMapping[str, object] | None = None,
     ) -> "PgQueuer":
-        """
-        Create a PgQueuer instance from an asyncpg connection.
-
-        Args:
-            connection: An asyncpg connection object.
-            channel: Optional Channel configuration. Defaults to Channel(DBSettings().channel).
-            resources: Optional mutable mapping for shared resources.
-
-        Returns:
-            PgQueuer: A configured PgQueuer instance.
-        """
+        """Build PgQueuer over an asyncpg connection."""
         return cls._from_driver(
             driver=AsyncpgDriver(connection),
             channel=channel,
@@ -115,19 +98,9 @@ class PgQueuer:
         cls,
         pool: "asyncpg.Pool",
         channel: Channel | None = None,
-        resources: MutableMapping | None = None,
+        resources: MutableMapping[str, object] | None = None,
     ) -> "PgQueuer":
-        """
-        Create a PgQueuer instance from an asyncpg connection pool.
-
-        Args:
-            pool: An asyncpg connection pool object.
-            channel: Optional Channel configuration. Defaults to Channel(DBSettings().channel).
-            resources: Optional mutable mapping for shared resources.
-
-        Returns:
-            PgQueuer: A configured PgQueuer instance.
-        """
+        """Build PgQueuer over an asyncpg pool."""
         return cls._from_driver(
             driver=AsyncpgPoolDriver(pool),
             channel=channel,
@@ -139,19 +112,9 @@ class PgQueuer:
         cls,
         connection: "psycopg.AsyncConnection",
         channel: Channel | None = None,
-        resources: MutableMapping | None = None,
+        resources: MutableMapping[str, object] | None = None,
     ) -> "PgQueuer":
-        """
-        Create a PgQueuer instance from a psycopg async connection.
-
-        Args:
-            connection: A psycopg async connection object. Must have autocommit enabled.
-            channel: Optional Channel configuration. Defaults to Channel(DBSettings().channel).
-            resources: Optional mutable mapping for shared resources.
-
-        Returns:
-            PgQueuer: A configured PgQueuer instance.
-        """
+        """Build PgQueuer over a psycopg async connection (must have autocommit=True)."""
         return cls._from_driver(
             driver=PsycopgDriver(connection),
             channel=channel,
@@ -163,9 +126,9 @@ class PgQueuer:
         cls,
         driver: Driver,
         channel: Channel | None = None,
-        resources: MutableMapping | None = None,
+        resources: MutableMapping[str, object] | None = None,
     ) -> "PgQueuer":
-        channel = channel or Channel(DBSettings().channel)
+        channel = channel or Channel(db_settings().channel)
         resources = resources or {}
         return cls(connection=driver, channel=channel, resources=resources)
 
@@ -173,7 +136,7 @@ class PgQueuer:
     def in_memory(
         cls,
         channel: Channel | None = None,
-        resources: MutableMapping | None = None,
+        resources: MutableMapping[str, object] | None = None,
     ) -> "PgQueuer":
         """Create a PgQueuer backed entirely by in-memory data structures.
 
@@ -181,7 +144,7 @@ class PgQueuer:
         and short-lived batch-processing containers.
         """
         driver = InMemoryDriver()
-        channel = channel or Channel(DBSettings().channel)
+        channel = channel or Channel(db_settings().channel)
         inmem = InMemoryQueries(driver=driver)
         return cls(
             connection=driver,
@@ -198,13 +161,9 @@ class PgQueuer:
         max_concurrent_tasks: int | None = None,
         shutdown_on_listener_failure: bool = False,
         heartbeat_timeout: timedelta = timedelta(seconds=30),
+        log_aggregation_interval: timedelta = timedelta(seconds=30),
     ) -> None:
-        """
-        Run both QueueManager and SchedulerManager concurrently.
-
-        This method starts both the `QueueManager` and `SchedulerManager` concurrently to
-        handle job processing and scheduling.
-        """
+        """Run QueueManager and SchedulerManager concurrently."""
         tasks = [
             asyncio.create_task(
                 self.qm.run(
@@ -214,24 +173,31 @@ class PgQueuer:
                     max_concurrent_tasks=max_concurrent_tasks,
                     shutdown_on_listener_failure=shutdown_on_listener_failure,
                     heartbeat_timeout=heartbeat_timeout,
+                    log_aggregation_interval=log_aggregation_interval,
                 )
             ),
             asyncio.create_task(self.sm.run()),
         ]
+        raised: BaseException | None = None
         try:
             await asyncio.gather(*tasks)
+        except BaseException as exc:
+            raised = exc
+            raise
         finally:
             self.shutdown.set()
             for t in tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+                if isinstance(outcome, Exception) and outcome is not raised:
+                    logconfig.logger.error("Manager failed during shutdown", exc_info=outcome)
 
     def entrypoint(
         self,
         name: str,
         *,
         concurrency_limit: int = 0,
-        accepts_context: bool = False,
+        accepts_context: bool | None = None,
         on_failure: OnFailure = "delete",
         serialize_dispatch_per_key: bool = False,
         executor_factory: Callable[
@@ -259,7 +225,7 @@ class PgQueuer:
         ]
         | None = None,
         clean_old: bool = False,
-        accepts_context: bool = False,
+        accepts_context: bool | None = None,
     ) -> Callable[[ScheduleCrontab], ScheduleCrontab]:
         return self.sm.schedule(
             entrypoint=entrypoint,

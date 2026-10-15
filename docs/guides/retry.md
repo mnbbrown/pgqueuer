@@ -1,11 +1,11 @@
 # Database-Level Retry
 
-PgQueuer supports **database-level retry** — when a job handler raises `RetryRequested`, the
+PgQueuer supports **database-level retry**: when a job handler raises `RetryRequested`, the
 job stays in the queue table and is re-queued for another attempt. The job row is updated
 in-place (not deleted and re-inserted), so the `id`, `payload`, `headers`, and all metadata
 are preserved across retries.
 
-## How It Works
+## How it works
 
 1. Your handler raises `RetryRequested` with an optional delay and reason.
 2. PgQueuer catches the exception and atomically:
@@ -20,7 +20,7 @@ Because the job row is **updated** (not deleted), the same `job.id` is stable ac
 retry attempts. This makes it straightforward to trace the full retry graph by querying the
 log table.
 
-## Basic Usage
+## Basic usage
 
 Raise `RetryRequested` from your handler when you detect a transient failure:
 
@@ -49,7 +49,14 @@ async def call_api(job: Job) -> None:
 | `delay` | `timedelta` | `timedelta(0)` | Time to wait before the next attempt |
 | `reason` | `str \| None` | `None` | Human-readable explanation (stored in the log) |
 
-## Reading the Attempt Counter
+### Raising from a TaskGroup
+
+On Python 3.11+, `RetryRequested` raised by a child of an `asyncio.TaskGroup` reaches
+PgQueuer wrapped in an `ExceptionGroup`. If every exception in the group is a
+`RetryRequested`, the job is retried with the longest delay among them. If the group also
+holds any other exception, the job fails as usual.
+
+## Reading the attempt counter
 
 The `job.attempts` field tells you how many previous attempts have been made. On the first
 execution it is `0`, after one retry it is `1`, and so on:
@@ -58,7 +65,7 @@ execution it is `0`, after one retry it is `1`, and so on:
 @pgq.entrypoint("resilient_task")
 async def resilient_task(job: Job) -> None:
     if job.attempts > 5:
-        # Give up after 5 retries — let it fail terminally
+        # Give up after 5 retries and let it fail terminally
         raise RuntimeError("Too many retries, giving up")
 
     try:
@@ -70,7 +77,7 @@ async def resilient_task(job: Job) -> None:
         )
 ```
 
-## Automatic Retry with DatabaseRetryEntrypointExecutor
+## Automatic retry with DatabaseRetryEntrypointExecutor
 
 For cases where you want **any** unhandled exception to trigger a retry (not just explicit
 `RetryRequested` raises), use `DatabaseRetryEntrypointExecutor`. It wraps your handler and
@@ -100,7 +107,7 @@ async def flaky_api(job: Job) -> None:
 After `max_attempts` consecutive failures, the original exception propagates as a terminal
 failure (the job is deleted and logged with status `exception`).
 
-If your handler raises `RetryRequested` directly, it passes through the executor unchanged —
+If your handler raises `RetryRequested` directly, it passes through the executor unchanged;
 the executor only converts non-retry exceptions.
 
 ### Parameters
@@ -112,7 +119,7 @@ the executor only converts non-retry exceptions.
 | `max_delay` | `timedelta` | `5m` | Cap on exponential backoff |
 | `backoff_multiplier` | `float` | `2.0` | Multiplier applied to delay after each attempt |
 
-### Backoff Schedule Example
+### Backoff schedule example
 
 With `initial_delay=1s`, `backoff_multiplier=2.0`, `max_delay=60s`:
 
@@ -126,7 +133,11 @@ With `initial_delay=1s`, `backoff_multiplier=2.0`, `max_delay=60s`:
 | 5 | 32s |
 | 6+ | 60s (capped) |
 
-## Retry vs. Heartbeat Recovery
+The table shows the delay *formula* independent of `max_attempts`. With the default
+`max_attempts=5`, only attempts 0-4 are retried (delays 1s-16s); the 5th failure is terminal,
+so the 32s/60s rows never apply unless you raise `max_attempts`.
+
+## Retry vs. heartbeat recovery
 
 PgQueuer has two complementary retry mechanisms:
 
@@ -149,6 +160,7 @@ Every retry writes a log entry to `pgqueuer_log` with:
 ```json
 {
     "entrypoint": "call_api",
+    "queue_manager_id": "1f4d0c9e-...",
     "attempt": 0,
     "retry_delay": "0:00:30",
     "reason": "rate limited"
@@ -167,12 +179,12 @@ WHERE job_id = 42
 ORDER BY created;
 ```
 
-## Behavior Summary
+## Behavior summary
 
 | Scenario | What happens |
 |----------|-------------|
 | Handler raises `RetryRequested` | Job updated to `queued`, attempts incremented, log entry written |
-| Handler raises any other exception | Job deleted, logged as `exception` (or held if `on_failure="hold"` — see [Holding Failed Jobs](hold-failed-jobs.md)) |
+| Handler raises any other exception | Job deleted, logged as `exception` (or held if `on_failure="hold"`: see [Holding Failed Jobs](hold-failed-jobs.md)) |
 | Handler completes normally | Job deleted, logged as `successful` (existing behavior) |
 | `DatabaseRetryEntrypointExecutor` + exception + attempts < max | Converted to `RetryRequested` with backoff |
 | `DatabaseRetryEntrypointExecutor` + exception + attempts >= max | Exception propagates as terminal failure (or held if `on_failure="hold"`) |

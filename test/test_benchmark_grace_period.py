@@ -32,9 +32,14 @@ def test_serialize_drain_key_modes() -> None:
     }
 
     assert (
-        serialize_keys_for(SerializeDrainSettings(**base, key_mode=SerializeKeyMode.none)) is None
+        serialize_keys_for(
+            SerializeDrainSettings.model_validate({**base, "key_mode": SerializeKeyMode.none})
+        )
+        is None
     )
-    assert serialize_keys_for(SerializeDrainSettings(**base, key_mode=SerializeKeyMode.unique)) == [
+    assert serialize_keys_for(
+        SerializeDrainSettings.model_validate({**base, "key_mode": SerializeKeyMode.unique})
+    ) == [
         "k:0",
         "k:1",
         "k:2",
@@ -42,7 +47,7 @@ def test_serialize_drain_key_modes() -> None:
         "k:4",
     ]
     assert serialize_keys_for(
-        SerializeDrainSettings(**base, key_mode=SerializeKeyMode.round_robin)
+        SerializeDrainSettings.model_validate({**base, "key_mode": SerializeKeyMode.round_robin})
     ) == [
         "k:0",
         "k:1",
@@ -50,7 +55,9 @@ def test_serialize_drain_key_modes() -> None:
         "k:1",
         "k:0",
     ]
-    assert serialize_keys_for(SerializeDrainSettings(**base, key_mode=SerializeKeyMode.single)) == [
+    assert serialize_keys_for(
+        SerializeDrainSettings.model_validate({**base, "key_mode": SerializeKeyMode.single})
+    ) == [
         "k:0",
         "k:0",
         "k:0",

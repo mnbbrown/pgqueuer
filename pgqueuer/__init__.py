@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from pgqueuer.adapters.cli.supervisor import run
 from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
 from pgqueuer.applications import PgQueuer
 from pgqueuer.db import AsyncpgDriver, AsyncpgPoolDriver, PsycopgDriver
@@ -11,7 +14,7 @@ from pgqueuer.sm import SchedulerManager
 try:
     from pgqueuer._version import version as __version__
 except ImportError:
-    __version__ = "0.0.0"  # Fallback version if _version.py is missing
+    __version__ = "0.0.0"
 
 __all__ = [
     "AsyncpgDriver",
@@ -28,4 +31,5 @@ __all__ = [
     "QueueManager",
     "RetryRequested",
     "SchedulerManager",
+    "run",
 ]

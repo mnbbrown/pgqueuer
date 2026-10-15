@@ -1,11 +1,16 @@
 import asyncio
+import contextlib
+import itertools
 import uuid
 from datetime import timedelta
+from typing import Any
 
 import async_timeout
 import pytest
 
 from pgqueuer import db
+from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
+from pgqueuer.core.tm import TaskManager
 from pgqueuer.models import Job, Log
 from pgqueuer.qm import QueueManager
 from pgqueuer.queries import Queries
@@ -158,6 +163,134 @@ async def test_drain_mode(
     assert len(jobs) == N
 
 
+@pytest.mark.parametrize("max_concurrent_tasks", (None, 0))
+async def test_run_unlimited_budget_reaches_dequeue_as_none(
+    apgdriver: db.Driver,
+    max_concurrent_tasks: int | None,
+) -> None:
+    """run() forwards unlimited max_concurrent_tasks (None or legacy 0) to dequeue as None."""
+    q = Queries(apgdriver)
+    qm = QueueManager(Queries(apgdriver))
+    seen = list[int | None]()
+
+    original = qm.queries.dequeue
+
+    async def spying_dequeue(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["global_concurrency_limit"])
+        return await original(*args, **kwargs)
+
+    qm.queries.dequeue = spying_dequeue
+
+    @qm.entrypoint("fetch")
+    async def fetch(job: Job) -> None: ...
+
+    await q.enqueue("fetch", None, 0)
+
+    async with async_timeout.timeout(10):
+        await qm.run(mode=QueueExecutionMode.drain, max_concurrent_tasks=max_concurrent_tasks)
+
+    assert seen
+    assert set(seen) == {None}
+
+
+async def test_periodic_log_aggregation_loops_until_shutdown() -> None:
+    """The periodic task calls aggregate_logs repeatedly and stops on shutdown."""
+    calls = 0
+    qm: QueueManager
+
+    class Stub:
+        async def aggregate_logs(self) -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                qm.shutdown.set()
+
+    qm = QueueManager(queries=Stub())  # type: ignore[arg-type]
+
+    async def keep_marking_work() -> None:
+        # Stands in for `_dispatch` incrementing `jobs_logged` concurrently;
+        # without a steady stream of "new work" the gate would starve the loop
+        # after the first (post-success) reset.
+        while not qm.shutdown.is_set():
+            qm.jobs_logged = 1
+            await asyncio.sleep(0)
+
+    qm.jobs_logged = 1
+    marker = asyncio.ensure_future(keep_marking_work())
+    try:
+        async with async_timeout.timeout(5):
+            await qm._run_periodic_log_aggregation(timedelta(seconds=0))
+    finally:
+        marker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await marker
+    assert calls == 3
+
+
+async def test_periodic_log_aggregation_skips_when_idle() -> None:
+    """No job logged since the last tick means aggregate_logs is never called."""
+    calls = 0
+    qm: QueueManager
+
+    class Stub:
+        async def aggregate_logs(self) -> None:
+            nonlocal calls
+            calls += 1
+
+    qm = QueueManager(queries=Stub())  # type: ignore[arg-type]
+    task = asyncio.ensure_future(qm._run_periodic_log_aggregation(timedelta(seconds=0)))
+    try:
+        for _ in range(3):
+            await asyncio.sleep(0)
+    finally:
+        qm.shutdown.set()
+        async with async_timeout.timeout(5):
+            await task
+    assert calls == 0
+
+
+async def test_dispatch_increments_jobs_logged_counter(
+    queries: InMemoryQueries,
+) -> None:
+    """`jobs_logged` counts dispatched jobs, the gate the periodic task checks."""
+    qm = QueueManager(queries)
+
+    @qm.entrypoint("fetch")
+    async def fetch(job: Job) -> None:
+        pass
+
+    await qm.queries.enqueue(["fetch"] * 3, [None] * 3, [0] * 3)
+
+    async with async_timeout.timeout(10):
+        await asyncio.gather(
+            # Aggregation disabled so it doesn't race the counter it gates.
+            qm.run(log_aggregation_interval=timedelta(0)),
+            wait_until_empty_queue(qm.queries, [qm]),
+        )
+
+    assert qm.jobs_logged == 3
+
+
+async def test_periodic_log_aggregation_survives_aggregate_errors() -> None:
+    """A failing aggregate_logs never tears down the loop; the next tick retries."""
+    calls = 0
+    qm: QueueManager
+
+    class Stub:
+        async def aggregate_logs(self) -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                qm.shutdown.set()
+            raise RuntimeError("boom")
+
+    qm = QueueManager(queries=Stub())  # type: ignore[arg-type]
+    qm.jobs_logged = 1
+    async with async_timeout.timeout(5):
+        await qm._run_periodic_log_aggregation(timedelta(seconds=0))
+    assert calls == 3
+
+
 @pytest.mark.parametrize("N", (1, 10, 100))
 async def test_traceback_log(
     apgdriver: db.Driver,
@@ -193,10 +326,17 @@ async def test_max_concurrent_tasks(
     picked_jobs = list[Log]()
 
     async def log_sampler() -> None:
-        await asyncio.sleep(0.25)
-        logs = [log for log in await q.queue_log() if log.status == "picked"]
+        # Poll until the manager has ramped to its concurrency ceiling instead of
+        # sampling once at a fixed delay, which races the ramp-up under load. The
+        # global limit caps picks, so the count settles at exactly the ceiling.
+        async with async_timeout.timeout(5):
+            while True:
+                logs = [log for log in await q.queue_log() if log.status == "picked"]
+                if len(logs) >= max_concurrent_tasks:
+                    picked_jobs.extend(logs)
+                    break
+                await asyncio.sleep(0.05)
         qm.shutdown.set()
-        picked_jobs.extend(logs)
 
     @qm.entrypoint("fetch")
     async def fetch(job: Job) -> None:
@@ -211,3 +351,139 @@ async def test_max_concurrent_tasks(
         )
 
     assert len(picked_jobs) == max_concurrent_tasks
+
+
+@pytest.mark.parametrize("fails", (False, True))
+async def test_run_drains_jobs_before_driver_exit(fails: bool) -> None:
+    """In-flight jobs finish while the driver, and its LISTEN, is still open (#896)."""
+    events: list[str] = []
+
+    class RecordingDriver(InMemoryDriver):
+        async def __aexit__(self, *_: object) -> None:
+            events.append("driver exit")
+
+    qm = QueueManager(InMemoryQueries(driver=RecordingDriver()))
+    started = asyncio.Event()
+
+    @qm.entrypoint("slow")
+    async def slow(job: Job) -> None:
+        started.set()
+        await asyncio.sleep(0.2)
+        events.append("job done")
+        if fails:
+            raise ValueError
+
+    await qm.queries.enqueue(["slow"], [None], [0])
+    run = asyncio.create_task(qm.run(dequeue_timeout=timedelta(seconds=0.05)))
+    await started.wait()
+    qm.shutdown.set()
+    await asyncio.wait_for(run, timeout=5)
+
+    assert events == ["job done", "driver exit"]
+
+
+async def test_run_failure_leaves_no_pending_lifecycle_tasks(
+    queries: InMemoryQueries,
+) -> None:
+    qm = QueueManager(queries)
+
+    @qm.entrypoint("fetch")
+    async def fetch(job: Job) -> None:
+        pass
+
+    async def failing_dequeue(*args: Any, **kwargs: Any) -> list[Job]:
+        raise RuntimeError("boom")
+
+    queries.dequeue = failing_dequeue
+
+    before = asyncio.all_tasks()
+    with pytest.raises(RuntimeError, match="boom"):
+        async with async_timeout.timeout(10):
+            await qm.run(dequeue_timeout=timedelta(seconds=0.01))
+
+    leaked = asyncio.all_tasks() - before
+    assert not leaked
+
+
+async def test_shutdown_mid_batch_leaves_no_stranded_picked_jobs(
+    queries: InMemoryQueries,
+) -> None:
+    qm = QueueManager(queries)
+    processed = list[Job]()
+    batch_size = 5
+
+    @qm.entrypoint("fetch")
+    async def fetch(job: Job) -> None:
+        processed.append(job)
+
+    payloads: list[bytes | None] = [None] * (batch_size * 2)
+    await qm.queries.enqueue(
+        ["fetch"] * batch_size * 2,
+        payloads,
+        [0] * batch_size * 2,
+    )
+
+    original_dequeue = queries.dequeue
+    calls = itertools.count()
+
+    async def dequeue_then_shutdown(*args: Any, **kwargs: Any) -> list[Job]:
+        # Set shutdown while the second batch is being picked, mimicking a
+        # signal arriving after rows are marked picked but before dispatch.
+        if next(calls) == 1:
+            qm.shutdown.set()
+        return await original_dequeue(*args, **kwargs)
+
+    queries.dequeue = dequeue_then_shutdown
+
+    async with async_timeout.timeout(10):
+        await qm.run(dequeue_timeout=timedelta(seconds=0.01), batch_size=batch_size)
+
+    assert len(processed) == batch_size * 2
+    assert sum(x.count for x in await queries.queue_size()) == 0
+
+
+async def test_drain_shutdown_skips_when_queue_has_work(
+    queries: InMemoryQueries,
+) -> None:
+    qm = QueueManager(queries)
+
+    @qm.entrypoint("fetch")
+    async def fetch(job: Job) -> None:
+        pass
+
+    await qm.queries.enqueue(["fetch"], [None], [0])
+    await qm._maybe_drain_shutdown(QueueExecutionMode.drain, TaskManager())
+    assert not qm.shutdown.is_set()
+
+
+async def test_drain_shutdown_sets_shutdown_when_queue_empty(
+    queries: InMemoryQueries,
+) -> None:
+    qm = QueueManager(queries)
+
+    @qm.entrypoint("fetch")
+    async def fetch(job: Job) -> None:
+        pass
+
+    await qm._maybe_drain_shutdown(QueueExecutionMode.drain, TaskManager())
+    assert qm.shutdown.is_set()
+
+
+async def test_drain_shutdown_skips_while_tasks_are_in_flight(
+    queries: InMemoryQueries,
+) -> None:
+    qm = QueueManager(queries)
+
+    @qm.entrypoint("fetch")
+    async def fetch(job: Job) -> None:
+        pass
+
+    task_manager = TaskManager()
+    blocker = asyncio.Event()
+    task_manager.add(asyncio.create_task(blocker.wait()))
+    try:
+        await qm._maybe_drain_shutdown(QueueExecutionMode.drain, task_manager)
+        assert not qm.shutdown.is_set()
+    finally:
+        blocker.set()
+        await task_manager.gather_tasks()

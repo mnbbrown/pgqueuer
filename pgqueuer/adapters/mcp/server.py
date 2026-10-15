@@ -6,17 +6,22 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Annotated
 
 import asyncpg
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
+from pgqueuer.adapters.connections import create_asyncpg_pool
+from pgqueuer.adapters.drivers.asyncpg import AsyncpgPoolDriver
 from pgqueuer.adapters.persistence.qb import (
     DBSettings,
+    QueryBuilderEnvironment,
     QueryQueueBuilder,
     QuerySchedulerBuilder,
 )
+from pgqueuer.adapters.persistence.queries import Queries
+from pgqueuer.core.insights import InsightsService
+from pgqueuer.domain.settings import ConnectionSettings, db_settings
 
 
 class PgQueuerDatabase:
@@ -24,9 +29,15 @@ class PgQueuerDatabase:
 
     def __init__(self, pool: asyncpg.Pool, settings: DBSettings) -> None:
         self.pool = pool
-        self.settings = settings
         self.qbq = QueryQueueBuilder(settings)
-        self.qbs = QuerySchedulerBuilder(settings)
+        self.insights = InsightsService(
+            Queries(
+                AsyncpgPoolDriver(pool),
+                qbe=QueryBuilderEnvironment(settings),
+                qbq=self.qbq,
+                qbs=QuerySchedulerBuilder(settings),
+            )
+        )
 
     async def fetch(self, sql: str, *args: object) -> list[dict[str, object]]:
         async with self.pool.acquire() as conn:
@@ -35,37 +46,6 @@ class PgQueuerDatabase:
 
 
 Ctx = Context[ServerSession, PgQueuerDatabase, object]
-
-# ---------------------------------------------------------------------------
-# Annotated parameter types — descriptions surface in the MCP tool schema.
-# These are the ONLY knobs an agent can turn; keep them simple and bounded.
-# ---------------------------------------------------------------------------
-
-Tail = Annotated[
-    int,
-    "Maximum number of rows to return. Must be a positive integer. "
-    "Default 50. Higher values return more history but increase response size.",
-]
-TimePeriod = Annotated[
-    str,
-    "ISO-8601 duration for the look-back window. "
-    "Examples: 'PT5M' (5 minutes), 'PT1H' (1 hour), 'P1D' (1 day), 'P7D' (7 days). "
-    "If omitted or null, no time filter is applied and all available data is returned.",
-]
-StaleThreshold = Annotated[
-    str,
-    "ISO-8601 duration defining when a picked job is considered stale. "
-    "A job whose heartbeat is older than NOW() minus this threshold is stale. "
-    "Examples: 'PT5M' (5 minutes), 'PT30M' (30 minutes). Default: 'PT5M'.",
-]
-Limit = Annotated[
-    int,
-    "Maximum number of rows to return. Must be a positive integer. Default 100.",
-]
-Offset = Annotated[
-    int,
-    "Number of rows to skip before returning results. Use for pagination. Default 0.",
-]
 
 
 def _parse_interval(period: str | None) -> timedelta | None:
@@ -87,12 +67,8 @@ def _db(ctx: Ctx) -> PgQueuerDatabase:
     return ctx.request_context.lifespan_context
 
 
-def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
+def _register_tools(mcp: FastMCP[PgQueuerDatabase]) -> None:  # noqa: C901
     """Register all read-only insight tools onto the given FastMCP instance."""
-
-    # ===================================================================
-    # QUEUE OVERVIEW
-    # ===================================================================
 
     @mcp.tool()
     async def queue_size(ctx: Ctx) -> list[dict[str, object]]:
@@ -118,14 +94,13 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
           - Many 'picked' jobs with stale heartbeats: workers may be stuck
             (use stale_jobs to investigate).
         """
-        d = _db(ctx)
-        return await d.fetch(d.qbq.build_queue_size_query())
+        return [s.model_dump() for s in await _db(ctx).insights.queue_size()]
 
     @mcp.tool()
     async def queue_table_info(
         ctx: Ctx,
-        limit: Limit = 100,
-        offset: Offset = 0,
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, object]]:
         """Browse raw queue table rows ordered by priority (descending) then id.
 
@@ -157,15 +132,11 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
         d = _db(ctx)
         return await d.fetch(d.qbq.build_queue_table_browse_query(), limit, offset)
 
-    # ===================================================================
-    # STATISTICS & THROUGHPUT
-    # ===================================================================
-
     @mcp.tool()
     async def queue_stats(
         ctx: Ctx,
-        period: TimePeriod | None = None,
-        limit: Tail = 50,
+        period: str | None = None,
+        limit: int = 50,
     ) -> list[dict[str, object]]:
         """Aggregated job processing statistics bucketed by second.
 
@@ -196,12 +167,13 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
         d = _db(ctx)
         await d.fetch(d.qbq.build_aggregate_log_data_to_statistics_query())
         interval = _parse_interval(period)
-        return await d.fetch(d.qbq.build_log_statistics_query(), limit, interval)
+        query = d.qbq.build_log_statistics_query(limit=limit, last=interval)
+        return await d.fetch(query.sql, *query.args)
 
     @mcp.tool()
     async def throughput_summary(
         ctx: Ctx,
-        period: TimePeriod | None = None,
+        period: str | None = None,
     ) -> list[dict[str, object]]:
         """High-level throughput summary: total jobs per entrypoint and status.
 
@@ -229,14 +201,10 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
         interval = _parse_interval(period)
         return await d.fetch(d.qbq.build_throughput_summary_query(), interval)
 
-    # ===================================================================
-    # FAILURE INVESTIGATION
-    # ===================================================================
-
     @mcp.tool()
     async def failed_jobs(
         ctx: Ctx,
-        limit: Limit = 50,
+        limit: int = 50,
     ) -> list[dict[str, object]]:
         """Recent jobs that failed with an exception, most recent first.
 
@@ -270,14 +238,10 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
         d = _db(ctx)
         return await d.fetch(d.qbq.build_failed_jobs_query(), limit)
 
-    # ===================================================================
-    # EVENT LOG
-    # ===================================================================
-
     @mcp.tool()
     async def queue_log(
         ctx: Ctx,
-        limit: Limit = 100,
+        limit: int = 100,
     ) -> list[dict[str, object]]:
         """Full event log showing every job state transition, most recent first.
 
@@ -307,10 +271,6 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
         d = _db(ctx)
         return await d.fetch(d.qbq.build_queue_log_query(), limit)
 
-    # ===================================================================
-    # SCHEDULES (CRON)
-    # ===================================================================
-
     @mcp.tool()
     async def schedules(ctx: Ctx) -> list[dict[str, object]]:
         """All cron-based recurring task definitions and their current state.
@@ -338,18 +298,13 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
             the worker executing this schedule may be stuck.
           - last_run is null: the schedule has never executed since registration.
         """
-        d = _db(ctx)
-        return await d.fetch(d.qbs.build_peek_schedule_query())
-
-    # ===================================================================
-    # WORKER HEALTH
-    # ===================================================================
+        return [s.model_dump() for s in await _db(ctx).insights.schedules()]
 
     @mcp.tool()
     async def stale_jobs(
         ctx: Ctx,
-        threshold: StaleThreshold = "PT5M",
-        limit: Limit = 50,
+        threshold: str = "PT5M",
+        limit: int = 50,
     ) -> list[dict[str, object]]:
         """Jobs stuck in 'picked' status whose heartbeat is older than the threshold.
 
@@ -382,9 +337,8 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
         If you see stale jobs, cross-reference the queue_manager_id with
         active_workers to check if that worker is still alive.
         """
-        d = _db(ctx)
-        interval = _parse_interval(threshold)
-        return await d.fetch(d.qbq.build_stale_jobs_query(), interval, limit)
+        jobs = await _db(ctx).insights.stale_jobs(_parse_interval(threshold), limit)
+        return [j.model_dump() for j in jobs]
 
     @mcp.tool()
     async def active_workers(ctx: Ctx) -> list[dict[str, object]]:
@@ -414,8 +368,7 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
           - No workers at all but queue_size shows 'queued' jobs: workers
             are not running or cannot connect.
         """
-        d = _db(ctx)
-        return await d.fetch(d.qbq.build_active_workers_query())
+        return [w.model_dump() for w in await _db(ctx).insights.active_workers()]
 
     @mcp.tool()
     async def queue_age(ctx: Ctx) -> list[dict[str, object]]:
@@ -434,7 +387,7 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
           - avg_age_seconds:    average age of all queued jobs for this entrypoint
 
         This tool takes no parameters. Returns one row per entrypoint that
-        has queued jobs, ordered by oldest_age_seconds descending (worst first).
+        has queued jobs, ordered by entrypoint.
         An empty result means no jobs are waiting — the queue is fully caught up.
 
         Diagnosis patterns:
@@ -444,12 +397,7 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
           - Both count and age are high: sustained backlog, need more workers
             or faster processing.
         """
-        d = _db(ctx)
-        return await d.fetch(d.qbq.build_queue_age_query())
-
-    # ===================================================================
-    # SCHEMA & SETUP
-    # ===================================================================
+        return [a.model_dump() for a in await _db(ctx).insights.queue_age()]
 
     @mcp.tool()
     async def schema_info(ctx: Ctx) -> list[dict[str, object]]:
@@ -482,27 +430,33 @@ def _register_tools(mcp: FastMCP) -> None:  # noqa: C901
         will be truncated after an unclean PostgreSQL shutdown (crash, OOM kill).
         Production systems typically use 'balanced' or 'durable' durability.
         """
-        d = _db(ctx)
-        return await d.fetch(d.qbq.build_schema_info_query())
+        return [t.model_dump() for t in await _db(ctx).insights.schema_info()]
 
 
 def create_mcp_server(
     dsn: str | None = None,
-    settings: DBSettings = DBSettings(),
-) -> FastMCP:
+    settings: DBSettings | None = None,
+    connection_settings: ConnectionSettings | None = None,
+) -> FastMCP[PgQueuerDatabase]:
     """Factory that builds a fully-configured PgQueuer MCP server.
 
     Args:
-        dsn: PostgreSQL connection string. If None, asyncpg reads standard
-             libpq environment variables (PGHOST, PGPORT, PGUSER,
-             PGPASSWORD, PGDATABASE) automatically.
-        settings: PgQueuer DBSettings (table names, channel, etc.).
+        dsn: PostgreSQL connection string. If None, the DSN comes from
+             PGQUEUER_DSN/PGDSN, else asyncpg reads standard libpq
+             environment variables (PGHOST, PGPORT, PGUSER, PGPASSWORD,
+             PGDATABASE) automatically.
+        settings: PgQueuer DBSettings (table names, channel, etc.). If None,
+             the process-wide settings read from PGQUEUER_* env vars.
+        connection_settings: Pool sizing/timeouts. If None, read from
+             PGQUEUER_* env vars at startup (PGQUEUER_POOL_MIN_SIZE,
+             PGQUEUER_POOL_MAX_SIZE, PGQUEUER_CONNECT_TIMEOUT,
+             PGQUEUER_APPLICATION_NAME).
     """
 
     @asynccontextmanager
-    async def app_lifespan(server: FastMCP) -> AsyncIterator[PgQueuerDatabase]:
-        async with asyncpg.create_pool(dsn=dsn, min_size=1, max_size=5) as pool:
-            yield PgQueuerDatabase(pool, settings)
+    async def app_lifespan(server: FastMCP[PgQueuerDatabase]) -> AsyncIterator[PgQueuerDatabase]:
+        async with create_asyncpg_pool(dsn=dsn, settings=connection_settings) as pool:
+            yield PgQueuerDatabase(pool, settings or db_settings())
 
     mcp = FastMCP("pgqueuer", lifespan=app_lifespan)
 

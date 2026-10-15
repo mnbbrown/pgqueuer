@@ -1,36 +1,28 @@
 # Drivers
 
-Drivers act as the bridge between PgQueuer and PostgreSQL, managing connections and
-abstracting database communication.
-
-## Purpose
-
-Drivers:
-
-- Manage database connections and enforce required configuration (e.g., autocommit).
-- Abstract PostgreSQL-specific features to streamline queue operations.
-- Provide a consistent interface for executing queries.
+A driver wraps a PostgreSQL connection and gives PgQueuer one interface for running
+queries and receiving notifications, whichever underlying library you use. It also
+enforces the configuration queue operations depend on, autocommit in particular.
 
 ## Requirements
 
 For any driver:
 
-1. **Autocommit mode** — The connection must operate in autocommit mode.
+1. **Autocommit mode**: The connection must operate in autocommit mode.
    - For `psycopg`, explicitly set `connection.autocommit = True`.
    - For `asyncpg`, autocommit is the default unless a transaction is explicitly started.
 
-2. **PostgreSQL compatibility** — The driver must support PostgreSQL-specific features
+2. **PostgreSQL compatibility**: The driver must support PostgreSQL-specific features
    used by PgQueuer.
 
-3. **Default isolation level** — Connections should maintain the default PostgreSQL
+3. **Default isolation level**: Connections should maintain the default PostgreSQL
    isolation level unless explicitly modified.
 
-## Driver Protocol
+## Driver protocol
 
 Every driver implements `pgqueuer.ports.driver.Driver`. Built-ins:
-`AsyncpgDriver`, `AsyncpgPoolDriver`, `PsycopgDriver`, `PsycopgPoolDriver`,
-`SyncPsycopgDriver`, and the in-memory driver. Custom drivers work anywhere a
-`Driver` is expected.
+`AsyncpgDriver`, `AsyncpgPoolDriver`, `PsycopgDriver`, `SyncPsycopgDriver`, and
+the in-memory driver. Custom drivers work anywhere a `Driver` is expected.
 
 Key methods:
 
@@ -40,6 +32,10 @@ Key methods:
 | `execute(query, *args)` | Run a statement and return a status string |
 | `add_listener(channel, callback)` | Subscribe to `LISTEN` notifications |
 | `notify(channel, payload)` | Send `NOTIFY` on a channel |
+| `remove_listener(channel, callback)` | Optional: unsubscribe a callback added with `add_listener` |
+
+`remove_listener` lives on the separate `ListenerRemover` protocol, so existing custom
+drivers still satisfy `Driver`. `CompletionWatcher` calls it on exit when a driver has it.
 
 `notify()` replaces the removed `build_notify_query()` helper. Each driver sends
 `NOTIFY` via its native parameterized API instead of the queries layer building
@@ -59,7 +55,7 @@ async def notify(self, channel: str, payload: str) -> None:
     await self.execute("SELECT pg_notify($1, $2)", channel, payload)
 ```
 
-## Asynchronous Drivers
+## Asynchronous drivers
 
 ### `AsyncpgDriver`
 
@@ -82,6 +78,19 @@ conn.autocommit = True
 driver = PsycopgDriver(conn)
 ```
 
+#### psycopg performance
+
+- **Install the C implementation.** `pgqueuer[psycopg]` does not pull in psycopg's C
+  implementation, and without it psycopg wraps libpq in pure Python. Install
+  `psycopg[binary]` (prebuilt wheels) or `psycopg[c]` (builds against your local libpq).
+  Check which one is active with `python -c "import psycopg; print(psycopg.pq.__impl__)"`.
+  It should print `binary` or `c`, not `python`.
+- **Expect extra latency on quiet queues.** psycopg delivers notifications through
+  `notifies()`, which holds the connection lock while it waits. While the listener runs, a
+  query on the same connection can wait up to about a second when no `NOTIFY` arrives.
+  Under steady load notifications keep arriving, so this costs little. If job latency on
+  low-traffic queues matters, use `AsyncpgDriver`.
+
 !!! note "Windows event loop"
     psycopg's async driver is not compatible with Python's default
     `ProactorEventLoop` on Windows. Run your application under
@@ -97,11 +106,11 @@ driver = PsycopgDriver(conn)
     The `pgq` CLI handles this automatically. See the
     [psycopg async docs](https://www.psycopg.org/psycopg3/docs/advanced/async.html).
 
-## Synchronous Driver
+## Synchronous driver
 
 ### `SyncPsycopgDriver`
 
-Designed for blocking code or frameworks such as Flask. **Can only enqueue jobs** — PgQueuer's
+Designed for blocking code or frameworks such as Flask. **Can only enqueue jobs**: PgQueuer's
 consumers and internals require an async driver.
 
 ```python
@@ -115,7 +124,7 @@ queries = SyncQueries(driver)
 queries.enqueue("fetch", b"payload")
 ```
 
-## Creating PgQueuer Instances with Classmethods
+## Creating PgQueuer instances with classmethods
 
 PgQueuer provides classmethods that handle driver instantiation automatically:
 
@@ -161,23 +170,22 @@ pgq = PgQueuer.from_psycopg_connection(connection)
 await pgq.run()
 ```
 
-## Classmethod Parameters
+## Classmethod parameters
 
 All classmethods accept:
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `connection` / `pool` | Yes | The database connection or pool |
-| `channel` | No | Custom `Channel` configuration. Defaults to `Channel(DBSettings().channel)` |
+| `channel` | No | Custom `Channel` configuration. Defaults to `ch_pgqueuer` with `PGQUEUER_PREFIX` prepended |
 | `resources` | No | Mutable mapping for shared resources. Defaults to `{}` |
 
-## Best Practices
+## Recommendations
 
 - Prefer an async driver when your project already runs on asyncio.
 - Use the sync driver only to enqueue jobs from short-lived scripts or WSGI applications.
-- Reuse connections or pools; keep autocommit enabled.
-- Use the PgQueuer classmethods for simplified setup.
-- When using psycopg, always ensure autocommit is enabled before passing the connection.
+- Reuse connections or pools rather than opening one per enqueue.
+- With psycopg, set autocommit before you hand the connection to a driver.
 
 ## Troubleshooting
 

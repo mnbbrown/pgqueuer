@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING
 
 from typing_extensions import Self
 
 from pgqueuer.core import logconfig
-from pgqueuer.core.tm import TaskManager
-from pgqueuer.ports.driver import Driver, SyncDriver
+from pgqueuer.core.tm import TaskManager, cancel_and_wait
+from pgqueuer.ports.driver import Driver, NotifyCallback, SyncDriver
 
 if TYPE_CHECKING:
     import psycopg
@@ -40,11 +40,14 @@ class PsycopgDriver(Driver):
         self._shutdown = asyncio.Event()
         self._connection = connection
         self._tm = TaskManager()
+        self._listeners: dict[str, list[NotifyCallback]] = {}
+        self._watcher: asyncio.Task[None] | None = None
+        self._entered = 0
 
         if not self._connection.autocommit:
             raise RuntimeError(
                 f"Database connection({self._connection}) must have autocommit enabled. This is "
-                "required for proper operation of PGQueuer. Ensure that your psycopg connection is "
+                "required for proper operation of PgQueuer. Ensure that your psycopg connection is "
                 "configured with autocommit=True."
             )
 
@@ -59,8 +62,8 @@ class PsycopgDriver(Driver):
     async def fetch(
         self,
         query: str,
-        *args: Any,
-    ) -> list[dict]:
+        *args: object,
+    ) -> list[dict[str, object]]:
         from psycopg import AsyncRawCursor
         from psycopg.rows import dict_row
 
@@ -71,7 +74,7 @@ class PsycopgDriver(Driver):
     async def execute(
         self,
         query: str,
-        *args: Any,
+        *args: object,
     ) -> str:
         from psycopg import AsyncRawCursor
 
@@ -85,39 +88,76 @@ class PsycopgDriver(Driver):
     async def add_listener(
         self,
         channel: str,
-        callback: Callable[[str | bytes | bytearray], None],
+        callback: NotifyCallback,
     ) -> None:
-        if not channel.isidentifier():
-            raise ValueError(f"Invalid channel name: {channel!r}")
-        await self._connection.execute(f"LISTEN {channel}")
+        from psycopg import sql
 
-        async def notify_watcher() -> None:
-            while not self.shutdown.is_set():
-                async for note in self._connection.notifies(
-                    timeout=1.0,
-                    stop_after=1,
-                ):
+        if channel not in self._listeners:
+            # Quote like asyncpg's add_listener does: an unquoted LISTEN folds
+            # the name to lowercase, so it would never match the trigger's
+            # pg_notify('{channel}') literal for mixed-case channels (#947).
+            await self._connection.execute(sql.SQL("LISTEN {}").format(sql.Identifier(channel)))
+            self._listeners[channel] = []
+        self._listeners[channel].append(callback)
+
+        if self._watcher is None:
+            self._watcher = asyncio.create_task(
+                self.watch_notifies(), name="notify_psycopg_watcher"
+            )
+            self._tm.add(self._watcher)
+
+    async def watch_notifies(self) -> None:
+        """Hand each NOTIFY to the callbacks of its channel.
+
+        One watcher per connection: psycopg gives each notification to a single notifies() reader.
+        """
+        while not self.shutdown.is_set():
+            async for note in self._connection.notifies(timeout=1.0, stop_after=1):
+                for callback in list(self._listeners.get(note.channel, [])):
                     try:
                         callback(note.payload)
                     except Exception:
                         logconfig.logger.exception(
                             "Unhandled error in NOTIFY callback for channel %s",
-                            channel,
+                            note.channel,
                         )
 
-        self._tm.add(
-            asyncio.create_task(
-                notify_watcher(),
-                name=f"notify_psycopg_watcher_{channel}",
-            )
-        )
+    async def remove_listener(
+        self,
+        channel: str,
+        callback: NotifyCallback,
+    ) -> None:
+        from psycopg import sql
+
+        callbacks = self._listeners.get(channel, [])
+        if callback not in callbacks:
+            return
+        callbacks.remove(callback)
+        if callbacks:
+            return
+
+        del self._listeners[channel]
+        if not self._listeners and self._watcher is not None:
+            await cancel_and_wait(self._watcher)
+            self._watcher = None
+        await self._connection.execute(sql.SQL("UNLISTEN {}").format(sql.Identifier(channel)))
 
     async def __aenter__(self) -> Self:
+        if self._entered == 0:
+            self._shutdown.clear()
+        self._entered += 1
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        # PgQueuer.run enters one driver from two managers; only the last exit may stop listening.
+        self._entered -= 1
+        if self._entered > 0:
+            return
         self.shutdown.set()
         await self.tm.gather_tasks()
+        # Start afresh on the next enter: add_listener then LISTENs and starts a new watcher.
+        self._watcher = None
+        self._listeners.clear()
 
 
 class SyncPsycopgDriver(SyncDriver):
@@ -139,15 +179,15 @@ class SyncPsycopgDriver(SyncDriver):
         if not self._connection.autocommit:
             raise RuntimeError(
                 f"Database connection({self._connection}) must have autocommit enabled. This is "
-                "required for proper operation of PGQueuer. Ensure that your psycopg connection is "
+                "required for proper operation of PgQueuer. Ensure that your psycopg connection is "
                 "configured with autocommit=True."
             )
 
     def fetch(
         self,
         query: str,
-        *args: Any,
-    ) -> list[dict]:
+        *args: object,
+    ) -> list[dict[str, object]]:
         from psycopg import RawCursor
         from psycopg.rows import dict_row
 

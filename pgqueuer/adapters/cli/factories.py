@@ -5,23 +5,17 @@ import inspect
 import os
 import sys
 from contextlib import AbstractAsyncContextManager
-from typing import Any, Callable
+from typing import Protocol
 
 
-def load_factory(factory: str | Callable[..., Any]) -> Callable[..., Any]:
-    """
-    Load factory function.
+class Factory(Protocol):
+    """User factory callable; CLI extra arguments are forwarded positionally."""
 
-    Args:
-        factory (str | Callable): Factory function specification. It may be one of the
-        following:
-          - Module path to the factory function
-          - Factory-style path
-          - Callable factory function
+    def __call__(self, *args: object) -> object: ...
 
 
-    Returns: A callable
-    """
+def load_factory(factory: str | Factory) -> Factory:
+    """Resolve a factory: a ``module:attr`` import path, or pass-through if already callable."""
     sys.path.insert(0, os.getcwd())
 
     if callable(factory):
@@ -29,10 +23,13 @@ def load_factory(factory: str | Callable[..., Any]) -> Callable[..., Any]:
 
     module_name, factory_name = factory.split(":", 1)
     module = importlib.import_module(module_name)
-    return getattr(module, factory_name)
+    loaded: object = getattr(module, factory_name)
+    if not callable(loaded):
+        raise TypeError(f"{factory!r} does not resolve to a callable, got {type(loaded).__name__}")
+    return loaded
 
 
-def validate_factory_result(result: object) -> AbstractAsyncContextManager[Any]:
+def validate_factory_result(result: object) -> AbstractAsyncContextManager[object]:
     """Validate that a factory produced an async context manager.
 
     Raises TypeError with actionable migration instructions when the result

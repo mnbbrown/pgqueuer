@@ -1,20 +1,13 @@
 # Custom Executors
 
-Executors define how jobs are processed once dequeued. PgQueuer provides a default executor,
-but you can create custom executors to introduce specialized behavior such as advanced logging,
-conditional execution, or retry logic.
+Executors define how jobs are processed once dequeued. The default executor calls your
+handler and lets exceptions propagate. A custom executor sits in the same place but can
+wrap that call: log around it, dispatch on the payload, retry it, or refuse to run it.
 
-## What Are Executors?
+Because the executor is a class, that logic lives outside your handlers, which keeps
+handler bodies about the work itself.
 
-Custom executors let you:
-
-- **Implement custom logic**: Interact with external APIs, add specialized error handling, or
-  build complex workflows.
-- **Modularize job processing**: Keep execution logic separate from application code.
-- **Enhance flexibility**: Define concurrency limits, dynamic resource allocation, or multi-step
-  dispatch patterns.
-
-## Creating a Custom Executor
+## Creating a custom executor
 
 Subclass `AbstractEntrypointExecutor` and implement the `execute` method:
 
@@ -37,7 +30,7 @@ class NotificationExecutor(AbstractEntrypointExecutor):
         print(f"Sending SMS: {message}")
 ```
 
-## Registering a Custom Executor
+## Registering a custom executor
 
 Pass the executor class via `executor_factory`:
 
@@ -47,13 +40,13 @@ async def notification_task(job: Job) -> None:
     pass
 ```
 
-## Database Retry Executor
+## Database retry executor
 
 `DatabaseRetryEntrypointExecutor` converts unhandled exceptions into database-level retries
 via `RetryRequested`. The job is re-queued in the database so any worker can pick it up after
-the delay — retries survive worker restarts.
+the delay; retries survive worker restarts.
 
-### When to Use It
+### When to use it
 
 - Failures that may take minutes to resolve (e.g., downstream service outages)
 - Jobs that must survive worker restarts between retry attempts
@@ -91,7 +84,7 @@ async def sync_inventory(job: Job) -> None:
 | `max_delay` | `5m` | Cap on exponential backoff |
 | `backoff_multiplier` | `2.0` | Multiplier applied to delay after each attempt |
 
-If the handler raises `RetryRequested` directly, it passes through unchanged — the executor
+If the handler raises `RetryRequested` directly, it passes through unchanged; the executor
 only converts non-retry exceptions. See [Database-Level Retry](retry.md) for the full guide.
 
 !!! tip "Combine with `on_failure=\"hold\"`"

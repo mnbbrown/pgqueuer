@@ -1,7 +1,7 @@
 # CLI Reference
 
-The `pgq` CLI provides a command-line interface for managing all aspects of PgQueuer.
-It can be invoked as `pgq` or `python3 -m pgqueuer`.
+The `pgq` CLI installs, inspects, and runs PgQueuer. Invoke it as `pgq` or
+`python3 -m pgqueuer`.
 
 ## Commands
 
@@ -12,15 +12,23 @@ Set up the necessary database schema for PgQueuer.
 **Options:**
 
 - `--durability`: Define the durability level for tables.
-  - `volatile`: All tables are unlogged — maximum performance, no crash recovery.
+  - `volatile`: All tables are unlogged: maximum performance, no crash recovery.
   - `balanced`: Critical tables (`pgqueuer`, `pgqueuer_schedules`) are logged; auxiliary
     tables are unlogged.
-  - `durable` *(default)*: All tables are logged — full crash recovery.
-- `--dry-run`: Print SQL commands without executing them.
+  - `durable` *(default)*: All tables are logged: full crash recovery.
+- `--dry-run` *(deprecated)*: Alias for [`pgq sql install`](#sql).
 
 ```bash
 pgq install --durability balanced
 ```
+
+On success, a confirmation is written to stderr; stdout stays empty. To preview or
+capture the SQL instead of executing it, use [`pgq sql install`](#sql).
+
+`install` creates objects from nothing. Pointed at a database that already has
+this installation it refuses and exits `1`, naming the prefix and schema it
+found. For a command that is safe to run repeatedly -- including against an
+empty database, where it installs everything -- use [`pgq upgrade`](#upgrade).
 
 ---
 
@@ -30,7 +38,7 @@ Remove the PgQueuer schema from the database.
 
 **Options:**
 
-- `--dry-run`: Print SQL commands without executing them.
+- `--dry-run` *(deprecated)*: Alias for [`pgq sql uninstall`](#sql).
 
 ```bash
 pgq uninstall
@@ -40,16 +48,76 @@ pgq uninstall
 
 ### `upgrade`
 
-Apply database schema upgrades.
+Bring the database schema up to what this PgQueuer release declares.
+
+The schema is read from `pg_catalog` and compared against the declaration, so
+only the statements this particular database needs are run. A database that is
+already current runs nothing and says so.
 
 **Options:**
 
-- `--durability`: Adjust the durability level during the upgrade (same options as `install`).
-- `--dry-run`: Print SQL commands without executing them.
+- `--plan`: Print the statements this database needs and exit without applying
+  them. Notes and the summary go to stderr, so stdout carries only SQL, headed
+  by a comment naming the release and warning that the delta belongs to this
+  database. A converged database prints nothing at all. See
+  [`pgq sql upgrade`](#sql) for the artifact to check in.
+- `--widen-id/--no-widen-id`: Widen legacy `int4` id columns to `BIGINT`. See
+  [Upgrading](../getting-started/upgrading.md).
+- `--dry-run` *(deprecated)*: Alias for [`pgq sql upgrade`](#sql).
+- `--durability` *(deprecated)*: Accepted for older scripts, warns, and is
+  ignored. See below.
 
 ```bash
-pgq upgrade --durability durable
+pgq upgrade --plan          # what would change, nothing applied
+pgq upgrade                 # apply it
 ```
+
+`upgrade` never changes durability. Switching a table between `LOGGED` and
+`UNLOGGED` rewrites it, which does not belong in a command the deployment guide
+calls safe to run against a live database. A table whose durability differs
+from the declared level is reported as a `note:` and left alone; use
+[`pgq durability`](#durability) to change it. The declared level comes from
+`PGQUEUER_DURABILITY` (default `durable`), so an installation running
+`volatile` should set that variable for the notes to be accurate.
+
+Output goes to stderr: `PgQueuer schema is already up to date.`, or
+`Applied 3 statements.` Anything the upgrade will not do on its own is reported
+as a `note:` line -- a column an older release left behind, for instance, is
+never dropped for you.
+
+An upgrade that rewrites a table also gets a `note:`, but `pgq upgrade` prints
+its notes only after it has applied, so read them from `--plan`. Converting a
+column type is the only thing here that rewrites a table, and Postgres holds
+`ACCESS EXCLUSIVE` for the whole rewrite, blocking enqueues, dequeues and
+reads. Run `--plan` first on any database old enough to still be on `int4` ids
+or the pre-v0.27 statistics enum:
+
+```
+note: Upgrading pgqueuer rewrites it (id). Postgres holds ACCESS EXCLUSIVE for
+      the whole rewrite, blocking enqueues, dequeues and reads, for a time that
+      scales with row count. Prefer a maintenance window.
+```
+
+Rebuilding an index whose definition differs from the declared one does not
+rewrite the table, but the build holds a `SHARE` lock that blocks writes to it,
+so it gets a `note:` too.
+
+A column whose installed type the planner has no conversion for stops the
+upgrade rather than guessing at a cast. It exits `1` with one line on stderr
+naming the column and both types; alter it by hand and re-run.
+
+!!! note "Concurrency"
+    Upgrades of one installation serialize on a session advisory lock, keyed on
+    the qualified queue table and held across planning and applying. Two
+    installations in one database do not block each other.
+
+    The statements cannot share a transaction, because PostgreSQL forbids using
+    a new enum value in the transaction that added it. That makes the lock
+    session-scoped, so it only binds the connection that took it -- `pgq
+    upgrade` uses one. Over `AsyncpgPoolDriver` the lock is not held at all:
+    asyncpg runs `pg_advisory_unlock_all()` when the connection that took it
+    goes back to the pool, so `Queries.upgrade()` through a pool serializes
+    nothing.
 
 ---
 
@@ -77,11 +145,10 @@ Change the durability level of existing PgQueuer tables **without data loss**.
 **Arguments:**
 
 - `durability` *(required)*: `volatile`, `balanced`, or `durable`.
-- `--dry-run` *(optional)*: Print SQL commands without executing them.
+- `--dry-run` *(deprecated)*: Alias for [`pgq sql durability`](#sql).
 
 ```bash
 pgq durability durable
-pgq durability volatile --dry-run
 ```
 
 ---
@@ -92,13 +159,65 @@ Apply recommended autovacuum settings for PgQueuer tables.
 
 **Options:**
 
-- `--dry-run`: Print SQL commands without executing them.
+- `--dry-run` *(deprecated)*: Alias for [`pgq sql autovac`](#sql).
 - `--rollback`: Reset autovacuum settings to system defaults.
 
 ```bash
 pgq autovac
 pgq autovac --rollback
 ```
+
+---
+
+### `sql`
+
+Emit PgQueuer SQL to stdout without connecting to a database. No DSN or
+credentials are needed. Use it to preview DDL, pipe it to `psql` or another
+Postgres client, or capture it as a migration file for tools like Flyway,
+sqitch, or Alembic.
+
+**Subcommands:**
+
+- `sql install`: SQL to create the PgQueuer schema. Accepts `--durability` and
+  `--create-schema/--no-create-schema` like `install`.
+- `sql uninstall`: SQL to drop all PgQueuer objects.
+- `sql upgrade`: SQL to migrate an existing installation to the current version.
+  Accepts `--widen-id/--no-widen-id` like `upgrade`, plus `--durability`, which
+  `upgrade` ignores: the offline script renders the tables it may have to
+  create, while a connected upgrade never changes durability. Since it
+  cannot see the database, it re-states every object behind `IF NOT EXISTS`
+  rather than emitting a delta. That makes it the version-portable artifact:
+  the same script for every database on this release, which is what a migration
+  tool wants checked in. For the delta one particular database needs, use
+  [`pgq upgrade --plan`](#upgrade) -- but read it rather than filing it, since
+  it is only valid for the database it was computed from.
+- `sql durability <level>`: SQL to switch table durability without data loss.
+- `sql autovac [--rollback]`: SQL for recommended autovacuum settings.
+
+Global `--prefix` and `--schema` apply as usual.
+
+**Output contract:** stdout carries only SQL: every statement is
+semicolon-terminated, statements are separated by blank lines, and the output is
+deterministic for a given PgQueuer version and settings (diff-friendly in CI).
+
+```bash
+# Preview the schema
+pgq sql install
+
+# Apply with psql instead of the built-in drivers
+pgq sql install | psql -v ON_ERROR_STOP=1
+
+# Capture a migration file for your migration tool
+pgq --schema billing sql upgrade > migrations/V2__pgqueuer_upgrade.sql
+```
+
+!!! warning "Transactions and `sql upgrade`"
+    The upgrade script adds enum values with `ALTER TYPE ... ADD VALUE` and then
+    references the enum in later statements. PostgreSQL forbids using a new enum
+    value in the same transaction that added it, so apply the script with
+    autocommit (the default). Do not wrap it in `psql --single-transaction` or a
+    `BEGIN`/`COMMIT` block. The `install`, `uninstall`, `durability`, and
+    `autovac` scripts have no such restriction.
 
 ---
 
@@ -111,8 +230,16 @@ Manually enqueue a job.
 - `entrypoint` *(required)*: The entrypoint name.
 - `payload` *(optional)*: A serialized string or JSON payload.
 
+**Options:**
+
+- `--dedupe-key`: Deduplication key; an active (`queued`/`picked`) job with the same key
+  blocks the enqueue.
+- `--on-conflict`: What to do on a dedupe-key conflict: `raise` (default) exits with an
+  error, `skip` exits 0 without enqueuing.
+
 ```bash
 pgq queue my_module.my_function '{"key": "value"}'
+pgq queue my_module.my_function '{"key": "value"}' --dedupe-key invoice-42 --on-conflict skip
 ```
 
 ---
@@ -123,14 +250,14 @@ Display a live dashboard showing job statistics.
 
 **Options:**
 
-- `--interval <seconds>`: Refresh interval. If not set, updates once and exits.
-- `--tail <number>`: Number of most recent log entries to display.
+- `-i`, `--interval <seconds>`: Refresh interval. If not set, updates once and exits.
+- `-n`, `--limit <number>`: Number of most recent log entries to display (default: `25`).
 
-The table format can be controlled via the `PGQUEUER_TABLEFMT` environment variable
-(default: `pretty`).
+The table format can be controlled via the `PGQUEUER_TABLEFMT` environment
+variable (legacy spelling `TABLEFMT` still works; default: `pretty`).
 
 ```bash
-pgq dashboard --interval 10 --tail 25
+pgq dashboard --interval 10 --limit 25
 ```
 
 ---
@@ -164,18 +291,24 @@ pgq schedules --remove fetch_db
 ### `failed`
 
 List jobs held with `status='failed'` for manual intervention. Held jobs come from
-entrypoints registered with `on_failure="hold"` — see [Holding Failed Jobs](../guides/hold-failed-jobs.md).
+entrypoints registered with `on_failure="hold"`: see [Holding Failed Jobs](../guides/hold-failed-jobs.md).
 
 **Options:**
 
 - `-n` / `--limit <number>` *(default: 25)*: Maximum number of jobs to display.
+- `--json`: Print the jobs as a JSON array on stdout instead of a table.
 
 ```bash
 pgq failed
 pgq failed -n 100
+pgq failed --json
 ```
 
 Output: job ID, entrypoint, attempt count, creation time, and payload size.
+
+With `--json`, each element carries the job's fields with ISO-8601 timestamps.
+The payload is replaced by `payload_bytes`, its size, because payloads are
+arbitrary bytes. No held jobs prints `[]` and exits `0`.
 
 ---
 
@@ -195,6 +328,78 @@ pgq requeue 42 43 44
 
 ---
 
+### `stale`
+
+List jobs in `picked` status whose heartbeat is older than a threshold. A stale
+job usually means its worker crashed, was killed, or is hanging.
+
+**Options:**
+
+- `-t` / `--threshold <seconds>` *(default: 300)*: How old the last heartbeat
+  must be before a picked job counts as stale.
+- `-n` / `--limit <number>` *(default: 25)*: Maximum number of jobs to display.
+- `--json`: Print the jobs as a JSON array on stdout instead of a table.
+
+```bash
+pgq stale
+pgq stale -t 1800
+pgq stale --json
+```
+
+Output: job ID, entrypoint, queue manager ID, last heartbeat, and seconds since
+that heartbeat, oldest heartbeat first. With `--json`, each element also carries
+the job's priority, status, and timestamps, in ISO-8601. No stale jobs prints
+`[]` and exits `0`.
+
+---
+
+### `workers`
+
+List queue managers that currently hold picked jobs, one row per
+`queue_manager_id`. A running worker with nothing picked does not appear.
+
+**Options:**
+
+- `--json`: Print the workers as a JSON array on stdout instead of a table.
+
+```bash
+pgq workers
+pgq workers --json
+```
+
+Output: queue manager ID, number of picked jobs, oldest and newest heartbeat
+among those jobs, and the entrypoints they belong to. An old oldest heartbeat
+points at a stuck job; [`pgq stale`](#stale) lists it. No workers prints `[]`
+with `--json` and exits `0`.
+
+---
+
+### `backlog`
+
+Show, per entrypoint, how many jobs are in `queued` status and how long they
+have waited since they were enqueued. A growing oldest age means workers are
+not keeping up with that entrypoint.
+
+Age is measured from each job's `created` time. Jobs whose `execute_after` is
+still in the future are counted too, so a queue with scheduled jobs can show a
+backlog before any of them is due.
+
+**Options:**
+
+- `--json`: Print one object per entrypoint as a JSON array on stdout instead
+  of a table.
+
+```bash
+pgq backlog
+pgq backlog --json
+```
+
+Output: entrypoint, queued count, oldest creation time, and the oldest and
+average age in seconds, sorted by entrypoint. No queued jobs prints `[]` with
+`--json` and exits `0`.
+
+---
+
 ### `run`
 
 Start a `QueueManager` to process jobs.
@@ -205,6 +410,7 @@ Start a `QueueManager` to process jobs.
 |------|------|---------|-------------|
 | `--dequeue-timeout` | float | 30.0 | Max seconds to wait for new jobs per batch |
 | `--batch-size` | int | 10 | Jobs to dequeue per batch |
+| `--heartbeat-timeout` | float | 30.0 | Seconds without a heartbeat before a job is re-picked by another worker |
 | `--restart-delay` | float | 5.0 | Seconds between restarts when `--restart-on-failure` is set |
 | `--restart-on-failure` | bool | False | Restart the manager automatically after failures |
 | `--log-level` | str | INFO | Logging level (DEBUG, INFO, WARNING, ERROR) |
@@ -216,11 +422,11 @@ Start a `QueueManager` to process jobs.
 # Run with a limit of 5 concurrent tasks
 pgq run my_module:my_factory --max-concurrent-tasks 5
 
-# Drain mode — process all queued jobs then exit
+# Drain mode: process all queued jobs then exit
 pgq run my_module:my_factory --mode drain
 ```
 
-#### Execution Modes
+#### Execution modes
 
 - **continuous** *(default)*: Keeps processing jobs indefinitely, waiting for new ones.
 - **drain**: Processes all available jobs and shuts down once the queue is empty.
@@ -229,56 +435,56 @@ Use **continuous** for long-running workers and **drain** for batch processing.
 
 ---
 
-## Durability Levels Explained
+## Durability levels
 
-Durability controls the logging behavior of PgQueuer tables, affecting performance and
-crash recovery.
+Durability controls whether PgQueuer tables are WAL-logged, which trades write speed
+against crash recovery.
 
 ### Volatile
 
-- All tables are **unlogged** — no Write-Ahead Log (WAL) writes.
+- All tables are **unlogged**: no Write-Ahead Log (WAL) writes.
 - Data is **lost** if PostgreSQL crashes.
 - Best for: temporary workloads where data loss is acceptable, or maximum throughput testing.
 
 ### Balanced
 
-- Critical tables (`pgqueuer`, `pgqueuer_schedules`) are **logged** — survive crashes.
-- Auxiliary tables (`pgqueuer_log`, `pgqueuer_statistics`) are **unlogged** — faster writes.
+- Critical tables (`pgqueuer`, `pgqueuer_schedules`) are **logged**: survive crashes.
+- Auxiliary tables (`pgqueuer_log`, `pgqueuer_statistics`) are **unlogged**: faster writes.
 - Best for: production systems where job data must survive crashes but log/statistics can be
   sacrificed for speed.
 
 ### Durable *(default)*
 
-- All tables are **logged** — full WAL writes.
+- All tables are **logged**: full WAL writes.
 - Data survives crashes and restarts.
 - Best for: production environments where data integrity is critical.
 
 ---
 
-## Factory Pattern (`run` command)
+## Factory pattern (`run` command)
 
 The `run` command uses a factory pattern. Your factory function creates and configures the
 manager instance; the CLI loads it, calls it, and runs the returned manager until shutdown.
 
-### Execution Flow
+### Execution flow
 
 ```
 pgq run my_module:factory
           │
           ▼
-  1. LOAD FACTORY — import module, retrieve function
+  1. LOAD FACTORY: import module, retrieve function
           │
           ▼
-  2. SETUP SIGNAL HANDLERS — SIGINT, SIGTERM
+  2. SETUP SIGNAL HANDLERS: SIGINT, SIGTERM
           │
           ▼
-  3. SUPERVISOR LOOP — continues until shutdown
+  3. SUPERVISOR LOOP: continues until shutdown
           │
           ▼
-  4. INVOKE YOUR FACTORY — create connection, register entrypoints
+  4. INVOKE YOUR FACTORY: create connection, register entrypoints
           │
           ▼
-  5. LINK SHUTDOWN EVENT — connect signal to manager
+  5. LINK SHUTDOWN EVENT: connect signal to manager
           │
           ▼
   6. RUN THE MANAGER
@@ -289,10 +495,10 @@ pgq run my_module:factory
       SHUTDOWN        (if --restart-on-failure)
 ```
 
-### Factory Contract
+### Factory contract
 
 The factory **must** return an `AsyncContextManager` (typically via `@asynccontextmanager`).
-Bare awaitables and sync context managers are **not** accepted — passing one raises
+Bare awaitables and sync context managers are **not** accepted; passing one raises
 `TypeError` with migration instructions.
 
 ```python
@@ -329,20 +535,46 @@ async def create_pgqueuer(args: list[str]):
     yield pgq
 ```
 
-### Key Points
+### Things worth knowing
 
-- **Factory runs on each restart**: With `--restart-on-failure`, the factory executes again
-  after failures, creating fresh connections and state.
-- **Async context manager is required**: Use `@asynccontextmanager` with `yield`.
-- **Extra args via `--`**: Arguments after `--` are passed as `list[str]` to the factory.
-  Factories that don't need args simply omit the parameter.
-- **Shutdown is graceful**: In-flight jobs complete before teardown runs.
+- With `--restart-on-failure`, the factory runs again after each failure, so every restart
+  gets fresh connections and state.
+- The factory must be an `@asynccontextmanager` that yields; nothing else is accepted.
+- Arguments after `--` reach the factory as `list[str]`. Factories that don't need them
+  omit the parameter.
+- Shutdown is graceful: in-flight jobs complete before teardown runs.
 
 See `examples/consumer.py` in the repository for a working example.
 
 ---
 
-## Global Options
+## Exit codes
+
+Scripts and agents should branch on the exit code, not on output text. The
+text output of commands is meant for humans and may change between releases.
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success. Also returned when there is nothing to report (e.g. `pgq failed` with no held jobs). |
+| `1` | The command ran and reported a failure, or an unhandled error occurred. See below. |
+| `2` | Usage error: unknown command, unknown option, or a missing required option. Nothing was sent to the database. |
+
+Code `1` is returned for:
+
+- `install`: PgQueuer is already installed in the target schema.
+- `verify`: at least one object is missing (`--expect present`) or unexpected
+  (`--expect absent`).
+- `upgrade`: the live schema has drifted from what this release can upgrade.
+- `queue`: a duplicate `--dedupe-key` with `--on-conflict raise`.
+- Any unhandled error, such as a refused database connection. A traceback is
+  printed to stderr.
+
+Code `1` does not distinguish these cases. Read stderr to tell a reported
+failure from an unhandled error.
+
+---
+
+## Global options
 
 All commands accept the following connection options:
 
@@ -350,7 +582,19 @@ All commands accept the following connection options:
 |------|-------------|-------------|
 | `--pg-dsn` | `PGDSN` | Full PostgreSQL connection string (DSN) |
 | `--prefix` | `PGQUEUER_PREFIX` | Prefix for PgQueuer database objects |
+| `--schema` | `PGQUEUER_SCHEMA` | Postgres schema holding all PgQueuer objects |
 
 When `--pg-dsn` is omitted, the database drivers (asyncpg / psycopg) read standard
 libpq environment variables automatically: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
-`PGDATABASE`. Use `PGOPTIONS="-csearch_path=myschema"` to set a custom schema.
+`PGDATABASE`.
+
+`pgq install` accepts `--create-schema/--no-create-schema` (default: create). It
+controls whether `CREATE SCHEMA IF NOT EXISTS` is emitted when `--schema` is set;
+disable it when the role lacks `CREATE` on the database and the schema already
+exists.
+
+The CLI connection (both drivers) also honors `PGQUEUER_DSN`,
+`PGQUEUER_CONNECT_TIMEOUT`, and `PGQUEUER_APPLICATION_NAME`. See
+[Pool and Connection Tuning](../getting-started/installation.md#pool-and-connection-tuning)
+for the full list of `PGQUEUER_*` connection variables and the
+[libpq variable support matrix](../getting-started/installation.md#libpq-environment-variable-support).

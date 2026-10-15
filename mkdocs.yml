@@ -4,6 +4,10 @@ site_url: https://janbjorge.github.io/pgqueuer/
 repo_url: https://github.com/janbjorge/pgqueuer
 repo_name: janbjorge/pgqueuer
 edit_uri: edit/main/docs/
+exclude_docs: |
+  agent-guide.md
+hooks:
+  - tools/mkdocs_agent_guide.py
 theme:
   name: material
   logo: favicon.svg
@@ -79,10 +83,11 @@ nav:
       - Installation: getting-started/installation.md
       - Quick Start: getting-started/quickstart.md
       - Core Concepts: getting-started/core-concepts.md
+      - When to Use PgQueuer: getting-started/when-to-use.md
       - Upgrading from 0.x: getting-started/upgrading.md
   - Guides:
       - Job Processing:
-          - Concurrency Control: guides/rate-limiting.md
+          - Concurrency Control: guides/concurrency-control.md
           - Per-Key Serialization: guides/per-key-serialization.md
           - Custom Executors: guides/custom-executors.md
           - Job Cancellation: guides/job-cancellation.md
@@ -98,14 +103,23 @@ nav:
       - Performance & Deployment:
           - Performance Tuning: guides/performance-tuning.md
           - Deployment Patterns: guides/deployment.md
+          - Docker Images: guides/docker-images.md
   - Reference:
       - CLI: reference/cli.md
+      - System Design: design/README.md
+      - Dequeue Composition: design/dequeue-composition.md
+      - Schema Manifest: design/schema-manifest.md
+      - Schema Upgrade: design/schema-upgrade.md
+      - SQL Naming: design/sql-naming.md
+      - Connection Failures: design/connection-failures.md
       - Architecture: reference/architecture.md
+      - Row Locking & SKIP LOCKED: reference/skip-locked.md
       - Drivers: reference/drivers.md
       - Database Setup: reference/database-setup.md
       - Database Permissions: reference/database-permissions.md
       - In-Memory Adapter: reference/in-memory.md
   - Integrations:
+      - Web Dashboard: integrations/web-dashboard.md
       - MCP Server: integrations/mcp-server.md
       - Prometheus Metrics: integrations/prometheus.md
       - Distributed Tracing: integrations/tracing.md
@@ -115,5 +129,6 @@ nav:
       - Benchmarks: comparisons/benchmarks.md
   - Development:
       - Contributing: development/development.md
+      - Architecture Decision Records: adr/README.md
       - Ports & Adapters: reference/ports-and-adapters.md
       - Driver Troubleshooting: development/troubleshooting.md

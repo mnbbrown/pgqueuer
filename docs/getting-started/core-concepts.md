@@ -1,8 +1,5 @@
 # Core Concepts
 
-This page explains the key abstractions in PgQueuer. Understanding these will help you
-make the most of every feature.
-
 ---
 
 ## Jobs
@@ -19,6 +16,7 @@ A **job** is a unit of work stored as a row in the `pgqueuer` table. Each job ha
 | `execute_after` | `timestamp` | Earliest time the job can be picked up |
 | `attempts` | `int` | Number of previous retry attempts (starts at 0) |
 | `heartbeat` | `timestamp` | Last time the worker confirmed it is alive |
+| `slot` | `int \| None` | Capacity seat held while picked under a `concurrency_limit`; `None` otherwise |
 | `dedupe_key` | `str \| None` | Optional unique key to prevent duplicate enqueuing |
 
 Jobs are created by calling `Queries.enqueue()` and processed by functions registered
@@ -51,21 +49,21 @@ When a job with `entrypoint="send_email"` is dequeued, PgQueuer calls this funct
         await asyncio.to_thread(cpu_bound_resize, job.payload)
     ```
 
-### Entrypoint Parameters
+### Entrypoint parameters
 
 The `@entrypoint()` decorator accepts several parameters that control how jobs are processed:
 
 | Parameter | Type | Default | Effect |
 |-----------|------|---------|--------|
-| `name` | `str` | (required) | Entrypoint name -- must match what producers enqueue |
+| `name` | `str` | (required) | Entrypoint name; must match what producers enqueue |
 | `concurrency_limit` | `int` | `0` (unlimited) | Max simultaneous jobs for this entrypoint (database-enforced globally). Use `1` for serialized processing |
-| `accepts_context` | `bool` | `False` | Pass a `Context` object as the second argument |
+| `accepts_context` | `bool \| None` | `None` (auto-detect) | Whether to pass a `Context` to the handler. When `None`, auto-detected from the signature (a parameter annotated `Context` receives it); set `True`/`False` to override |
 | `on_failure` | `"delete" \| "hold"` | `"delete"` | Hold failed jobs for manual re-queue instead of deleting |
 | `executor_factory` | callable | `None` | Custom executor class for retry logic, etc. |
 
 ---
 
-## Job Status Lifecycle
+## Job status lifecycle
 
 Every job transitions through a series of states. The status is stored as the
 `pgqueuer_status` PostgreSQL enum with seven values:
@@ -173,11 +171,11 @@ See [Drivers](../reference/drivers.md) for detailed guidance.
 
 These are the two runtime engines inside `PgQueuer`:
 
-- **`QueueManager`** -- listens for NOTIFY events, dequeues job batches with
+- **`QueueManager`**: listens for NOTIFY events, dequeues job batches with
   `FOR UPDATE SKIP LOCKED`, dispatches them to registered entrypoints, and updates
   job status.
 
-- **`SchedulerManager`** -- polls the `pgqueuer_schedules` table, checks which cron
+- **`SchedulerManager`**: polls the `pgqueuer_schedules` table, checks which cron
   expressions are due, and executes the corresponding registered functions.
 
 When you call `pgq run myapp:main`, both managers run concurrently in the same
@@ -185,13 +183,13 @@ asyncio event loop.
 
 ---
 
-## Database Tables
+## Database tables
 
 PgQueuer creates four tables:
 
 | Table | Purpose |
 |-------|---------|
-| `pgqueuer` | Active job queue -- rows are INSERT'd by producers and UPDATE'd/DELETE'd by workers |
+| `pgqueuer` | Active job queue; rows are INSERT'd by producers and UPDATE'd/DELETE'd by workers |
 | `pgqueuer_log` | Append-only audit trail of completed jobs (with traceback for failed jobs) |
 | `pgqueuer_statistics` | Aggregated processing statistics per entrypoint |
 | `pgqueuer_schedules` | Cron schedule definitions and last-run timestamps |
@@ -201,11 +199,10 @@ See [Database Setup](../reference/database-setup.md) for full schema details and
 
 ---
 
-## Next Steps
+## Next steps
 
-Now that you understand the building blocks:
-
-- **[Scheduling](../guides/scheduling.md)** -- set up cron-style recurring tasks
-- **[Concurrency Control](../guides/rate-limiting.md)** -- limit parallel job execution
-- **[Reliability](../guides/reliability.md)** -- retries, idempotency, and audit trails
-- **[Deployment](../guides/deployment.md)** -- run workers in production
+- **[Row Locking & SKIP LOCKED](../reference/skip-locked.md)**: how workers claim jobs without colliding
+- **[Scheduling](../guides/scheduling.md)**: set up cron-style recurring tasks
+- **[Concurrency Control](../guides/concurrency-control.md)**: limit parallel job execution
+- **[Reliability](../guides/reliability.md)**: retries, idempotency, and audit trails
+- **[Deployment](../guides/deployment.md)**: run workers in production

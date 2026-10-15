@@ -117,7 +117,7 @@ async def test_on_listener_health_check_fires_on_healthy_check() -> None:
     ) -> HealthCheckEvent:
         return cast(HealthCheckEvent, None)
 
-    pq.qm.listener_healthy = _ok_listener_healthy  # type: ignore[method-assign]
+    pq.qm.listener_healthy = _ok_listener_healthy
 
     async def _stop_after_one() -> None:
         await asyncio.sleep(0.05)
@@ -146,7 +146,7 @@ async def test_on_listener_health_check_fires_on_failure() -> None:
     ) -> HealthCheckEvent:
         raise errors.FailingListenerError
 
-    pq.qm.listener_healthy = _broken_listener_healthy  # type: ignore[method-assign]
+    pq.qm.listener_healthy = _broken_listener_healthy
 
     with pytest.raises(errors.FailingListenerError):
         await pq.qm._run_periodic_health_check(interval=timedelta(milliseconds=10))

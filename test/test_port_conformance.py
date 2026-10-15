@@ -18,8 +18,10 @@ def test_queries_has_queue_repository_methods() -> None:
         "mark_job_as_cancelled",
         "update_heartbeat",
         "queued_work",
+        "eligible_queued_work",
         "queue_log",
         "job_status",
+        "aggregate_logs",
     }
     assert required <= set(dir(Queries))
 
@@ -65,8 +67,10 @@ def test_inmemory_has_queue_repository_methods() -> None:
         "mark_job_as_cancelled",
         "update_heartbeat",
         "queued_work",
+        "eligible_queued_work",
         "queue_log",
         "job_status",
+        "aggregate_logs",
     }
     assert required <= set(dir(InMemoryQueries))
 
@@ -98,6 +102,50 @@ def test_inmemory_has_schema_management_methods() -> None:
         "table_has_column",
         "table_has_index",
         "has_user_defined_enum",
+    }
+    assert required <= set(dir(InMemoryQueries))
+
+
+def test_queries_has_insights_repository_methods() -> None:
+    required = {
+        "queue_size",
+        "queue_age",
+        "job_duration_percentiles",
+        "throughput_summary",
+        "throughput_timeseries",
+        "log_statistics",
+        "active_workers",
+        "stale_jobs",
+        "exception_logs",
+        "list_failed_jobs",
+        "browse_queue",
+        "queue_job_by_id",
+        "job_log_history",
+        "unaggregated_log_count",
+        "schema_info",
+        "peek_schedule",
+    }
+    assert required <= set(dir(Queries))
+
+
+def test_inmemory_has_insights_repository_methods() -> None:
+    required = {
+        "queue_size",
+        "queue_age",
+        "job_duration_percentiles",
+        "throughput_summary",
+        "throughput_timeseries",
+        "log_statistics",
+        "active_workers",
+        "stale_jobs",
+        "exception_logs",
+        "list_failed_jobs",
+        "browse_queue",
+        "queue_job_by_id",
+        "job_log_history",
+        "unaggregated_log_count",
+        "schema_info",
+        "peek_schedule",
     }
     assert required <= set(dir(InMemoryQueries))
 

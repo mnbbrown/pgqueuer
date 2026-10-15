@@ -1,9 +1,9 @@
 # Deployment Patterns
 
-PgQueuer requires no message broker, Redis instance, or additional infrastructure — just
+PgQueuer requires no message broker, Redis instance, or additional infrastructure, just
 PostgreSQL. This page covers how to run workers in production.
 
-## Single Worker Process
+## Single worker process
 
 The simplest deployment: one process, one `QueueManager`.
 
@@ -32,10 +32,32 @@ async def main():
 pgq run myapp:main
 ```
 
+To start the same worker from your own code instead of the CLI, call `pgqueuer.run`. It
+takes the factory (or its `module:attr` path) and the same options as `pgq run`, as
+keyword arguments:
+
+```python
+import asyncio
+import pgqueuer
+
+asyncio.run(pgqueuer.run("myapp:main", batch_size=20))
+```
+
+Inside an application that already handles signals, pass your own `shutdown` event.
+`pgqueuer.run` then leaves SIGINT and SIGTERM alone and stops when the event is set:
+
+```python
+shutdown = asyncio.Event()
+worker = asyncio.create_task(pgqueuer.run(main, shutdown=shutdown))
+...
+shutdown.set()
+await worker
+```
+
 This is sufficient for most workloads. A single `QueueManager` handles multiple entrypoints
 concurrently via asyncio.
 
-## Horizontal Scaling
+## Horizontal scaling
 
 Run multiple worker processes against the same PostgreSQL database. PgQueuer uses
 `FOR UPDATE SKIP LOCKED` in every dequeue query, so workers never claim the same job:
@@ -55,7 +77,7 @@ Run multiple worker processes against the same PostgreSQL database. PgQueuer use
 
 Each worker:
 - Listens on the same `ch_pgqueuer` channel independently
-- Claims jobs atomically — no coordinator or leader election needed
+- Claims jobs atomically; no coordinator or leader election needed
 - Can run on separate VMs, containers, or processes on the same host
 
 **Starting multiple workers:**
@@ -73,7 +95,7 @@ pgq run myapp:main &
 pgq run myapp:main
 ```
 
-## One Process per CPU Core
+## One process per CPU core
 
 For CPU-bound workloads, run one worker per core to avoid GIL contention in Python:
 
@@ -88,7 +110,7 @@ wait
 For IO-bound workloads (HTTP calls, database queries), a single asyncio process typically
 saturates a database connection before needing additional processes.
 
-## Process Supervision
+## Process supervision
 
 Use a supervisor to restart workers on crash.
 
@@ -146,12 +168,33 @@ LISTEN connection causes a clean restart rather than silent degradation:
   worker = "pgq run myapp:main --shutdown-on-listener-failure"
 ```
 
-## Graceful Shutdown
+## Connection loss
+
+PgQueuer does not reconnect a dropped connection itself. A worker recovers by exiting and
+starting again with a new connection:
+
+- `--shutdown-on-listener-failure` makes the worker exit when its connection stops working.
+  Every 10 s the worker sends a NOTIFY on its own channel and waits for it to come back
+  through LISTEN. If the NOTIFY can't be sent, or doesn't arrive within 10 s, the worker exits.
+  A dead connection is noticed within about 20 s.
+- `--restart-on-failure`, or a process supervisor, starts the worker again. With `pgq run`
+  the factory runs again, so it opens a new connection.
+
+Without `--shutdown-on-listener-failure`, a dead connection is only noticed at the worker's
+next query, which can be up to `--dequeue-timeout` (30 s) away. With an asyncpg pool, a dead
+LISTEN connection is never noticed: the worker keeps running, but only picks up jobs by polling
+every `--dequeue-timeout`.
+
+Jobs running when the connection drops still finish, but their results can't be saved, so they
+run again after `--heartbeat-timeout`. Keep jobs idempotent.
+
+## Graceful shutdown
 
 `pgq run` handles `SIGTERM` and `SIGINT`. On receiving a signal:
 
 1. Stop accepting new jobs from the queue.
-2. Wait for in-flight jobs to complete (up to a configurable drain period).
+2. Wait for in-flight jobs to finish. PgQueuer has no built-in drain timeout; it awaits
+   running jobs to completion, so bound the wait via your orchestrator (see below).
 3. Exit cleanly.
 
 Container orchestrators (Kubernetes, Fly.io, ECS) send `SIGTERM` before `SIGKILL`, so
@@ -161,22 +204,37 @@ in-flight jobs finish provided the `terminationGracePeriodSeconds` is long enoug
     Set `terminationGracePeriodSeconds` to at least the 95th-percentile runtime of your
     longest job plus a 30-second buffer.
 
-## Schema Migrations on Deploy
+## Schema migrations on deploy
 
 Run `pgq upgrade` before deploying new application code. It is safe to run against a live
-database — migrations are additive and non-destructive:
+database and never drops a table or a column:
 
 ```bash
 # Deploy workflow
+pgq upgrade --plan   # optional: review the delta first
 pgq upgrade          # apply schema changes
 # then roll out new workers
 ```
 
-`pgq upgrade` is idempotent: running it multiple times produces no side effects.
+`pgq upgrade` compares the installed schema against what the release declares and applies
+the delta for *that* database, rather than replaying a migration history. Run again on a
+current database, it applies nothing and reports `PgQueuer schema is already up to date.`
 
-## Environment Configuration
+Anything it will not do on its own is printed as a `note:` line on stderr. A column an
+older release left behind is reported, never dropped -- it holds data, and discarding it
+is your call. Worth reading the notes on the first upgrade after a long gap.
 
-PgQueuer reads standard PostgreSQL environment variables:
+One class of note is about what the upgrade *will* do: converting a column type rewrites
+the table under `ACCESS EXCLUSIVE`, blocking the queue for the duration. Only a database
+still on `int4` ids or the pre-v0.27 statistics enum hits it, and `pgq upgrade --plan`
+says so before you commit to the window.
+
+Concurrent upgrades serialize on an advisory lock. It is session-scoped, so hold schema
+changes on a single connection; see [`pgq upgrade`](../reference/cli.md#upgrade).
+
+## Environment configuration
+
+The database drivers read standard PostgreSQL environment variables:
 
 | Variable | Purpose |
 |----------|---------|
@@ -185,7 +243,12 @@ PgQueuer reads standard PostgreSQL environment variables:
 | `PGUSER` | Database user |
 | `PGPASSWORD` | Database password |
 | `PGDATABASE` | Database name |
-| `PGQUEUER_PREFIX` | Prefix for table/channel names (default `pgqueuer`) |
+| `PGQUEUER_PREFIX` | Prefix prepended to table/channel names (default: empty; names default to `pgqueuer`, `ch_pgqueuer`, etc.) |
+| `PGQUEUER_SCHEMA` | Postgres schema holding all PgQueuer objects (default: unset; objects are resolved via the connection's `search_path`) |
+| `PGQUEUER_DURABILITY` | Durability level the schema is declared at: `volatile`, `balanced`, or `durable` (default). `pgq upgrade` reports a table that differs; `pgq durability` changes it |
+
+PgQueuer reads the `PGQUEUER_*` variables once per process, on first use, so set
+them before the process starts.
 
 Use `PGQUEUER_PREFIX` to run multiple isolated PgQueuer instances in the same database:
 
@@ -194,7 +257,15 @@ PGQUEUER_PREFIX=billing pgq install
 PGQUEUER_PREFIX=billing pgq run billing_app:main
 ```
 
-## Deployment Checklist
+Use `PGQUEUER_SCHEMA` to keep PgQueuer objects in a dedicated schema; workers must
+run with the same value the objects were installed with:
+
+```bash
+PGQUEUER_SCHEMA=pgq pgq install
+PGQUEUER_SCHEMA=pgq pgq run my_app:main
+```
+
+## Deployment checklist
 
 - [ ] `pgq install` run once against the target database
 - [ ] `pgq autovac` applied after installation

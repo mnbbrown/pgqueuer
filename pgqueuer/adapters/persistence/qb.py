@@ -1,345 +1,128 @@
-"""
-Database query builder and executor for job queue operations.
-
-This module provides classes and functions to construct and execute SQL queries
-related to job queuing, such as installing the necessary database schema,
-enqueueing and dequeueing jobs, logging job statuses, and managing job statistics.
-It abstracts the SQL details and offers a high-level interface for interacting
-with the database in the context of the pgqueuer application.
-"""
-
 from __future__ import annotations
 
 import dataclasses
+from datetime import timedelta
 from typing import Generator
 
+from typing_extensions import assert_never
+
+from pgqueuer.adapters.persistence import schema_ddl
+from pgqueuer.adapters.persistence.composer import ComposedQuery, SqlComposer
+from pgqueuer.domain.schema.queue import dedupe_predicate
+from pgqueuer.domain.schema.statistics import UNIQUE_COUNT_KEY
 from pgqueuer.domain.settings import (
     DBSettings,
     Durability,
     DurabilityPolicy,
-    add_prefix,
+    QualifiedNames,
+    db_settings,
 )
-from pgqueuer.domain.types import SortOrder
+from pgqueuer.domain.types import (
+    OnConflict,
+    QueueEntrypoint,
+    QueueManagerId,
+    SortOrder,
+)
 
 # Re-export for backward compatibility within the adapter layer
 __all__ = [
     "DBSettings",
     "Durability",
     "DurabilityPolicy",
+    "QualifiedNames",
     "QueryBuilderEnvironment",
     "QueryQueueBuilder",
     "QuerySchedulerBuilder",
-    "add_prefix",
 ]
 
 
 @dataclasses.dataclass
 class QueryBuilderEnvironment:
-    """
-    Setup/teardown environment for executing queries.
+    """DDL/utility query builder bound to a :class:`DBSettings`."""
 
-    Handles the configuration required for executing SQL queries, ensuring
-    consistent settings are applied during setup and teardown operations.
-    """
+    settings: DBSettings = dataclasses.field(default_factory=db_settings)
 
-    settings: DBSettings = dataclasses.field(default_factory=DBSettings)
+    @property
+    def qualified(self) -> QualifiedNames:
+        return self.settings.qualified
 
-    def build_install_query(self) -> str:
-        """
-        Generate SQL statements to install the job queue schema.
-
-        Constructs the SQL commands needed to set up the database schema required
-        by the job queue system. This includes creating custom ENUM types for statuses,
-        creating the queue and statistics tables, defining indexes to optimize queries,
-        and setting up triggers and functions for notifications.
-
-        Returns:
-            str: A string containing the SQL commands to install the schema.
-        """
-        durability_policy = self.settings.durability.config
-
-        return f"""CREATE TYPE {self.settings.queue_status_type} AS ENUM ('queued', 'picked', 'successful', 'exception', 'canceled', 'deleted', 'failed');
-    CREATE {durability_policy.queue_table} TABLE {self.settings.queue_table} (
-        id SERIAL PRIMARY KEY,
-        priority INT NOT NULL,
-        queue_manager_id UUID,
-        created TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        updated TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        heartbeat TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        execute_after TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        status {self.settings.queue_status_type} NOT NULL,
-        entrypoint TEXT NOT NULL,
-        dedupe_key TEXT,
-        serialize_key TEXT,
-        payload BYTEA,
-        headers JSONB,
-        attempts INT NOT NULL DEFAULT 0
-    );
-    CREATE INDEX {self.settings.queue_table}_priority_id_id1_idx ON {self.settings.queue_table} (priority ASC, id DESC)
-        INCLUDE (id) WHERE status = 'queued';
-    CREATE INDEX {self.settings.queue_table}_updated_id_id1_idx ON {self.settings.queue_table} (updated ASC, id DESC)
-        INCLUDE (id) WHERE status = 'picked';
-    CREATE INDEX {self.settings.queue_table}_queue_manager_id_idx ON {self.settings.queue_table} (queue_manager_id)
-        WHERE queue_manager_id IS NOT NULL;
-    CREATE UNIQUE INDEX IF NOT EXISTS {self.settings.queue_table}_unique_dedupe_key ON
-        {self.settings.queue_table} (dedupe_key) WHERE ((status IN ('queued', 'picked') AND dedupe_key IS NOT NULL));
-    -- Per-key serialization: at most one picked per (entrypoint, serialize_key).
-    -- Acts as a safety net behind the dispatch-level NOT EXISTS check.
-    CREATE UNIQUE INDEX IF NOT EXISTS {self.settings.queue_table}_picked_serialize_key_idx ON
-        {self.settings.queue_table} (entrypoint, serialize_key) WHERE (status = 'picked' AND serialize_key IS NOT NULL);
-    -- Powers the FIFO leader-lookup in the dispatch query (priority-aware).
-    CREATE INDEX IF NOT EXISTS {self.settings.queue_table}_queued_serialize_key_idx ON
-        {self.settings.queue_table} (entrypoint, serialize_key, priority DESC, id ASC) WHERE (status = 'queued' AND serialize_key IS NOT NULL);
-
-    CREATE {durability_policy.queue_log_table} TABLE {self.settings.queue_table_log} (
-        id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-        created TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        job_id BIGINT NOT NULL,
-        status {self.settings.queue_status_type} NOT NULL,
-        priority INT NOT NULL,
-        entrypoint TEXT NOT NULL,
-        traceback JSONB DEFAULT NULL,
-        aggregated BOOLEAN DEFAULT FALSE
-    );
-    CREATE INDEX {self.settings.queue_table_log}_not_aggregated ON {self.settings.queue_table_log} ((1)) WHERE not aggregated;
-    CREATE INDEX {self.settings.queue_table_log}_created ON {self.settings.queue_table_log} (created);
-    CREATE INDEX {self.settings.queue_table_log}_status ON {self.settings.queue_table_log} (status);
-    CREATE INDEX {self.settings.queue_table_log}_job_id_status ON {self.settings.queue_table_log} (job_id, created DESC);
-
-    CREATE {durability_policy.statistics_table} TABLE {self.settings.statistics_table} (
-        id SERIAL PRIMARY KEY,
-        created TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT DATE_TRUNC('sec', NOW() at time zone 'UTC'),
-        count BIGINT NOT NULL,
-        priority INT NOT NULL,
-        status {self.settings.queue_status_type} NOT NULL,
-        entrypoint TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX {self.settings.statistics_table}_unique_count ON {self.settings.statistics_table} (
-        priority,
-        DATE_TRUNC('sec', created at time zone 'UTC'),
-        status,
-        entrypoint
-    );
-
-    CREATE {durability_policy.schedules_table} TABLE {self.settings.schedules_table} (
-        id SERIAL PRIMARY KEY,
-        expression TEXT NOT NULL, -- Crontab-like schedule definition (e.g., '* * * * *')
-        entrypoint TEXT NOT NULL,
-        heartbeat TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        created TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        updated TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        next_run TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        last_run TIMESTAMP WITH TIME ZONE,
-        status {self.settings.queue_status_type} DEFAULT 'queued',
-        UNIQUE (expression, entrypoint)
-    );
-
-    CREATE FUNCTION {self.settings.function}() RETURNS TRIGGER AS $$
-    DECLARE
-        to_emit BOOLEAN := false;  -- Flag to decide whether to emit a notification
-    BEGIN
-        -- Check operation type and set the emit flag accordingly
-        IF TG_OP = 'UPDATE' AND OLD IS DISTINCT FROM NEW THEN
-            to_emit := true;
-        ELSIF TG_OP = 'DELETE' THEN
-            to_emit := true;
-        ELSIF TG_OP = 'INSERT' THEN
-            to_emit := true;
-        ELSIF TG_OP = 'TRUNCATE' THEN
-            to_emit := true;
-        END IF;
-
-        -- Perform notification if the emit flag is set
-        IF to_emit THEN
-            PERFORM pg_notify(
-                '{self.settings.channel}',
-                json_build_object(
-                    'channel', '{self.settings.channel}',
-                    'operation', lower(TG_OP),
-                    'sent_at', NOW(),
-                    'table', TG_TABLE_NAME,
-                    'type', 'table_changed_event'
-                )::text
-            );
-        END IF;
-
-        -- Return appropriate value based on the operation
-        IF TG_OP IN ('INSERT', 'UPDATE') THEN
-            RETURN NEW;
-        ELSIF TG_OP = 'DELETE' THEN
-            RETURN OLD;
-        ELSE
-            RETURN NULL; -- For TRUNCATE and other non-row-specific contexts
-        END IF;
-
-    END;
-    $$ LANGUAGE plpgsql;
-
-    CREATE TRIGGER {self.settings.trigger}
-    AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON {self.settings.queue_table}
-    EXECUTE FUNCTION {self.settings.function}();
-        """  # noqa: E501
+    def build_install_query(self, create_schema: bool = True) -> str:
+        """DDL: schema (optional), types, tables, indexes, trigger, and notify function."""
+        return schema_ddl.render_install(self.settings, create_schema=create_schema)
 
     def build_uninstall_query(self) -> str:
-        return f"""DROP TRIGGER    IF EXISTS   {self.settings.trigger} ON {self.settings.queue_table};
-    DROP FUNCTION   IF EXISTS   {self.settings.function};
-    DROP TABLE      IF EXISTS   {self.settings.queue_table};
-    DROP TABLE      IF EXISTS   {self.settings.statistics_table};
-    DROP TABLE      IF EXISTS   {self.settings.schedules_table};
-    DROP TABLE      IF EXISTS   {self.settings.queue_table_log};
-    DROP TYPE       IF EXISTS   {self.settings.queue_status_type};
-    DROP TYPE       IF EXISTS   {add_prefix("pgqueuer_statistics_status")};
-    """  # noqa
-
-    def build_upgrade_queries(self) -> Generator[str, None, None]:
-        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS updated TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();"  # noqa: E501
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table}_updated_id_id1_idx ON {self.settings.queue_table} (updated ASC, id DESC) INCLUDE (id) WHERE status = 'picked';"  # noqa: E501
-        yield f"""CREATE OR REPLACE FUNCTION {self.settings.function}() RETURNS TRIGGER AS $$
-    DECLARE
-        to_emit BOOLEAN := false;  -- Flag to decide whether to emit a notification
-    BEGIN
-        -- Check operation type and set the emit flag accordingly
-        IF TG_OP = 'UPDATE' AND OLD IS DISTINCT FROM NEW THEN
-            to_emit := true;
-        ELSIF TG_OP = 'DELETE' THEN
-            to_emit := true;
-        ELSIF TG_OP = 'INSERT' THEN
-            to_emit := true;
-        ELSIF TG_OP = 'TRUNCATE' THEN
-            to_emit := true;
-        END IF;
-
-        -- Perform notification if the emit flag is set
-        IF to_emit THEN
-            PERFORM pg_notify(
-                '{self.settings.channel}',
-                json_build_object(
-                    'channel', '{self.settings.channel}',
-                    'operation', lower(TG_OP),
-                    'sent_at', NOW(),
-                    'table', TG_TABLE_NAME,
-                    'type', 'table_changed_event'
-                )::text
-            );
-        END IF;
-
-        -- Return appropriate value based on the operation
-        IF TG_OP IN ('INSERT', 'UPDATE') THEN
-            RETURN NEW;
-        ELSIF TG_OP = 'DELETE' THEN
-            RETURN OLD;
-        ELSE
-            RETURN NULL; -- For TRUNCATE and other non-row-specific contexts
-        END IF;
-
-    END;
-    $$ LANGUAGE plpgsql;"""
-        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS heartbeat TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();"  # noqa: E501
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table}_heartbeat_id_id1_idx ON {self.settings.queue_table} (heartbeat ASC, id DESC) INCLUDE (id) WHERE status = 'picked';"  # noqa: E501
-        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS queue_manager_id UUID;"  # noqa: E501
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table}_queue_manager_id_idx ON {self.settings.queue_table} (queue_manager_id) WHERE queue_manager_id IS NOT NULL;"  # noqa: E501
-        yield f"""CREATE TABLE IF NOT EXISTS {self.settings.schedules_table} (
-        id SERIAL PRIMARY KEY,
-        expression TEXT NOT NULL, -- Crontab-like schedule definition (e.g., '* * * * *')
-        entrypoint TEXT NOT NULL,
-        heartbeat TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        created TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        updated TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        next_run TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        last_run TIMESTAMP WITH TIME ZONE,
-        status {self.settings.queue_status_type} DEFAULT 'queued',
-        UNIQUE (expression, entrypoint)
-    );"""
-        yield f"""ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS execute_after TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();"""  # noqa: E501
-        yield f"ALTER TYPE {self.settings.queue_status_type} ADD VALUE IF NOT EXISTS 'successful';"  # noqa: E501
-        yield f"ALTER TYPE {self.settings.queue_status_type} ADD VALUE IF NOT EXISTS 'exception';"  # noqa: E501
-        yield f"ALTER TYPE {self.settings.queue_status_type} ADD VALUE IF NOT EXISTS 'canceled';"  # noqa: E501
-        yield f"ALTER TYPE {self.settings.queue_status_type} ADD VALUE IF NOT EXISTS 'deleted';"  # noqa: E501
-        yield f"ALTER TABLE {self.settings.statistics_table} ALTER COLUMN status TYPE {self.settings.queue_status_type} USING status::TEXT::pgqueuer_status;"  # noqa
-        yield f"""CREATE UNLOGGED TABLE IF NOT EXISTS {self.settings.queue_table_log} (
-        id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-        created TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-        job_id BIGINT NOT NULL,
-        status {self.settings.queue_status_type} NOT NULL,
-        priority INT NOT NULL,
-        entrypoint TEXT NOT NULL,
-        aggregated BOOLEAN DEFAULT FALSE
-    );"""
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table_log}_not_aggregated ON {self.settings.queue_table_log} ((1)) WHERE not aggregated;"  # noqa
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table_log}_created ON {self.settings.queue_table_log} (created);"  # noqa
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table_log}_status ON {self.settings.queue_table_log} (status);"  # noqa
-        yield f"ALTER TABLE {self.settings.queue_table_log} ADD COLUMN IF NOT EXISTS traceback JSONB DEFAULT NULL;"  # noqa: E501
-        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS dedupe_key TEXT DEFAULT NULL;"  # noqa: E501
-        yield f"CREATE UNIQUE INDEX IF NOT EXISTS {self.settings.queue_table}_unique_dedupe_key ON {self.settings.queue_table} (dedupe_key) WHERE ((status IN ('queued', 'picked') AND dedupe_key IS NOT NULL));"  # noqa
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table_log}_job_id_status ON {self.settings.queue_table_log} (job_id, created DESC);"  # noqa: E501
-        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS headers JSONB;"  # noqa: E501
-        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;"  # noqa: E501
-        yield f"ALTER TYPE {self.settings.queue_status_type} ADD VALUE IF NOT EXISTS 'failed';"  # noqa: E501
-        yield f"ALTER TABLE {self.settings.queue_table} ADD COLUMN IF NOT EXISTS serialize_key TEXT DEFAULT NULL;"  # noqa: E501
-        yield f"CREATE UNIQUE INDEX IF NOT EXISTS {self.settings.queue_table}_picked_serialize_key_idx ON {self.settings.queue_table} (entrypoint, serialize_key) WHERE (status = 'picked' AND serialize_key IS NOT NULL);"  # noqa: E501
-        yield f"CREATE INDEX IF NOT EXISTS {self.settings.queue_table}_queued_serialize_key_idx ON {self.settings.queue_table} (entrypoint, serialize_key, priority DESC, id ASC) WHERE (status = 'queued' AND serialize_key IS NOT NULL);"  # noqa: E501
+        return schema_ddl.render_uninstall(self.settings)
 
     def build_table_has_column_query(self) -> str:
-        return """SELECT EXISTS (
+        return f"""SELECT EXISTS (
         SELECT FROM information_schema.columns
         WHERE
-                table_schema = current_schema()
+                table_schema = {self.settings.schema_expr}
             AND table_name = $1
             AND column_name = $2
         );"""
 
     def build_table_has_index_query(self) -> str:
-        return """SELECT EXISTS (
+        return f"""SELECT EXISTS (
             SELECT 1
             FROM pg_indexes
             WHERE
                     tablename  = $1
                 AND indexname  = $2
-                AND schemaname = current_schema()
+                AND schemaname = {self.settings.schema_expr}
         );
         """
 
     def build_has_table_query(self) -> str:
-        return """SELECT EXISTS (
+        return f"""SELECT EXISTS (
         SELECT FROM information_schema.columns
         WHERE
-                table_schema = current_schema()
+                table_schema = {self.settings.schema_expr}
             AND table_name = $1
         );"""
 
     def build_has_function_query(self) -> str:
-        return """SELECT EXISTS (
+        return f"""SELECT EXISTS (
             SELECT 1
             FROM pg_proc p
             JOIN pg_namespace n ON p.pronamespace = n.oid
-            WHERE n.nspname = current_schema()
+            WHERE n.nspname = {self.settings.schema_expr}
               AND p.proname = $1
         );"""
 
     def build_has_trigger_query(self) -> str:
-        return """SELECT EXISTS (
+        return f"""SELECT EXISTS (
             SELECT 1
             FROM pg_trigger t
             JOIN pg_class c ON t.tgrelid = c.oid
             JOIN pg_namespace n ON c.relnamespace = n.oid
-            WHERE n.nspname = current_schema()
+            WHERE n.nspname = {self.settings.schema_expr}
               AND t.tgname = $1
         );"""
 
     def build_user_types_query(self) -> str:
+        # Unfiltered when db_schema is unset: the pre-schema behavior scanned
+        # every schema, and narrowing it here would change what upgrade sees
+        # on search_path-based installs.
+        if self.settings.db_schema:
+            return f"""SELECT enumlabel, typname
+    FROM pg_enum
+    JOIN pg_type ON pg_enum.enumtypid = pg_type.oid
+    JOIN pg_namespace ON pg_type.typnamespace = pg_namespace.oid
+    WHERE pg_namespace.nspname = {self.settings.schema_expr}"""
         return """SELECT enumlabel, typname
     FROM pg_enum
     JOIN pg_type ON pg_enum.enumtypid = pg_type.oid"""
 
     def build_alter_durability_query(self) -> Generator[str, None, None]:
         durability = self.settings.durability.config
-        yield f"""ALTER TABLE {self.settings.queue_table} SET {"LOGGED" if durability.queue_table == "" else "UNLOGGED"};"""  # noqa
-        yield f"""ALTER TABLE {self.settings.queue_table_log} SET {"LOGGED" if durability.queue_log_table == "" else "UNLOGGED"};"""  # noqa
-        yield f"""ALTER TABLE {self.settings.statistics_table} SET {"LOGGED" if durability.statistics_table == "" else "UNLOGGED"};"""  # noqa
-        yield f"""ALTER TABLE {self.settings.schedules_table} SET {"LOGGED" if durability.schedules_table == "" else "UNLOGGED"};"""  # noqa
+        yield f"""ALTER TABLE {self.qualified.queue_table} SET {"LOGGED" if durability.queue_table == "" else "UNLOGGED"};"""  # noqa
+        yield f"""ALTER TABLE {self.qualified.queue_table_log} SET {"LOGGED" if durability.queue_log_table == "" else "UNLOGGED"};"""  # noqa
+        yield f"""ALTER TABLE {self.qualified.statistics_table} SET {"LOGGED" if durability.statistics_table == "" else "UNLOGGED"};"""  # noqa
+        yield f"""ALTER TABLE {self.qualified.schedules_table} SET {"LOGGED" if durability.schedules_table == "" else "UNLOGGED"};"""  # noqa
 
     def build_optimize_autovacuum_query(self) -> str:
-        return f"""ALTER TABLE {self.settings.queue_table} SET (
+        return f"""ALTER TABLE {self.qualified.queue_table} SET (
     autovacuum_vacuum_scale_factor   = 0.01,
     autovacuum_vacuum_threshold      = 1000,
     autovacuum_analyze_scale_factor  = 0.02,
@@ -349,7 +132,7 @@ class QueryBuilderEnvironment:
     fillfactor                       = 70
 );
 
-ALTER TABLE {self.settings.schedules_table} SET (
+ALTER TABLE {self.qualified.schedules_table} SET (
 autovacuum_vacuum_scale_factor   = 0.01,
 autovacuum_vacuum_threshold      = 1000,
 autovacuum_analyze_scale_factor  = 0.02,
@@ -359,14 +142,14 @@ autovacuum_vacuum_cost_delay     = 0,
 fillfactor                       = 70
 );
 
-ALTER TABLE {self.settings.queue_table_log} SET (
+ALTER TABLE {self.qualified.queue_table_log} SET (
     autovacuum_vacuum_scale_factor   = 0.95,
     autovacuum_vacuum_threshold      = 1000000,
     autovacuum_analyze_scale_factor  = 0.05,
     autovacuum_analyze_threshold     = 10000
 );
 
-ALTER TABLE {self.settings.statistics_table} SET (
+ALTER TABLE {self.qualified.statistics_table} SET (
     autovacuum_vacuum_scale_factor   = 0.95,
     autovacuum_vacuum_threshold      = 1000000,
     autovacuum_analyze_scale_factor  = 0.05,
@@ -374,7 +157,7 @@ ALTER TABLE {self.settings.statistics_table} SET (
 );"""
 
     def build_optimize_autovacuum_rollback_query(self) -> str:
-        return f"""ALTER TABLE {self.settings.queue_table} RESET (
+        return f"""ALTER TABLE {self.qualified.queue_table} RESET (
     autovacuum_vacuum_scale_factor,
     autovacuum_vacuum_threshold,
     autovacuum_analyze_scale_factor,
@@ -384,7 +167,7 @@ ALTER TABLE {self.settings.statistics_table} SET (
     fillfactor
 );
 
-ALTER TABLE {self.settings.schedules_table} RESET (
+ALTER TABLE {self.qualified.schedules_table} RESET (
 autovacuum_vacuum_scale_factor,
 autovacuum_vacuum_threshold,
 autovacuum_analyze_scale_factor,
@@ -394,14 +177,14 @@ autovacuum_vacuum_cost_delay,
 fillfactor
 );
 
-ALTER TABLE {self.settings.queue_table_log} RESET (
+ALTER TABLE {self.qualified.queue_table_log} RESET (
     autovacuum_vacuum_scale_factor,
     autovacuum_vacuum_threshold,
     autovacuum_analyze_scale_factor,
     autovacuum_analyze_threshold
 );
 
-ALTER TABLE {self.settings.statistics_table} RESET (
+ALTER TABLE {self.qualified.statistics_table} RESET (
     autovacuum_vacuum_scale_factor,
     autovacuum_vacuum_threshold,
     autovacuum_analyze_scale_factor,
@@ -411,176 +194,868 @@ ALTER TABLE {self.settings.statistics_table} RESET (
 
 @dataclasses.dataclass
 class QueryQueueBuilder:
-    settings: DBSettings = dataclasses.field(default_factory=DBSettings)
+    settings: DBSettings = dataclasses.field(default_factory=db_settings)
+    # Rendered dequeue SQL per (capacity-gated, budget-gated) shape. The bind
+    # order is fixed per shape, so cached text pairs with freshly bound args.
+    dequeue_sql_cache: dict[tuple[bool, bool], str] = dataclasses.field(default_factory=dict)
 
-    def build_dequeue_query(self) -> str:
-        t = self.settings.queue_table
-        t_log = self.settings.queue_table_log
-        # The per-key clause excludes a candidate row q when its (entrypoint,
-        # serialize_key) is "blocked": either another job with the same key is
-        # already 'picked', OR another eligible queued peer with the same key
-        # has earlier priority/id under the (priority DESC, id ASC) ordering.
-        # Future and failed jobs are outside the active dispatch lane.
-        # Short-circuits to false for entrypoints with the flag off, or for rows
-        # with NULL serialize_key.
-        per_key_block = f"""(
-          p.serialize_dispatch_per_key
-          AND q.serialize_key IS NOT NULL
-          AND EXISTS (
-              SELECT 1 FROM {t} other
-              WHERE other.entrypoint = q.entrypoint
-                AND other.serialize_key = q.serialize_key
-                AND other.id <> q.id
-                AND (
-                    other.status = 'picked'
-                    OR (
-                        other.status = 'queued'
-                        AND other.execute_after < NOW()
-                        AND (
-                            other.priority > q.priority
-                            OR (other.priority = q.priority AND other.id < q.id)
-                        )
-                    )
+    @property
+    def qualified(self) -> QualifiedNames:
+        return self.settings.qualified
+
+    def build_dequeue_query(
+        self,
+        *,
+        batch_size: int,
+        entrypoints: list[QueueEntrypoint],
+        concurrency_limits: list[int],
+        queue_manager_id: QueueManagerId,
+        global_concurrency_limit: int | None,
+        heartbeat_timeout: timedelta,
+        serialize_dispatch_per_key: list[bool] | None = None,
+    ) -> ComposedQuery:
+        """
+        Compose the dequeue statement for the concurrency gates actually in use.
+
+        Gate CTEs are selected from the runtime values: entrypoint capacity
+        machinery only when some ``concurrency_limits`` entry is positive, the
+        per-worker budget only when ``global_concurrency_limit`` is set. A
+        dequeue with no limits configured renders a plain pick-and-claim. The
+        composer pairs the SQL with its argument tuple, so parameter numbering
+        never drifts between query shapes.
+
+        The rendered text is cached per gate shape because dequeue rebuilds
+        its query every busy-loop iteration; values are re-bound on every
+        call, so cached SQL never pins or shares argument objects.
+        """
+        if len(entrypoints) != len(concurrency_limits):
+            raise ValueError("entrypoints and concurrency_limits must be the same length")
+
+        capacity_gated = any(limit > 0 for limit in concurrency_limits)
+        budget_gated = global_concurrency_limit is not None
+
+        composer = SqlComposer()
+        batch = composer.bind(batch_size)
+        eps = composer.bind(list(entrypoints))
+        queue_manager = composer.bind(queue_manager_id)
+        heartbeat = composer.bind(heartbeat_timeout)
+        limits = ""
+        if capacity_gated:
+            limits = composer.bind(list(concurrency_limits))
+
+        global_limit = ""
+        if budget_gated:
+            global_limit = composer.bind(global_concurrency_limit)
+
+        serialized = [
+            entrypoint
+            for entrypoint, enabled in zip(
+                entrypoints, serialize_dispatch_per_key or [False] * len(entrypoints), strict=True
+            )
+            if enabled
+        ]
+        serial_eps = composer.bind(serialized)
+        shape = (capacity_gated, budget_gated)
+        if (cached_sql := self.dequeue_sql_cache.get(shape)) is not None:
+            return ComposedQuery(sql=cached_sql, args=tuple(composer.values))
+
+        queue_table = self.qualified.queue_table
+
+        def key_guard(alias: str) -> str:
+            return f"""AND NOT (
+                {alias}.entrypoint = ANY({serial_eps}::text[])
+                AND {alias}.serialize_key IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM {queue_table} other
+                    WHERE other.entrypoint = {alias}.entrypoint
+                      AND other.serialize_key = {alias}.serialize_key
+                      AND other.id <> {alias}.id
+                      AND (
+                        other.status = 'picked'
+                        OR (other.status = 'queued' AND other.execute_after < NOW()
+                            AND (other.priority > {alias}.priority
+                                 OR (other.priority = {alias}.priority AND other.id < {alias}.id)))
+                      )
                 )
-          )
-      )"""
-        return f"""WITH
--- Unpack per-entrypoint parameters; concurrency_limit 0 means unlimited.
-params AS (
-    SELECT
-        UNNEST($2::text[])    AS entrypoint,
-        UNNEST($3::bigint[])  AS concurrency_limit,
-        UNNEST($7::boolean[]) AS serialize_dispatch_per_key
-),
+            )"""
 
--- Per-entrypoint count of *live* picked jobs (global, all workers).
--- Stale rows (heartbeat timed out) are excluded so a dead worker holding a
--- full batch cannot count against — and thereby block reclaim of — its own
--- slots. See next_stale/next_queued, both gated on this count.
-picked AS (
-    SELECT entrypoint, COUNT(*) AS total
-    FROM {t}
-    WHERE queue_manager_id IS NOT NULL
-      AND entrypoint = ANY($2)
-      AND heartbeat >= NOW() - $6::interval
-    GROUP BY entrypoint
-),
+        if capacity_gated:
+            # The limit comes from the dequeuing worker's own registration, so the
+            # fleet has to agree on it. Workers declaring different limits for one
+            # entrypoint is unsupported; the highest one wins.
+            composer.cte(
+                "params",
+                f"""
+                    SELECT
+                        UNNEST({eps}::text[]) AS entrypoint,
+                        UNNEST({limits}::bigint[]) AS concurrency_limit
+                """,
+                comment="Unpack per-entrypoint parameters; concurrency_limit 0 means unlimited.",
+            )
+            composer.cte(
+                "picked",
+                f"""
+                    SELECT entrypoint, COUNT(*) AS total
+                    FROM {queue_table}
+                    WHERE queue_manager_id IS NOT NULL
+                      AND entrypoint = ANY({eps})
+                    GROUP BY entrypoint
+                """,
+                comment="Per-entrypoint count of picked jobs (global, all workers).",
+            )
+            # Applying the gate here rather than per row keeps a saturated entrypoint
+            # from scanning its queued backlog at all. remaining is NULL for unlimited
+            # entrypoints; otherwise it caps how many rows one dequeue may pick, so a
+            # single statement cannot exceed the entrypoint's concurrency_limit.
+            composer.cte(
+                "available",
+                """
+                    SELECT
+                        params.entrypoint,
+                        CASE
+                            WHEN params.concurrency_limit <= 0 THEN NULL
+                            ELSE params.concurrency_limit - COALESCE(picked.total, 0)
+                        END AS remaining
+                    FROM params
+                    LEFT JOIN picked ON picked.entrypoint = params.entrypoint
+                    WHERE params.concurrency_limit <= 0
+                       OR COALESCE(picked.total, 0) < params.concurrency_limit
+                """,
+                comment="Entrypoints with free capacity; remaining caps a single dequeue.",
+            )
+        else:
+            composer.cte(
+                "available",
+                f"SELECT UNNEST({eps}::text[]) AS entrypoint",
+                comment="No entrypoint carries a concurrency limit; all are available.",
+            )
 
--- This worker's total picked jobs (scalar, for max_concurrent_tasks).
-worker_load AS (
-    SELECT COUNT(*) AS total
-    FROM {t}
-    WHERE queue_manager_id = $4
-      AND entrypoint = ANY($2)
-),
+        # Both gate lines drop out of their block when the budget is unlimited.
+        budget_where = ""
+        budget_and = ""
+        eligible_limit = batch
+        if budget_gated:
+            # headroom, not the total, is what stops a batch overshooting: the total
+            # only says whether a dequeue may start, never how much it may take.
+            composer.cte(
+                "worker_load",
+                f"""
+                    SELECT
+                        COUNT(*) AS total,
+                        GREATEST(LEAST({batch}, {global_limit} - COUNT(*)), 0) AS headroom
+                    FROM {queue_table}
+                    WHERE queue_manager_id = {queue_manager}
+                      AND entrypoint = ANY({eps})
+                """,
+                comment="This worker's picked jobs, and how many more this batch may claim.",
+            )
+            under_budget = f"(SELECT total FROM worker_load) < {global_limit}"
+            budget_where = f"WHERE {under_budget}"
+            budget_and = f"AND {under_budget}"
+            eligible_limit = "(SELECT headroom FROM worker_load)"
 
--- New queued jobs (uses partial index WHERE status = 'queued').
-next_queued AS (
-    SELECT q.id
-    FROM {t} q
-    JOIN      params p  ON p.entrypoint  = q.entrypoint
-    LEFT JOIN picked pk ON pk.entrypoint = q.entrypoint
-    WHERE q.status = 'queued'
-      AND q.execute_after < NOW()
-      AND ($5::BIGINT IS NULL
-           OR (SELECT total FROM worker_load) < $5)
-      AND (p.concurrency_limit <= 0
-           OR COALESCE(pk.total, 0) < p.concurrency_limit)
-      AND NOT {per_key_block}
-    ORDER BY q.priority DESC, q.id ASC
-    FOR UPDATE SKIP LOCKED
-    LIMIT $1
-),
+        if capacity_gated:
+            composer.cte(
+                "unlimited_claims",
+                f"""
+                    SELECT job.id, job.priority, available.entrypoint
+                    FROM available
+                    CROSS JOIN LATERAL (
+                        SELECT candidate.id, candidate.priority
+                        FROM {queue_table} candidate
+                        WHERE candidate.entrypoint = available.entrypoint
+                          AND candidate.status = 'queued'
+                          AND candidate.execute_after < NOW()
+                          {key_guard("candidate")}
+                        ORDER BY candidate.priority DESC, candidate.id ASC
+                        LIMIT {batch}
+                        FOR UPDATE SKIP LOCKED
+                    ) job
+                    WHERE available.remaining IS NULL
+                """,
+                comment="Claims for entrypoints without a limit; lock straight down the backlog.",
+            )
+            # Windowing before the lock keeps the lock node out from under a LIMIT,
+            # where SKIP LOCKED slides down the backlog and past the cap (#761).
+            composer.cte(
+                "limited_claims",
+                f"""
+                    SELECT job.id, job.priority, available.entrypoint
+                    FROM available
+                    CROSS JOIN LATERAL (
+                        SELECT locked.id, locked.priority
+                        FROM (
+                            SELECT candidate.id
+                            FROM {queue_table} candidate
+                            WHERE candidate.entrypoint = available.entrypoint
+                              AND candidate.status = 'queued'
+                              AND candidate.execute_after < NOW()
+                          {key_guard("candidate")}
+                            ORDER BY candidate.priority DESC, candidate.id ASC
+                            LIMIT LEAST({batch}, available.remaining)
+                        ) capped
+                        CROSS JOIN LATERAL (
+                            SELECT target.id, target.priority
+                            FROM {queue_table} target
+                            WHERE target.id = capped.id
+                              AND target.status = 'queued'
+                              AND target.execute_after < NOW()
+                            FOR UPDATE OF target SKIP LOCKED
+                        ) locked
+                        ORDER BY locked.priority DESC, locked.id ASC
+                        LIMIT LEAST({batch}, available.remaining)
+                    ) job
+                    WHERE available.remaining IS NOT NULL
+                """,
+                comment="Claims for limited entrypoints; the window is fixed before the lock.",
+            )
+            queued_comment = "Both claim sets merged into one priority order."
+            queued_body = f"""
+                SELECT job.id, job.priority, job.entrypoint
+                FROM (
+                    SELECT id, priority, entrypoint FROM unlimited_claims
+                    UNION ALL
+                    SELECT id, priority, entrypoint FROM limited_claims
+                ) job
+                {budget_where}
+                ORDER BY job.priority DESC, job.id ASC
+                LIMIT {batch}
+            """
+        else:
+            queued_comment = "New queued jobs; LATERAL hits the (entrypoint, priority, id) index."
+            queued_body = f"""
+                SELECT job.id, job.priority
+                FROM available
+                CROSS JOIN LATERAL (
+                    SELECT candidate.id, candidate.priority
+                    FROM {queue_table} candidate
+                    WHERE candidate.entrypoint = available.entrypoint
+                      AND candidate.status = 'queued'
+                      AND candidate.execute_after < NOW()
+                          {key_guard("candidate")}
+                    ORDER BY candidate.priority DESC, candidate.id ASC
+                    LIMIT {batch}
+                    FOR UPDATE SKIP LOCKED
+                ) job
+                {budget_where}
+                ORDER BY job.priority DESC, job.id ASC
+                LIMIT {batch}
+            """
+        composer.cte("next_queued", queued_body, comment=queued_comment)
 
--- Stale picked jobs whose heartbeat timed out (uses partial index WHERE status = 'picked').
-next_stale AS (
-    SELECT q.id
-    FROM {t} q
-    JOIN      params p  ON p.entrypoint  = q.entrypoint
-    LEFT JOIN picked pk ON pk.entrypoint = q.entrypoint
-    WHERE q.status = 'picked'
-      AND q.heartbeat < NOW() - $6::interval
-      AND q.execute_after < NOW()
-      AND ($5::BIGINT IS NULL
-           OR (SELECT total FROM worker_load) < $5)
-      AND (p.concurrency_limit <= 0
-           OR COALESCE(pk.total, 0) < p.concurrency_limit)
-      AND NOT {per_key_block}
-    ORDER BY q.priority DESC, q.id ASC
-    FOR UPDATE SKIP LOCKED
-    LIMIT $1
-),
+        stale_entrypoint = ""
+        if capacity_gated:
+            stale_entrypoint = ", stale.entrypoint"
 
--- Merge both sets, keeping priority order, capped to batch size.
-eligible AS (
-    SELECT id FROM (
-        SELECT id, 0 AS src FROM next_queued
-        UNION ALL
-        SELECT id, 1 AS src FROM next_stale
-    ) combined
-    ORDER BY src, id
-    LIMIT $1
-),
+        # The entrypoint concurrency gate is intentionally omitted here: re-picking a
+        # stale job only transfers ownership of a row already counted in `picked`, so
+        # net live execution is unchanged. Applying the gate would deadlock recovery
+        # once leaked rows fill the slot.
+        composer.cte(
+            "next_stale",
+            f"""
+                SELECT stale.id, stale.priority{stale_entrypoint}
+                FROM {queue_table} stale
+                WHERE stale.status = 'picked'
+                  AND stale.entrypoint = ANY({eps})
+                  AND stale.heartbeat < NOW() - {heartbeat}::interval
+                  AND stale.execute_after < NOW()
+                  {key_guard("stale")}
+                  {budget_and}
+                ORDER BY stale.priority DESC, stale.id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT {batch}
+            """,
+            comment="Stale picked jobs whose heartbeat timed out.",
+        )
 
--- Atomically claim the jobs and log the pick event.
-claimed AS (
-    UPDATE {t}
-    SET status = 'picked',
-        updated   = NOW(),
-        heartbeat = NOW(),
-        queue_manager_id = $4
-    WHERE id IN (SELECT id FROM eligible)
-    RETURNING *
-),
-log_pick AS (
-    INSERT INTO {t_log} (job_id, status, entrypoint, priority)
-    SELECT id, status, entrypoint, priority FROM claimed
-)
-SELECT * FROM claimed ORDER BY priority DESC, id ASC;
-"""  # noqa
+        if capacity_gated:
+            # A stale re-pick keeps the slot it already holds; only fresh claims need one.
+            eligible_body = f"""
+                SELECT id, priority, entrypoint, fresh FROM (
+                    SELECT id, priority, entrypoint, TRUE AS fresh FROM next_queued
+                    UNION ALL
+                    SELECT id, priority, entrypoint, FALSE AS fresh FROM next_stale
+                ) combined
+                ORDER BY priority DESC, id ASC
+                LIMIT {eligible_limit}
+            """
+        else:
+            eligible_body = f"""
+                SELECT id FROM (
+                    SELECT id, priority FROM next_queued
+                    UNION ALL
+                    SELECT id, priority FROM next_stale
+                ) combined
+                ORDER BY priority DESC, id ASC
+                LIMIT {eligible_limit}
+            """
+        composer.cte(
+            "eligible",
+            eligible_body,
+            comment="Merge both sets into one priority order so stale competes with fresh.",
+        )
+
+        if capacity_gated:
+            # The partial unique index on (entrypoint, slot) enforces the limit across
+            # snapshots: a uniqueness check sees uncommitted tuples, so the loser of a
+            # slot race fails with 23505 and retries rather than overshooting (#761).
+            # Generating held+batch seats finds the lowest free ones a dequeue can use:
+            # at most `held` seats inside that range are taken.
+            composer.cte(
+                "free_slots",
+                f"""
+                    SELECT
+                        available.entrypoint,
+                        slots.slot,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY available.entrypoint ORDER BY slots.slot
+                        ) AS slot_rank
+                    FROM available
+                    JOIN params ON params.entrypoint = available.entrypoint
+                    CROSS JOIN LATERAL GENERATE_SERIES(
+                        0,
+                        params.concurrency_limit - available.remaining
+                            + LEAST({batch}, available.remaining) - 1
+                    ) AS slots(slot)
+                    WHERE available.remaining IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT FROM {queue_table} holder
+                          WHERE holder.entrypoint = available.entrypoint
+                            AND holder.status = 'picked'
+                            AND holder.slot = slots.slot
+                      )
+                """,
+                comment="Free capacity slots, ranked; only as many seats as one dequeue uses.",
+            )
+            composer.cte(
+                "slot_assignments",
+                """
+                    SELECT ranked.id, free_slots.slot
+                    FROM (
+                        SELECT
+                            id,
+                            entrypoint,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY entrypoint ORDER BY priority DESC, id ASC
+                            ) AS slot_rank
+                        FROM eligible
+                        WHERE fresh
+                    ) ranked
+                    JOIN free_slots
+                        ON free_slots.entrypoint = ranked.entrypoint
+                        AND free_slots.slot_rank = ranked.slot_rank
+                """,
+                comment="Pair each fresh claim with a free slot by rank; unpaired ones drop.",
+            )
+            claim_body = f"""
+                UPDATE {queue_table} job
+                SET status = 'picked',
+                    updated   = NOW(),
+                    heartbeat = NOW(),
+                    queue_manager_id = {queue_manager},
+                    slot = CASE WHEN eligible.fresh THEN slot_assignments.slot ELSE job.slot END
+                FROM eligible
+                LEFT JOIN slot_assignments ON slot_assignments.id = eligible.id
+                LEFT JOIN params ON params.entrypoint = eligible.entrypoint
+                WHERE job.id = eligible.id
+                  AND (NOT eligible.fresh
+                       OR params.concurrency_limit <= 0
+                       OR slot_assignments.slot IS NOT NULL)
+                RETURNING job.*
+            """
+        else:
+            claim_body = f"""
+                UPDATE {queue_table}
+                SET status = 'picked',
+                    updated   = NOW(),
+                    heartbeat = NOW(),
+                    queue_manager_id = {queue_manager}
+                WHERE id IN (SELECT id FROM eligible)
+                RETURNING *
+            """
+        composer.cte(
+            "claimed",
+            claim_body,
+            comment="Claim every eligible job in one atomic UPDATE.",
+        )
+        composer.cte(
+            "log_pick",
+            f"""
+                INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority)
+                SELECT id, status, entrypoint, priority FROM claimed
+            """,
+            comment="Record the pick in the log table.",
+        )
+        query = composer.render("SELECT * FROM claimed ORDER BY priority DESC, id ASC;")
+        self.dequeue_sql_cache[shape] = query.sql
+        return query
 
     def build_has_queued_work(self) -> str:
         return f"""
-        SELECT
-            COUNT(*) AS queued_work
-        FROM
-            {self.settings.queue_table}
-        WHERE
-                entrypoint = ANY($1)
-            AND status = 'queued'
+        SELECT COUNT(*) AS queued_work
+        FROM (
+            SELECT 1
+            FROM {self.qualified.queue_table}
+            WHERE entrypoint = ANY($1)
+              AND status = 'queued'
+            LIMIT 1
+        ) sub
         """
 
-    def build_enqueue_query(self) -> str:
-        cols = (
-            "priority, entrypoint, payload, execute_after, "
-            "dedupe_key, headers, serialize_key, status"
-        )
+    def build_has_eligible_queued_work(self) -> str:
         return f"""
-        WITH inserted AS (
-            INSERT INTO {self.settings.queue_table}
-            ({cols})
-            VALUES (
-                UNNEST($1::int[]),
-                UNNEST($2::text[]),
-                UNNEST($3::bytea[]),
-                UNNEST($4::interval[]) + NOW(),
-                UNNEST($5::text[]),
-                UNNEST($6::jsonb[]),
-                UNNEST($7::text[]),
-                'queued'
-            )
-            RETURNING id, entrypoint, status, priority
+        SELECT COUNT(*) AS queued_work
+        FROM (
+            SELECT 1
+            FROM {self.qualified.queue_table}
+            WHERE entrypoint = ANY($1)
+              AND status = 'queued'
+              AND execute_after <= NOW()
+            LIMIT 1
+        ) sub
+        """
+
+    def build_enqueue_query(self, on_conflict: OnConflict = "raise") -> str:
+        # Restating the index predicate is what lets PostgreSQL infer the
+        # arbiter; spelled() qualifies the enum for a schema'd install.
+        predicate = schema_ddl.spelled(dedupe_predicate(self.settings), self.settings)
+        same_key = ""
+        if on_conflict == "skip":
+            on_conflict_clause = f"""ON CONFLICT (dedupe_key)
+                WHERE {predicate}
+                DO NOTHING"""
+        elif on_conflict == "update_priority":
+            on_conflict_clause = f"""ON CONFLICT (dedupe_key)
+                WHERE {predicate}
+                DO UPDATE SET priority = GREATEST(job.priority, EXCLUDED.priority)"""
+            # An updated job keeps its own id, so it maps back to its input by key.
+            same_key = "OR i.dedupe_key = ins.dedupe_key"
+        elif on_conflict == "raise":
+            on_conflict_clause = ""
+        else:
+            assert_never(on_conflict)
+        return f"""
+        WITH input AS MATERIALIZED (
+            -- MATERIALIZED: nextval is volatile and `input` is referenced twice,
+            -- so pin single evaluation -- each input row gets exactly one id.
+            -- The scalar sub-select resolves the sequence name once (InitPlan)
+            -- rather than a catalog lookup per row.
+            -- Skipped ON CONFLICT rows leave harmless id gaps; a pre-count CTE
+            -- could avoid them but isn't worth the extra pass.
+            SELECT
+                nextval(
+                    (SELECT pg_get_serial_sequence('{self.qualified.queue_table}', 'id'))
+                ) AS id,
+                priority, entrypoint, payload, execute_after,
+                dedupe_key, headers, serialize_key, ord
+            FROM UNNEST(
+                $1::int[], $2::text[], $3::bytea[],
+                $4::interval[], $5::text[], $6::jsonb[], $7::text[]
+            ) WITH ORDINALITY AS
+                t(priority, entrypoint, payload, execute_after,
+                dedupe_key, headers, serialize_key, ord)
+        ),
+        inserted AS (
+            INSERT INTO {self.qualified.queue_table} AS job
+            (id, priority, entrypoint, payload, execute_after,
+                dedupe_key, headers, serialize_key, status)
+            SELECT id, priority, entrypoint, payload, execute_after + NOW(),
+                dedupe_key, headers, serialize_key, 'queued'
+            FROM input
+            {on_conflict_clause}
+            RETURNING id, entrypoint, priority, dedupe_key
+        ),
+        logged AS (
+            INSERT INTO {self.qualified.queue_table_log}
+            (job_id, status, entrypoint, priority)
+            SELECT id, 'queued', entrypoint, priority
+            FROM inserted
+            -- A job whose priority was updated was queued before; log new jobs only.
+            WHERE id IN (SELECT id FROM input)
         )
-        INSERT INTO {self.settings.queue_table_log}
-        (job_id, status, entrypoint, priority)
-        SELECT id, 'queued', entrypoint, priority
-        FROM inserted
-        RETURNING job_id AS id
+        -- Join maps each surviving id back to its input ordinal. Rows skipped by
+        -- ON CONFLICT are absent from `inserted`, so their positions never appear.
+        SELECT i.ord AS ord, ins.id AS id
+        FROM inserted ins
+        JOIN input i ON i.id = ins.id {same_key}
+        ORDER BY i.ord
+        """
+
+    def build_delete_from_queue_query(self) -> str:
+        return f"""WITH deleted AS (
+            DELETE FROM {self.qualified.queue_table}
+            WHERE entrypoint = ANY($1)
+            RETURNING id, entrypoint, priority
+        )
+        INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority)
+        SELECT id, 'deleted'::{self.qualified.queue_status_type} AS status, entrypoint, priority
+        FROM deleted
+        """
+
+    def build_truncate_queue_query(self) -> str:
+        return f"TRUNCATE {self.qualified.queue_table}"
+
+    def build_queue_size_query(self) -> str:
+        return f"""SELECT
+        count(*) AS count,
+        priority,
+        entrypoint,
+        status
+    FROM
+        {self.qualified.queue_table}
+    GROUP BY entrypoint, priority, status
+    ORDER BY count, entrypoint, priority, status
+    """
+
+    def build_log_job_query(self) -> str:
+        return f"""WITH job_status AS (
+            SELECT
+                UNNEST($1::bigint[])                            AS id,
+                UNNEST($2::{self.qualified.queue_status_type}[]) AS status,
+                UNNEST($3::JSONB[])                             AS traceback
+        ), deleted AS (
+            DELETE FROM {self.qualified.queue_table}
+            WHERE id = ANY(SELECT js.id FROM job_status js WHERE js.status != 'failed')
+            RETURNING id, entrypoint, priority
+        ), held AS (
+            UPDATE {self.qualified.queue_table}
+            SET status = 'failed', updated = NOW(), queue_manager_id = NULL
+            WHERE id = ANY(SELECT js.id FROM job_status js WHERE js.status = 'failed')
+            RETURNING id, entrypoint, priority
+        ), all_resolved AS (
+            SELECT id, entrypoint, priority FROM deleted
+            UNION ALL
+            SELECT id, entrypoint, priority FROM held
+        ), merged AS (
+            SELECT
+                job_status.id           AS id,
+                job_status.status       AS status,
+                job_status.traceback    AS traceback,
+                all_resolved.entrypoint AS entrypoint,
+                all_resolved.priority   AS priority
+            FROM job_status
+            INNER JOIN all_resolved
+                ON all_resolved.id = job_status.id
+        )
+        INSERT INTO {self.qualified.queue_table_log} (
+            job_id,
+            status,
+            entrypoint,
+            priority,
+            traceback
+        )
+        SELECT id, status, entrypoint, priority, traceback FROM merged
+        """
+
+    def build_truncate_log_statistics_query(self) -> str:
+        return f"""TRUNCATE {self.qualified.statistics_table}"""
+
+    def build_delete_from_log_statistics_query(self) -> str:
+        return f"""DELETE FROM {self.qualified.statistics_table} WHERE entrypoint = ANY($1)"""
+
+    def build_log_statistics_query(
+        self,
+        *,
+        limit: int | None,
+        last: timedelta | None,
+    ) -> ComposedQuery:
+        """Read recent statistics rows; an unset limit/last elides its clause."""
+        composer = SqlComposer()
+
+        window = ""
+        if last is not None:
+            bound_last = composer.bind(last)
+            window = f"WHERE created > NOW() - {bound_last}::interval"
+
+        cap = ""
+        if limit is not None:
+            bound_limit = composer.bind(limit)
+            cap = f"LIMIT {bound_limit}"
+
+        return composer.render(
+            f"""
+                SELECT count, created, entrypoint, priority, status
+                FROM {self.qualified.statistics_table}
+                {window}
+                ORDER BY id DESC
+                {cap}
+            """
+        )
+
+    def build_update_heartbeat_query(self) -> str:
+        return f"""UPDATE {self.qualified.queue_table} SET heartbeat = NOW() WHERE id = ANY($1::bigint[])"""  # noqa: E501
+
+    def build_truncate_log_query(self) -> str:
+        return f"TRUNCATE {self.qualified.queue_table_log}"
+
+    def build_delete_log_query(self) -> str:
+        return f"DELETE FROM {self.qualified.queue_table_log} WHERE entrypoint = ANY($1)"
+
+    def build_fetch_log_query(self) -> str:
+        return f"SELECT * FROM {self.qualified.queue_table_log}"
+
+    def build_aggregate_log_data_to_statistics_query(self, advisory_lock: bool = False) -> str:
+        """Fold unaggregated log rows into per-second statistics buckets.
+
+        A single-row ``guard`` CTE gates the whole statement. With
+        ``advisory_lock=True`` its ``proceed`` column is a
+        ``pg_try_advisory_xact_lock``, so concurrent workers serialize on
+        aggregation (losers see ``proceed = FALSE`` and no-op) -- used by the
+        periodic background task. Without it ``proceed`` is an unconditional
+        ``TRUE`` (the on-demand ``log_statistics`` read path).
+        """
+        log = self.qualified.queue_table_log
+        stats = self.qualified.statistics_table
+        proceed = f"pg_try_advisory_xact_lock(hashtext('{stats}'))" if advisory_lock else "TRUE"
+        return f"""WITH guard AS (
+            SELECT {proceed} AS proceed
+        ),
+        log_aggregation AS (
+            SELECT
+                entrypoint,
+                priority,
+                status,
+                COUNT(*) AS count,
+                date_trunc('sec', created) AS created
+            FROM {log}, guard
+            WHERE NOT aggregated AND guard.proceed
+            GROUP BY entrypoint, priority, status, date_trunc('sec', created)
+        ),
+        updated_logs AS (
+            UPDATE {log}
+            SET aggregated = TRUE
+            FROM guard
+            WHERE NOT aggregated AND guard.proceed
+            RETURNING id
+        )
+        INSERT INTO {stats} (count, created, entrypoint, priority, status)
+        SELECT count, created, entrypoint, priority, status
+        FROM log_aggregation
+        ON CONFLICT ({UNIQUE_COUNT_KEY}) DO UPDATE SET
+            count = {stats}.count + EXCLUDED.count
+        """  # noqa
+
+    def build_retry_job_query(self) -> str:
+        return f"""WITH retry AS (
+            UPDATE {self.qualified.queue_table}
+            SET
+                status = 'queued',
+                execute_after = NOW() + $2::interval,
+                attempts = attempts + 1,
+                updated = NOW(),
+                queue_manager_id = NULL
+            WHERE id = $1::bigint
+            RETURNING id, entrypoint, priority
+        )
+        INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority, traceback)
+        SELECT id, 'queued', entrypoint, priority, $3::JSONB FROM retry
+        """  # noqa: E501
+
+    def build_requeue_jobs_query(self, reset_attempts: bool = True) -> str:
+        attempts_clause = "attempts = 0," if reset_attempts else ""
+        return f"""WITH requeued AS (
+            UPDATE {self.qualified.queue_table}
+            SET status = 'queued', execute_after = NOW(), updated = NOW(),
+                {attempts_clause} queue_manager_id = NULL
+            WHERE id = ANY($1::bigint[]) AND status = 'failed'
+            RETURNING id, entrypoint, priority
+        )
+        INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority)
+        SELECT id, 'queued', entrypoint, priority FROM requeued
+        """
+
+    def build_list_failed_jobs_query(self, order: SortOrder = "DESC") -> str:
+        return f"""SELECT * FROM {self.qualified.queue_table}
+        WHERE status = 'failed'
+        ORDER BY created {order}
+        LIMIT $1
+        """
+
+    def build_queue_table_browse_query(self) -> str:
+        return f"""SELECT * FROM {self.qualified.queue_table}
+        ORDER BY priority DESC, id ASC
+        LIMIT $1 OFFSET $2
+        """
+
+    def build_failed_jobs_query(self) -> str:
+        return f"""SELECT * FROM {self.qualified.queue_table_log}
+        WHERE status = 'exception'::{self.qualified.queue_status_type}
+        ORDER BY created DESC
+        LIMIT $1
+        """
+
+    def build_queue_log_query(self) -> str:
+        return f"""SELECT * FROM {self.qualified.queue_table_log}
+        ORDER BY created DESC
+        LIMIT $1
+        """
+
+    def build_stale_jobs_query(self) -> str:
+        return f"""SELECT id, priority, queue_manager_id, created, updated, heartbeat,
+            execute_after, status, entrypoint,
+            EXTRACT(EPOCH FROM NOW() - heartbeat) AS seconds_since_heartbeat
+        FROM {self.qualified.queue_table}
+        WHERE status = 'picked'::{self.qualified.queue_status_type}
+          AND heartbeat < NOW() - $1::interval
+        ORDER BY heartbeat ASC
+        LIMIT $2
+        """
+
+    def build_queue_age_query(self) -> str:
+        return f"""SELECT
+            entrypoint,
+            COUNT(*) AS queued_count,
+            MIN(created) AS oldest_created,
+            EXTRACT(EPOCH FROM NOW() - MIN(created)) AS oldest_age_seconds,
+            AVG(EXTRACT(EPOCH FROM NOW() - created)) AS avg_age_seconds
+        FROM {self.qualified.queue_table}
+        WHERE status = 'queued'::{self.qualified.queue_status_type}
+        GROUP BY entrypoint
+        ORDER BY entrypoint
+        """
+
+    def build_throughput_summary_query(self) -> str:
+        return f"""SELECT
+            entrypoint,
+            status,
+            SUM(count) AS total_count
+        FROM {self.qualified.statistics_table}
+        WHERE ($1::interval IS NULL OR created > NOW() - $1)
+        GROUP BY entrypoint, status
+        ORDER BY entrypoint, status
+        """
+
+    def build_active_workers_query(self) -> str:
+        return f"""SELECT
+            queue_manager_id,
+            COUNT(*) AS active_jobs,
+            MIN(heartbeat) AS oldest_heartbeat,
+            MAX(heartbeat) AS newest_heartbeat,
+            array_agg(DISTINCT entrypoint) AS entrypoints
+        FROM {self.qualified.queue_table}
+        WHERE status = 'picked'::{self.qualified.queue_status_type}
+          AND queue_manager_id IS NOT NULL
+        GROUP BY queue_manager_id
+        ORDER BY queue_manager_id
+        """
+
+    def build_schema_info_query(self) -> str:
+        s = self.settings
+        return f"""SELECT
+            c.relname AS table_name,
+            CASE WHEN c.relpersistence = 'u' THEN 'UNLOGGED'
+                 WHEN c.relpersistence = 'p' THEN 'LOGGED'
+                 ELSE c.relpersistence::text
+            END AS persistence,
+            c.reltuples::bigint AS estimated_rows,
+            pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = {s.schema_expr}
+          AND c.relname IN (
+            '{s.queue_table}',
+            '{s.queue_table_log}',
+            '{s.statistics_table}',
+            '{s.schedules_table}'
+          )
+          AND c.relkind = 'r'
+        ORDER BY c.relname
+        """
+
+    def build_job_status_query(self) -> str:
+        return f"""SELECT DISTINCT ON (job_id) job_id, status
+        FROM   {self.qualified.queue_table_log}
+        WHERE  job_id = ANY($1)
+        ORDER  BY job_id, created DESC, id DESC;
+        """
+
+    def build_next_deferred_eta_query(self) -> str:
+        return f"""SELECT execute_after - NOW() AS eta
+        FROM {self.qualified.queue_table}
+        WHERE status = 'queued'
+          AND execute_after > NOW()
+          AND entrypoint = ANY($1)
+        ORDER BY execute_after
+        LIMIT 1
+        """
+
+    def build_job_duration_percentiles_query(self) -> str:
+        """Execution-duration percentiles per entrypoint, derived from log transitions.
+
+        Pairs each terminal log row with the preceding 'picked' row of the same
+        job. Jobs picked before the window start lose their pair and are
+        undercounted rather than miscounted.
+        """
+        return f"""WITH transitions AS (
+            SELECT
+                entrypoint,
+                status,
+                created,
+                LAG(status) OVER w AS prev_status,
+                LAG(created) OVER w AS prev_created
+            FROM {self.qualified.queue_table_log}
+            WHERE created > NOW() - $1::interval
+            WINDOW w AS (PARTITION BY job_id ORDER BY created, id)
+        ), durations AS (
+            SELECT
+                entrypoint,
+                EXTRACT(EPOCH FROM created - prev_created) AS duration_seconds
+            FROM transitions
+            WHERE prev_status = 'picked'
+              AND status IN ('successful', 'exception', 'canceled', 'failed')
+        )
+        SELECT
+            entrypoint,
+            COUNT(*) AS completed,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_seconds) AS p50_seconds,
+            percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_seconds) AS p95_seconds,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_seconds) AS p99_seconds,
+            MAX(duration_seconds) AS max_seconds
+        FROM durations
+        GROUP BY entrypoint
+        ORDER BY p95_seconds DESC
+        """
+
+    def build_throughput_timeseries_query(self) -> str:
+        return f"""SELECT
+            DATE_TRUNC('minute', created) AS bucket,
+            entrypoint,
+            status,
+            SUM(count) AS count
+        FROM {self.qualified.statistics_table}
+        WHERE created > NOW() - $1::interval
+        GROUP BY bucket, entrypoint, status
+        ORDER BY bucket
+        """
+
+    def build_queue_job_by_id_query(self) -> str:
+        return f"SELECT * FROM {self.qualified.queue_table} WHERE id = $1::bigint"
+
+    def build_job_log_history_query(self) -> str:
+        return f"""SELECT * FROM {self.qualified.queue_table_log}
+        WHERE job_id = $1::bigint
+        ORDER BY created ASC, id ASC
+        LIMIT $2
+        """
+
+    def build_unaggregated_log_count_query(self) -> str:
+        return f"""SELECT COUNT(*) AS unaggregated
+        FROM {self.qualified.queue_table_log}
+        WHERE NOT aggregated
+        """
+
+    def build_browse_queue_query(self) -> str:
+        return f"""SELECT * FROM {self.qualified.queue_table}
+        WHERE ($3::text[] IS NULL OR status::text = ANY($3::text[]))
+          AND ($4::text[] IS NULL OR entrypoint = ANY($4::text[]))
+        ORDER BY priority DESC, id ASC
+        LIMIT $1 OFFSET $2
         """
 
     def build_enqueue_if_no_queued_query(self) -> str:
-        t = self.settings.queue_table
-        t_log = self.settings.queue_table_log
+        t = self.qualified.queue_table
+        t_log = self.qualified.queue_table_log
         return f"""
         WITH inserted AS (
             INSERT INTO {t}
@@ -617,8 +1092,8 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
         """
 
     def build_enqueue_if_no_dedupe_query(self) -> str:
-        t = self.settings.queue_table
-        t_log = self.settings.queue_table_log
+        t = self.qualified.queue_table
+        t_log = self.qualified.queue_table_log
         return f"""
         WITH inserted AS (
             INSERT INTO {t}
@@ -648,224 +1123,10 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
     def build_active_dedupe_status_query(self) -> str:
         return f"""
         SELECT status
-        FROM {self.settings.queue_table}
+        FROM {self.qualified.queue_table}
         WHERE dedupe_key = $1
           AND status IN ('queued', 'picked')
         LIMIT 1
-        """
-
-    def build_delete_from_queue_query(self) -> str:
-        return f"""WITH deleted AS (
-            DELETE FROM {self.settings.queue_table}
-            WHERE entrypoint = ANY($1)
-            RETURNING id, entrypoint, priority
-        )
-        INSERT INTO {self.settings.queue_table_log} (job_id, status, entrypoint, priority)
-        SELECT id, 'deleted'::{self.settings.queue_status_type} AS status, entrypoint, priority
-        FROM deleted
-        """
-
-    def build_truncate_queue_query(self) -> str:
-        return f"TRUNCATE {self.settings.queue_table}"
-
-    def build_queue_size_query(self) -> str:
-        return f"""SELECT
-        count(*) AS count,
-        priority,
-        entrypoint,
-        status
-    FROM
-        {self.settings.queue_table}
-    GROUP BY entrypoint, priority, status
-    ORDER BY count, entrypoint, priority, status
-    """
-
-    def build_log_job_query(self) -> str:
-        return f"""WITH job_status AS (
-            SELECT
-                UNNEST($1::integer[])                           AS id,
-                UNNEST($2::{self.settings.queue_status_type}[]) AS status,
-                UNNEST($3::JSONB[])                             AS traceback
-        ), deleted AS (
-            DELETE FROM {self.settings.queue_table}
-            WHERE id = ANY(SELECT js.id FROM job_status js WHERE js.status != 'failed')
-            RETURNING id, entrypoint, priority
-        ), held AS (
-            UPDATE {self.settings.queue_table}
-            SET status = 'failed', updated = NOW(), queue_manager_id = NULL
-            WHERE id = ANY(SELECT js.id FROM job_status js WHERE js.status = 'failed')
-            RETURNING id, entrypoint, priority
-        ), all_resolved AS (
-            SELECT id, entrypoint, priority FROM deleted
-            UNION ALL
-            SELECT id, entrypoint, priority FROM held
-        ), merged AS (
-            SELECT
-                job_status.id           AS id,
-                job_status.status       AS status,
-                job_status.traceback    AS traceback,
-                all_resolved.entrypoint AS entrypoint,
-                all_resolved.priority   AS priority
-            FROM job_status
-            INNER JOIN all_resolved
-                ON all_resolved.id = job_status.id
-        )
-        INSERT INTO {self.settings.queue_table_log} (
-            job_id,
-            status,
-            entrypoint,
-            priority,
-            traceback
-        )
-        SELECT id, status, entrypoint, priority, traceback FROM merged
-        """
-
-    def build_truncate_log_statistics_query(self) -> str:
-        return f"""TRUNCATE {self.settings.statistics_table}"""
-
-    def build_delete_from_log_statistics_query(self) -> str:
-        return f"""DELETE FROM {self.settings.statistics_table} WHERE entrypoint = ANY($1)"""
-
-    def build_log_statistics_query(self) -> str:
-        return f"""SELECT
-        count,
-        created,
-        entrypoint,
-        priority,
-        status
-    FROM {self.settings.statistics_table}
-    WHERE ($2::interval IS NULL OR created > NOW() - $2)
-    ORDER BY id DESC
-    LIMIT $1
-    """
-
-    def build_update_heartbeat_query(self) -> str:
-        return f"""UPDATE {self.settings.queue_table} SET heartbeat = NOW() WHERE id = ANY($1::integer[])"""  # noqa: E501
-
-    def build_truncate_log_query(self) -> str:
-        return f"TRUNCATE {self.settings.queue_table_log}"
-
-    def build_delete_log_query(self) -> str:
-        return f"DELETE FROM {self.settings.queue_table_log} WHERE entrypoint = ANY($1)"
-
-    def build_fetch_log_query(self) -> str:
-        return f"SELECT * FROM {self.settings.queue_table_log}"
-
-    def build_aggregate_log_data_to_statistics_query(self) -> str:
-        return f"""WITH log_aggregation AS (
-            SELECT
-                entrypoint,
-                priority,
-                status,
-                COUNT(*) AS count,
-                date_trunc('sec', created) AS created
-            FROM {self.settings.queue_table_log}
-            WHERE NOT aggregated
-            GROUP BY entrypoint, priority, status, date_trunc('sec', created)
-        ),
-        updated_logs AS (
-            UPDATE {self.settings.queue_table_log}
-            SET aggregated = TRUE
-            WHERE NOT aggregated
-            RETURNING id
-        )
-        INSERT INTO {self.settings.statistics_table} (count, created, entrypoint, priority, status)
-        SELECT
-            count,
-            created,
-            entrypoint,
-            priority,
-            status
-        FROM log_aggregation
-        ON CONFLICT (
-            priority,
-            date_trunc('sec', created AT TIME ZONE 'UTC'),
-            status,
-            entrypoint
-        ) DO UPDATE SET
-            count = {self.settings.statistics_table}.count + EXCLUDED.count
-        """  # noqa
-
-    def build_retry_job_query(self) -> str:
-        return f"""WITH retry AS (
-            UPDATE {self.settings.queue_table}
-            SET
-                status = 'queued',
-                execute_after = NOW() + $2::interval,
-                attempts = attempts + 1,
-                updated = NOW(),
-                queue_manager_id = NULL
-            WHERE id = $1::integer
-            RETURNING id, entrypoint, priority
-        )
-        INSERT INTO {self.settings.queue_table_log} (job_id, status, entrypoint, priority, traceback)
-        SELECT id, 'queued', entrypoint, priority, $3::JSONB FROM retry
-        """  # noqa: E501
-
-    def build_requeue_jobs_query(self, reset_attempts: bool = True) -> str:
-        # When reset_attempts=False, attempts is preserved so the next failure
-        # consumes the existing retry budget (one more shot under max_attempts)
-        # rather than handing the job a fresh budget.
-        attempts_clause = "attempts = 0," if reset_attempts else ""
-        return f"""WITH requeued AS (
-            UPDATE {self.settings.queue_table}
-            SET status = 'queued', execute_after = NOW(), updated = NOW(),
-                {attempts_clause} queue_manager_id = NULL
-            WHERE id = ANY($1::integer[]) AND status = 'failed'
-            RETURNING id, entrypoint, priority
-        )
-        INSERT INTO {self.settings.queue_table_log} (job_id, status, entrypoint, priority)
-        SELECT id, 'queued', entrypoint, priority FROM requeued
-        """
-
-    def build_list_failed_jobs_query(self, order: SortOrder = "DESC") -> str:
-        return f"""SELECT * FROM {self.settings.queue_table}
-        WHERE status = 'failed'
-        ORDER BY created {order}
-        LIMIT $1
-        """
-
-    def build_queue_table_browse_query(self) -> str:
-        return f"""SELECT * FROM {self.settings.queue_table}
-        ORDER BY priority DESC, id ASC
-        LIMIT $1 OFFSET $2
-        """
-
-    def build_failed_jobs_query(self) -> str:
-        return f"""SELECT * FROM {self.settings.queue_table_log}
-        WHERE status = 'exception'::{self.settings.queue_status_type}
-        ORDER BY created DESC
-        LIMIT $1
-        """
-
-    def build_queue_log_query(self) -> str:
-        return f"""SELECT * FROM {self.settings.queue_table_log}
-        ORDER BY created DESC
-        LIMIT $1
-        """
-
-    def build_stale_jobs_query(self) -> str:
-        return f"""SELECT id, priority, queue_manager_id, created, updated, heartbeat,
-            execute_after, status, entrypoint,
-            EXTRACT(EPOCH FROM NOW() - heartbeat) AS seconds_since_heartbeat
-        FROM {self.settings.queue_table}
-        WHERE status = 'picked'::{self.settings.queue_status_type}
-          AND heartbeat < NOW() - $1::interval
-        ORDER BY heartbeat ASC
-        LIMIT $2
-        """
-
-    def build_queue_age_query(self) -> str:
-        return f"""SELECT
-            entrypoint,
-            COUNT(*) AS queued_count,
-            MIN(created) AS oldest_created,
-            EXTRACT(EPOCH FROM NOW() - MIN(created)) AS oldest_age_seconds,
-            AVG(EXTRACT(EPOCH FROM NOW() - created)) AS avg_age_seconds
-        FROM {self.settings.queue_table}
-        WHERE status = 'queued'::{self.settings.queue_status_type}
-        GROUP BY entrypoint
-        ORDER BY oldest_age_seconds DESC
         """
 
     def build_blocked_keys_query(self) -> str:
@@ -875,19 +1136,19 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
             COUNT(*) AS queued_count,
             MIN(q.created) AS oldest_queued_created,
             EXTRACT(EPOCH FROM NOW() - MIN(q.created)) AS oldest_queued_age_seconds,
-            (SELECT id FROM {self.settings.queue_table} l
+            (SELECT id FROM {self.qualified.queue_table} l
                 WHERE l.entrypoint = q.entrypoint
                   AND l.serialize_key = q.serialize_key
                   AND l.status = 'picked')                                AS leader_id,
-            (SELECT EXTRACT(EPOCH FROM NOW() - updated) FROM {self.settings.queue_table} l
+            (SELECT EXTRACT(EPOCH FROM NOW() - updated) FROM {self.qualified.queue_table} l
                 WHERE l.entrypoint = q.entrypoint
                   AND l.serialize_key = q.serialize_key
                   AND l.status = 'picked')                                AS leader_age_seconds,
-            (SELECT EXTRACT(EPOCH FROM NOW() - heartbeat) FROM {self.settings.queue_table} l
+            (SELECT EXTRACT(EPOCH FROM NOW() - heartbeat) FROM {self.qualified.queue_table} l
                 WHERE l.entrypoint = q.entrypoint
                   AND l.serialize_key = q.serialize_key
                   AND l.status = 'picked')                AS leader_heartbeat_age_seconds
-        FROM {self.settings.queue_table} q
+        FROM {self.qualified.queue_table} q
         WHERE q.status = 'queued'
           AND q.serialize_key IS NOT NULL
           AND q.execute_after < NOW()
@@ -895,7 +1156,7 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
         GROUP BY q.entrypoint, q.serialize_key
         HAVING COUNT(*) > 1
             OR EXISTS (
-                SELECT 1 FROM {self.settings.queue_table} l
+                SELECT 1 FROM {self.qualified.queue_table} l
                 WHERE l.entrypoint = q.entrypoint
                   AND l.serialize_key = q.serialize_key
                   AND l.status = 'picked'
@@ -904,72 +1165,14 @@ SELECT * FROM claimed ORDER BY priority DESC, id ASC;
         LIMIT $2
         """
 
-    def build_throughput_summary_query(self) -> str:
-        return f"""SELECT
-            entrypoint,
-            status,
-            SUM(count) AS total_count
-        FROM {self.settings.statistics_table}
-        WHERE ($1::interval IS NULL OR created > NOW() - $1)
-        GROUP BY entrypoint, status
-        ORDER BY entrypoint, status
-        """
-
-    def build_active_workers_query(self) -> str:
-        return f"""SELECT
-            queue_manager_id,
-            COUNT(*) AS active_jobs,
-            MIN(heartbeat) AS oldest_heartbeat,
-            MAX(heartbeat) AS newest_heartbeat,
-            array_agg(DISTINCT entrypoint) AS entrypoints
-        FROM {self.settings.queue_table}
-        WHERE status = 'picked'::{self.settings.queue_status_type}
-          AND queue_manager_id IS NOT NULL
-        GROUP BY queue_manager_id
-        ORDER BY active_jobs DESC
-        """
-
-    def build_schema_info_query(self) -> str:
-        return f"""SELECT
-            c.relname AS table_name,
-            CASE WHEN c.relpersistence = 'u' THEN 'UNLOGGED'
-                 WHEN c.relpersistence = 'p' THEN 'LOGGED'
-                 ELSE c.relpersistence::text
-            END AS persistence,
-            c.reltuples::bigint AS estimated_rows,
-            pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = current_schema()
-          AND c.relname IN (
-            '{self.settings.queue_table}',
-            '{self.settings.queue_table_log}',
-            '{self.settings.statistics_table}',
-            '{self.settings.schedules_table}'
-          )
-          AND c.relkind = 'r'
-        ORDER BY c.relname
-        """
-
-    def build_job_status_query(self) -> str:
-        return f"""SELECT DISTINCT ON (job_id) job_id, status
-        FROM   {self.settings.queue_table_log}
-        WHERE  job_id = ANY($1)
-        ORDER  BY job_id, created DESC, id DESC;
-        """
-
-    def build_next_deferred_eta_query(self) -> str:
-        return f"""SELECT MIN(execute_after) - NOW() AS eta
-        FROM {self.settings.queue_table}
-        WHERE status = 'queued'
-          AND execute_after > NOW()
-          AND entrypoint = ANY($1)
-        """
-
 
 @dataclasses.dataclass
 class QuerySchedulerBuilder:
-    settings: DBSettings = dataclasses.field(default_factory=DBSettings)
+    settings: DBSettings = dataclasses.field(default_factory=db_settings)
+
+    @property
+    def qualified(self) -> QualifiedNames:
+        return self.settings.qualified
 
     def build_insert_schedule_query(self) -> str:
         return f"""WITH params AS (
@@ -977,7 +1180,7 @@ class QuerySchedulerBuilder:
                UNNEST($2::text[])       AS entrypoint,
                UNNEST($3::interval[])   AS delay
         )
-        INSERT INTO {self.settings.schedules_table} (expression, next_run, entrypoint)
+        INSERT INTO {self.qualified.schedules_table} (expression, next_run, entrypoint)
         SELECT expression, date_trunc('seconds', NOW() + delay), entrypoint FROM params
         ON CONFLICT (entrypoint, expression) DO NOTHING"""
 
@@ -988,7 +1191,7 @@ class QuerySchedulerBuilder:
                UNNEST($3::interval[])   AS delay
     ), picked_jobs AS (
         SELECT id, expression, entrypoint
-        FROM {self.settings.schedules_table}
+        FROM {self.qualified.schedules_table}
         WHERE
                 ((entrypoint, expression) IN (SELECT entrypoint, expression FROM params)
             AND next_run <= NOW()
@@ -999,7 +1202,7 @@ class QuerySchedulerBuilder:
             AND status = 'picked')
         FOR UPDATE SKIP LOCKED
     )
-    UPDATE {self.settings.schedules_table}
+    UPDATE {self.qualified.schedules_table}
     SET
         status = 'picked',
         updated = NOW(),
@@ -1007,23 +1210,23 @@ class QuerySchedulerBuilder:
         next_run = date_trunc('seconds', NOW() + (
                 SELECT delay FROM params
                 WHERE
-                    params.entrypoint = {self.settings.schedules_table}.entrypoint
-                AND params.expression = {self.settings.schedules_table}.expression
+                    params.entrypoint = {self.qualified.schedules_table}.entrypoint
+                AND params.expression = {self.qualified.schedules_table}.expression
             ))
     WHERE (entrypoint, expression) IN (SELECT entrypoint, expression FROM picked_jobs)
     RETURNING *;"""  # noqa: E501
 
     def build_set_schedule_queued_query(self) -> str:
-        return f"""UPDATE {self.settings.schedules_table} SET status = 'queued', last_run = NOW(), updated = NOW() WHERE id = ANY($1);"""  # noqa: E501
+        return f"""UPDATE {self.qualified.schedules_table} SET status = 'queued', last_run = NOW(), updated = NOW() WHERE id = ANY($1);"""  # noqa: E501
 
     def build_update_schedule_heartbeat(self) -> str:
-        return f"""UPDATE {self.settings.schedules_table} SET heartbeat = NOW(), updated = NOW() WHERE id = ANY($1);"""  # noqa: E501
+        return f"""UPDATE {self.qualified.schedules_table} SET heartbeat = NOW(), updated = NOW() WHERE id = ANY($1);"""  # noqa: E501
 
     def build_peek_schedule_query(self) -> str:
-        return f"""SELECT * FROM {self.settings.schedules_table} ORDER BY last_run ASC"""
+        return f"""SELECT * FROM {self.qualified.schedules_table} ORDER BY last_run ASC"""
 
     def build_delete_schedule_query(self) -> str:
-        return f"""DELETE FROM {self.settings.schedules_table} WHERE id = ANY($1) OR entrypoint = ANY($2)"""  # noqa: E501
+        return f"""DELETE FROM {self.qualified.schedules_table} WHERE id = ANY($1) OR entrypoint = ANY($2)"""  # noqa: E501
 
     def build_truncate_schedule_query(self) -> str:
-        return f"""TRUNCATE {self.settings.schedules_table}"""
+        return f"""TRUNCATE {self.qualified.schedules_table}"""

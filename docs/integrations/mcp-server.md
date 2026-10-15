@@ -2,7 +2,7 @@
 
 PgQueuer ships an optional [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server
 that gives AI agents read-only access to your queue state, statistics, and schedules.
-All queries are predefined — no arbitrary SQL is accepted.
+All queries are predefined; the server does not accept arbitrary SQL.
 
 ## Installation
 
@@ -20,11 +20,15 @@ All queries are predefined — no arbitrary SQL is accepted.
 
 This pulls in `mcp>=1.0` and `asyncpg>=0.30.0`.
 
-## Quick Start
+## Quick start
 
 The server connects to PostgreSQL using the same
 [libpq environment variables](../getting-started/installation.md#connection-configuration)
-you already use (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`):
+you already use (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`), or a
+full DSN from `PGQUEUER_DSN`/`PGDSN`. Pool sizing and connection extras come from
+[`PGQUEUER_*` variables](../getting-started/installation.md#pool-and-connection-tuning)
+(`PGQUEUER_POOL_MIN_SIZE`, `PGQUEUER_POOL_MAX_SIZE`, `PGQUEUER_CONNECT_TIMEOUT`,
+`PGQUEUER_APPLICATION_NAME`; defaults: min 1, max 5):
 
 === "uv"
 
@@ -97,44 +101,48 @@ server = create_mcp_server(dsn="postgresql://user:pass@host:5432/mydb")
 server.run(transport="stdio")
 ```
 
-### Custom Table Prefix
+### Custom table prefix or schema
 
-If you use `PGQUEUER_PREFIX` to namespace your tables, pass custom settings:
+The server reads `PGQUEUER_PREFIX` and `PGQUEUER_SCHEMA` from the environment. Set
+them to the values your tables were installed with, next to the connection
+variables in the client's `env` block:
 
-```python
-from pgqueuer.adapters.mcp.server import create_mcp_server
-from pgqueuer.adapters.persistence.qb import DBSettings
-
-server = create_mcp_server(settings=DBSettings())  # reads PGQUEUER_PREFIX
-server.run(transport="stdio")
+```json
+"env": {
+  "PGQUEUER_PREFIX": "billing",
+  "PGQUEUER_SCHEMA": "jobs"
+}
 ```
 
-## Available Tools
+See [Environment configuration](../guides/deployment.md#environment-configuration)
+for the full list.
+
+## Available tools
 
 All tools are **read-only** and use predefined static SQL queries.
 They cannot modify queue data.
 
-### Queue Overview
+### Queue overview
 
 | Tool | Description |
 |------|-------------|
 | `queue_size` | Current job counts grouped by entrypoint, status, and priority. Start here for a quick health check. |
 | `queue_table_info` | Browse raw queue rows with pagination. Shows payloads, headers, worker assignments, and timestamps. |
 
-### Throughput & Statistics
+### Throughput & statistics
 
 | Tool | Description |
 |------|-------------|
 | `queue_stats` | Per-second time-series of job state transitions. Supports a time-window filter (`period`). |
 | `throughput_summary` | High-level totals per entrypoint and status. Easier to read than `queue_stats` when you just want aggregate counts. |
 
-### Failure Investigation
+### Failure investigation
 
 | Tool | Description |
 |------|-------------|
 | `failed_jobs` | Recent jobs that ended with an exception, including full Python tracebacks as JSON. |
 
-### Worker Health
+### Worker health
 
 | Tool | Description |
 |------|-------------|
@@ -148,14 +156,14 @@ They cannot modify queue data.
 |------|-------------|
 | `schedules` | All cron-based recurring task definitions with next/last run times and status. |
 
-### Audit & Schema
+### Audit & schema
 
 | Tool | Description |
 |------|-------------|
 | `queue_log` | Full event log of every job state transition (enqueue, pick, complete, fail, cancel). |
 | `schema_info` | PgQueuer table metadata: existence, LOGGED/UNLOGGED durability, disk size, estimated row counts. |
 
-## Programmatic Usage
+## Programmatic usage
 
 The `create_mcp_server` factory returns a `FastMCP` instance with no module-level
 globals, so you can create multiple servers or embed one in a larger application:
@@ -163,11 +171,20 @@ globals, so you can create multiple servers or embed one in a larger application
 ```python
 from pgqueuer.adapters.mcp.server import create_mcp_server
 
-# All parameters are optional — asyncpg reads libpq env vars by default
+# All parameters are optional; the DSN comes from PGQUEUER_DSN/PGDSN,
+# else asyncpg reads libpq env vars. Pool sizing from PGQUEUER_* env vars.
 server = create_mcp_server()
 
 # Or pass an explicit DSN and/or custom settings
 server = create_mcp_server(dsn="postgresql://...")
+
+# Pool sizing/timeouts can also be passed explicitly
+from pgqueuer.domain.settings import ConnectionSettings
+
+server = create_mcp_server(
+    dsn="postgresql://...",
+    connection_settings=ConnectionSettings(pool_min_size=2, pool_max_size=10),
+)
 
 server.run(transport="stdio")
 ```
@@ -177,9 +194,9 @@ server.run(transport="stdio")
 The MCP server lives in the adapter layer (`pgqueuer/adapters/mcp/`) and follows
 the same hexagonal architecture as the rest of PgQueuer:
 
-- **`server.py`** — `create_mcp_server()` factory, `PgQueuerDatabase` wrapper,
+- **`server.py`**: `create_mcp_server()` factory, `PgQueuerDatabase` wrapper,
   all tool registrations.
-- **`__main__.py`** — `python -m pgqueuer.adapters.mcp` entry point.
+- **`__main__.py`**: `python -m pgqueuer.adapters.mcp` entry point.
 - All SQL queries are defined as `build_*` methods in
-  `pgqueuer/adapters/persistence/qb.py` — no SQL is constructed at runtime.
+  `pgqueuer/adapters/persistence/qb.py`: no SQL is constructed at runtime.
 - The server uses an asyncpg connection pool managed by FastMCP's lifespan.

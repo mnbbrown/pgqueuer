@@ -1,31 +1,31 @@
 # Driver Troubleshooting
 
-Use this checklist when PGQueuer starts misbehaving before diving into the codebase. It
-highlights the most common rough edges in PostgreSQL drivers (`asyncpg`, `psycopg`) and
-the questions that quickly separate configuration issues from bugs.
+Work through this checklist before you go reading PgQueuer internals. It covers the rough
+edges people actually hit in `asyncpg` and `psycopg`, and the questions that separate a
+configuration problem from a bug.
 
-## 1. Connection Basics
+## 1. Connection basics
 
-- **Autocommit drift** — psycopg defaults to transactional mode while asyncpg autocommits.
+- **Autocommit drift**: psycopg defaults to transactional mode while asyncpg autocommits.
   Verify `connection.autocommit` (or pool init hooks) so enqueued jobs become visible
   immediately.
-- **Pools returning dirty state** — Reused connections may keep open transactions or altered
+- **Pools returning dirty state**: Reused connections may keep open transactions or altered
   settings. Confirm pool size fits workload and that teardown callbacks reset state.
-- **Authentication/network churn** — Sudden bursts can hit `max_connections`, stale
+- **Authentication/network churn**: Sudden bursts can hit `max_connections`, stale
   certificates, or mismatched DSNs. Cross-check the exact DSN with `psql`, check
   `pg_hba.conf`, and ensure SSL parameters match the server.
 
-## 2. Query Flow and Transactions
+## 2. Query flow and transactions
 
-- **Locked rows** — Long-lived transactions block `SELECT … FOR UPDATE SKIP LOCKED`. Inspect
+- **Locked rows**: Long-lived transactions block `SELECT … FOR UPDATE SKIP LOCKED`. Inspect
   `pg_locks` + `pg_stat_activity` for blockers and keep DDL or maintenance outside hot paths.
-- **Unexpected timeouts** — Server-side `statement_timeout` or driver-level timeouts cancel
+- **Unexpected timeouts**: Server-side `statement_timeout` or driver-level timeouts cancel
   dequeues. List active timeout settings (asyncpg `timeout`, psycopg `options`) and compare
   with production defaults.
-- **Type adapters** — Binary payloads must match table encoding. Confirm `pgqueuer` table
+- **Type adapters**: Binary payloads must match table encoding. Confirm `pgqueuer` table
   column types and ensure custom adapters/serializers are registered before enqueueing.
 
-## 3. Driver Quirks
+## 3. Driver quirks
 
 **asyncpg:**
 
@@ -39,20 +39,20 @@ the questions that quickly separate configuration issues from bugs.
 - Mixing `%s` and `$1` placeholders breaks prepared statement caching.
 - Async connections must be `await conn.close()`; sync connections should stay out of asyncio
   event loops.
-- **Windows event loop** — async psycopg rejects the default `ProactorEventLoop`. Use
+- **Windows event loop**: async psycopg rejects the default `ProactorEventLoop`. Use
   `SelectorEventLoop` (e.g. `asyncio.run(main, loop_factory=asyncio.SelectorEventLoop)` on
   3.12+). The `pgq` CLI does this for you; embedded use must opt in. See
   [drivers reference](../reference/drivers.md#psycopgdriver) for full snippets.
 
-## 4. PGQueuer Expectations
+## 4. PgQueuer expectations
 
 - Health checks may raise exceptions from `pgqueuer.errors` (e.g. `FailingListenerError`);
   capture them during service startup.
 - LISTEN/NOTIFY keeps consumers awake. Firewalls that drop idle sockets or missing
-  `pg_notify` privileges starve queues — monitor `pg_notification_queue_usage()`.
+  `pg_notify` privileges starve queues; monitor `pg_notification_queue_usage()`.
 - Payloads are stored as `bytea`; producers and consumers must agree on encoding.
 
-## 5. Rapid Triage Questions
+## 5. Rapid triage questions
 
 1. Can a fresh `psql` session connect with the same DSN?
 2. Are autocommit and transaction status clean before returning pooled connections?
@@ -60,7 +60,7 @@ the questions that quickly separate configuration issues from bugs.
 4. Are LISTEN/NOTIFY messages flowing end-to-end?
 5. Did timeouts or pool recycling settings change recently?
 6. Are payloads serialized consistently across services?
-7. Did a driver upgrade land without matching PGQueuer expectations?
+7. Did a driver upgrade land without matching PgQueuer expectations?
 
-Capture answers with relevant logs before escalating; the pattern usually reveals itself
-within this checklist.
+Write the answers down alongside the relevant logs before escalating. Most reports that
+reach the issue tracker turn out to be one of the items above.

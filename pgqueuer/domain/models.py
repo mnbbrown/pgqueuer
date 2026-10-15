@@ -1,19 +1,10 @@
-"""
-Models and type definitions for events, jobs, and statistics.
-
-This module defines data classes and types used throughout the application,
-including events received from PostgreSQL channels, job representations,
-and statistical data structures for logging and monitoring.
-"""
-
 from __future__ import annotations
 
 import dataclasses
 import traceback
-import uuid
 from collections.abc import MutableMapping
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Literal, NamedTuple
+from typing import Annotated, Literal, NamedTuple
 
 import anyio
 from pydantic import AwareDatetime, BaseModel, BeforeValidator, Field, RootModel
@@ -26,8 +17,12 @@ from pgqueuer.domain.types import (
     Channel,
     CronEntrypoint,
     CronExpression,
+    HealthCheckId,
     JobId,
+    QueueEntrypoint,
+    QueueManagerId,
     ScheduleId,
+    Slot,
 )
 
 
@@ -36,19 +31,8 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-###### Events ######
-
-
 class Event(BaseModel):
-    """
-    A class representing an event in a PostgreSQL channel.
-
-    Attributes:
-        channel: The PostgreSQL channel the event belongs to.
-        sent_at: The timestamp when the event was sent.
-        type: The event type discriminator.
-        received_at: The timestamp when the event was received.
-    """
+    """Base NOTIFY event. ``received_at`` is stamped on validation."""
 
     channel: Channel
     sent_at: AwareDatetime
@@ -62,20 +46,12 @@ class Event(BaseModel):
 
     @property
     def latency(self) -> timedelta:
-        """
-        Calculate the latency between when the event was sent and received.
-        """
+        """``received_at - sent_at``."""
         return self.received_at - self.sent_at
 
 
 class TableChangedEvent(Event):
-    """
-    A class representing an event in a PostgreSQL channel.
-
-    Attributes:
-        operation: The type of operation performed (insert, update or delete).
-        table: The table the event is associated with.
-    """
+    """Row-level change on the queue table."""
 
     type: Literal["table_changed_event"]
     operation: OPERATIONS
@@ -83,27 +59,16 @@ class TableChangedEvent(Event):
 
 
 class CancellationEvent(Event):
-    """
-    A class representing an cancellation event in a PostgreSQL channel.
-
-    Attributes:
-        ids: The job-ids to mark for cancellation
-    """
+    """Request cancellation of *ids*."""
 
     type: Literal["cancellation_event"]
     ids: list[JobId]
 
 
 class HealthCheckEvent(Event):
-    """
-    A class representing a health check event in a PostgreSQL channel.
+    """Echo response for a health-check probe; ``id`` matches the originating probe."""
 
-    Attributes:
-        id: A unique identifier for the health check event, used to ensure
-            correct event matching in scenarios with multiple senders.
-    """
-
-    id: uuid.UUID
+    id: HealthCheckId
     type: Literal["health_check_event"]
 
 
@@ -117,13 +82,11 @@ class AnyEvent(
 ): ...
 
 
-###### Jobs ######
-
-
 class Job(BaseModel):
-    """
-    Represents a job with attributes such as ID, priority,
-    creation time, status, entrypoint, and optional payload.
+    """A queued or in-flight job row.
+
+    ``slot`` is the capacity seat held while picked under a ``concurrency_limit``;
+    None for unlimited entrypoints and for rows not currently picked.
     """
 
     id: JobId
@@ -133,35 +96,32 @@ class Job(BaseModel):
     heartbeat: AwareDatetime
     execute_after: AwareDatetime
     status: JOB_STATUS
-    entrypoint: str
+    entrypoint: QueueEntrypoint
     payload: bytes | None
     attempts: int = 0
-    queue_manager_id: uuid.UUID | None
+    queue_manager_id: QueueManagerId | None
+    slot: Slot | None = None
     headers: Annotated[
-        dict[str, Any] | None,
-        BeforeValidator(lambda x: None if x is None else from_json(x)),
+        dict[str, object] | None,
+        BeforeValidator(lambda x: x if x is None or isinstance(x, dict) else from_json(x)),
     ]
 
-    def logfire_headers(self) -> dict[str, Any] | None:
-        """
-        Extracts logfire headers from the job headers if available.
-        """
-        return None if self.headers is None else self.headers.get("logfire")
+    def header_section(self, key: str) -> dict[str, object] | None:
+        """Return the nested header dict under *key*, or None when absent or not a dict."""
+        section = None if self.headers is None else self.headers.get(key)
+        return section if isinstance(section, dict) else None
 
-    def sentry_headers(self) -> dict[str, Any] | None:
-        """
-        Extracts sentry headers from the job headers if available.
-        """
-        return None if self.headers is None else self.headers.get("sentry")
+    def logfire_headers(self) -> dict[str, object] | None:
+        """Return the ``logfire`` sub-dict from job headers, or None."""
+        return self.header_section("logfire")
 
-    def otel_headers(self) -> dict[str, Any] | None:
-        """
-        Extracts OpenTelemetry W3C propagation headers from the job headers if available.
-        """
-        return None if self.headers is None else self.headers.get("otel")
+    def sentry_headers(self) -> dict[str, object] | None:
+        """Return the ``sentry`` sub-dict from job headers, or None."""
+        return self.header_section("sentry")
 
-
-###### Log ######
+    def otel_headers(self) -> dict[str, object] | None:
+        """Return the ``otel`` W3C propagation sub-dict from job headers, or None."""
+        return self.header_section("otel")
 
 
 class Log(BaseModel):
@@ -171,7 +131,7 @@ class Log(BaseModel):
     job_id: JobId
     status: JOB_STATUS
     priority: int
-    entrypoint: str
+    entrypoint: QueueEntrypoint
     traceback: Annotated[
         TracebackRecord | None,
         BeforeValidator(lambda x: None if x is None else from_json(x)),
@@ -179,26 +139,28 @@ class Log(BaseModel):
     aggregated: bool
 
 
-###### Statistics ######
+class JobStatusRow(BaseModel):
+    """One ``(job_id, status)`` pair from a job-status lookup."""
+
+    job_id: JobId
+    status: JOB_STATUS
+
+
 class QueueStatistics(BaseModel):
-    """
-    Represents the number of jobs per entrypoint and priority in the queue.
-    """
+    """Per-(entrypoint, priority, status) job count snapshot."""
 
     count: int
-    entrypoint: str
+    entrypoint: QueueEntrypoint
     priority: int
     status: JOB_STATUS
 
 
 class LogStatistics(BaseModel):
-    """
-    Represents log statistics for jobs based on status, entrypoint, and priority.
-    """
+    """Per-(entrypoint, priority, status) processing counts bucketed by second."""
 
     count: int
     created: AwareDatetime
-    entrypoint: str
+    entrypoint: QueueEntrypoint
     priority: int
     status: JOB_STATUS
 
@@ -235,7 +197,7 @@ class Context:
     """
 
     cancellation: anyio.CancelScope
-    resources: MutableMapping = dataclasses.field(default_factory=dict)
+    resources: MutableMapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -249,10 +211,7 @@ class ScheduleContext:
             mapping; never None. Users can mutate this at runtime if needed.
     """
 
-    resources: MutableMapping = dataclasses.field(default_factory=dict)
-
-
-###### Schedules ######
+    resources: MutableMapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 class CronExpressionEntrypoint(NamedTuple):
@@ -272,7 +231,102 @@ class Schedule(BaseModel):
     entrypoint: CronEntrypoint
 
 
-###### Tracebacks ######
+class QueueAgeStats(BaseModel):
+    """Per-entrypoint backlog age for queued jobs."""
+
+    entrypoint: QueueEntrypoint
+    queued_count: int
+    oldest_created: AwareDatetime
+    oldest_age_seconds: float
+    avg_age_seconds: float
+
+
+class JobDurationStats(BaseModel):
+    """Per-entrypoint execution-duration percentiles derived from log transitions."""
+
+    entrypoint: QueueEntrypoint
+    completed: int
+    p50_seconds: float
+    p95_seconds: float
+    p99_seconds: float
+    max_seconds: float
+
+
+class ThroughputStats(BaseModel):
+    """Total processed jobs per (entrypoint, status) over a time window."""
+
+    entrypoint: QueueEntrypoint
+    status: JOB_STATUS
+    total_count: int
+
+
+class ThroughputBucket(BaseModel):
+    """Per-minute processed-job count for one (entrypoint, status)."""
+
+    bucket: AwareDatetime
+    entrypoint: QueueEntrypoint
+    status: JOB_STATUS
+    count: int
+
+
+class ActiveWorker(BaseModel):
+    """A queue manager currently holding picked jobs."""
+
+    queue_manager_id: QueueManagerId
+    active_jobs: int
+    oldest_heartbeat: AwareDatetime
+    newest_heartbeat: AwareDatetime
+    entrypoints: list[QueueEntrypoint]
+
+
+class StaleJob(BaseModel):
+    """A picked job whose heartbeat is older than the staleness threshold."""
+
+    id: JobId
+    priority: int
+    queue_manager_id: QueueManagerId | None
+    created: AwareDatetime
+    updated: AwareDatetime
+    heartbeat: AwareDatetime
+    execute_after: AwareDatetime
+    status: JOB_STATUS
+    entrypoint: QueueEntrypoint
+    seconds_since_heartbeat: float
+
+
+class TableInfo(BaseModel):
+    """Size and persistence mode of one PgQueuer table."""
+
+    table_name: str
+    persistence: str
+    estimated_rows: int
+    total_size: str
+
+
+class EntrypointStat(BaseModel):
+    """Combined per-entrypoint health row: depth, latency, durations, failure rate."""
+
+    entrypoint: QueueEntrypoint
+    queued: int
+    picked: int
+    oldest_age_seconds: float | None
+    p50_seconds: float | None
+    p95_seconds: float | None
+    p99_seconds: float | None
+    completed: int
+    failure_rate: float | None
+    sparkline: list[int]
+
+
+class OverviewSnapshot(BaseModel):
+    """Headline numbers for the dashboard overview."""
+
+    queued_total: int
+    picked_total: int
+    failed_total: int
+    active_workers: int
+    oldest_queued_age_seconds: float | None
+    exceptions_recent: int
 
 
 class TracebackRecord(BaseModel):
@@ -281,14 +335,14 @@ class TracebackRecord(BaseModel):
     exception_type: str
     exception_message: str
     traceback: str
-    additional_context: dict[str, Any] | None
+    additional_context: dict[str, object] | None
 
     @classmethod
     def from_exception(
         cls,
         exc: Exception,
         job_id: JobId,
-        additional_context: dict[str, Any] | None = None,
+        additional_context: dict[str, object] | None = None,
     ) -> TracebackRecord:
         return cls(
             job_id=job_id,

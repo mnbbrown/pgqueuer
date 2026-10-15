@@ -16,6 +16,7 @@ from pgqueuer.adapters.mcp.server import (
 )
 from pgqueuer.adapters.persistence.qb import DBSettings
 from pgqueuer.db import AsyncpgDriver
+from pgqueuer.domain.settings import ConnectionSettings
 from pgqueuer.queries import Queries
 
 
@@ -61,26 +62,11 @@ class TestParseInterval:
 
 class TestCreateMcpServer:
     def test_factory_returns_fastmcp(self) -> None:
-        server = create_mcp_server(dsn="postgresql://localhost/test")
+        server = create_mcp_server(
+            dsn="postgresql://localhost/test",
+            connection_settings=ConnectionSettings(pool_min_size=1, pool_max_size=2),
+        )
         assert server.name == "pgqueuer"
-
-    def test_factory_registers_all_tools(self) -> None:
-        server = create_mcp_server(dsn="postgresql://localhost/test")
-        tool_names = {t.name for t in server._tool_manager.list_tools()}
-        expected = {
-            "queue_size",
-            "queue_table_info",
-            "queue_stats",
-            "throughput_summary",
-            "failed_jobs",
-            "queue_log",
-            "schedules",
-            "stale_jobs",
-            "active_workers",
-            "queue_age",
-            "schema_info",
-        }
-        assert expected == tool_names
 
 
 class TestPgQueuerDatabase:
@@ -91,23 +77,6 @@ class TestPgQueuerDatabase:
 
 class TestMcpToolsIntegration:
     """Integration tests that exercise the static queries against a real PgQueuer DB."""
-
-    async def test_queue_size_empty(self, mcpdb: PgQueuerDatabase) -> None:
-        rows = await mcpdb.fetch(mcpdb.qbq.build_queue_size_query())
-        assert rows == []
-
-    async def test_queue_size_with_jobs(
-        self, mcpdb: PgQueuerDatabase, apgdriver: AsyncpgDriver
-    ) -> None:
-        q = Queries(apgdriver)
-        await q.enqueue("test_ep", b"payload", priority=0)
-        await q.enqueue("test_ep", b"payload2", priority=1)
-
-        rows = await mcpdb.fetch(mcpdb.qbq.build_queue_size_query())
-        assert len(rows) >= 1
-        counts = [r["count"] for r in rows]
-        assert all(isinstance(c, int) for c in counts)
-        assert sum(counts) == 2  # type: ignore[arg-type]
 
     async def test_queue_table_browse(
         self, mcpdb: PgQueuerDatabase, apgdriver: AsyncpgDriver
@@ -133,10 +102,6 @@ class TestMcpToolsIntegration:
         rows = await mcpdb.fetch(mcpdb.qbq.build_failed_jobs_query(), 50)
         assert rows == []
 
-    async def test_schedules_empty(self, mcpdb: PgQueuerDatabase) -> None:
-        rows = await mcpdb.fetch(mcpdb.qbs.build_peek_schedule_query())
-        assert rows == []
-
     async def test_stats_aggregation(
         self, mcpdb: PgQueuerDatabase, apgdriver: AsyncpgDriver
     ) -> None:
@@ -144,36 +109,9 @@ class TestMcpToolsIntegration:
         await q.enqueue("stats_ep", b"x", priority=0)
 
         await mcpdb.fetch(mcpdb.qbq.build_aggregate_log_data_to_statistics_query())
-        rows = await mcpdb.fetch(mcpdb.qbq.build_log_statistics_query(), 50, None)
+        stats_query = mcpdb.qbq.build_log_statistics_query(limit=50, last=None)
+        rows = await mcpdb.fetch(stats_query.sql, *stats_query.args)
         assert len(rows) >= 1
-
-    async def test_stale_jobs_none_when_fresh(
-        self, mcpdb: PgQueuerDatabase, apgdriver: AsyncpgDriver
-    ) -> None:
-        q = Queries(apgdriver)
-        await q.enqueue("stale_test", b"x", priority=0)
-
-        rows = await mcpdb.fetch(mcpdb.qbq.build_stale_jobs_query(), timedelta(minutes=5), 50)
-        assert rows == []
-
-    async def test_active_workers_empty(self, mcpdb: PgQueuerDatabase) -> None:
-        rows = await mcpdb.fetch(mcpdb.qbq.build_active_workers_query())
-        assert rows == []
-
-    async def test_queue_age_empty(self, mcpdb: PgQueuerDatabase) -> None:
-        rows = await mcpdb.fetch(mcpdb.qbq.build_queue_age_query())
-        assert rows == []
-
-    async def test_queue_age_with_queued_jobs(
-        self, mcpdb: PgQueuerDatabase, apgdriver: AsyncpgDriver
-    ) -> None:
-        q = Queries(apgdriver)
-        await q.enqueue("age_test", b"x", priority=0)
-
-        rows = await mcpdb.fetch(mcpdb.qbq.build_queue_age_query())
-        assert len(rows) == 1
-        assert rows[0]["entrypoint"] == "age_test"
-        assert rows[0]["queued_count"] == 1
 
     async def test_throughput_summary_empty(self, mcpdb: PgQueuerDatabase) -> None:
         rows = await mcpdb.fetch(mcpdb.qbq.build_throughput_summary_query(), None)
@@ -189,11 +127,3 @@ class TestMcpToolsIntegration:
         rows = await mcpdb.fetch(mcpdb.qbq.build_throughput_summary_query(), None)
         assert len(rows) >= 1
         assert any(r["entrypoint"] == "tp_test" for r in rows)
-
-    async def test_schema_info(self, mcpdb: PgQueuerDatabase) -> None:
-        rows = await mcpdb.fetch(mcpdb.qbq.build_schema_info_query())
-        table_names = {r["table_name"] for r in rows}
-        assert "pgqueuer" in table_names
-        assert "pgqueuer_log" in table_names
-        assert "pgqueuer_statistics" in table_names
-        assert "pgqueuer_schedules" in table_names

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import uuid
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Generator
 from urllib.parse import quote, urlparse, urlunparse
 
 import asyncpg
@@ -12,18 +13,54 @@ import pytest
 import pytest_asyncio
 
 from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
-from pgqueuer.db import AsyncpgDriver, AsyncpgPoolDriver
+from pgqueuer.core.tm import TaskManager
+from pgqueuer.db import AsyncpgDriver
+from pgqueuer.domain.settings import db_settings
 from pgqueuer.queries import Queries
 
 try:  # pragma: no cover - uvloop not installed on Windows
     import uvloop
+
+    HAS_UVLOOP = True
 except ModuleNotFoundError:
-    uvloop = None  # type: ignore[assignment]
+    HAS_UVLOOP = False
 
 from testcontainers.core.container import DockerContainer
-from testcontainers.core.wait_strategies import LogMessageWaitStrategy
+from testcontainers.core.wait_strategies import HealthcheckWaitStrategy
 
 from pgqueuer.db import SyncPsycopgDriver
+
+
+@pytest.fixture(autouse=True)
+def _restore_pgqueuer_env() -> Generator[None, None, None]:
+    """Restore the env vars the CLI callback writes via AppConfig.setup_env.
+
+    setup_env writes PGQUEUER_PREFIX/PGQUEUER_SCHEMA straight into os.environ,
+    and monkeypatch.delenv on an absent key records nothing to undo, so a CLI
+    invocation with --prefix/--schema would otherwise leak into every later
+    test on the same worker. Restore just those keys here; swapping os.environ
+    for a dict copy is not an option because it would stop monkeypatch.setenv
+    from calling os.putenv, which the libpq integration tests rely on.
+    """
+    keys = ("PGQUEUER_PREFIX", "PGQUEUER_SCHEMA")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@pytest.fixture(autouse=True)
+def _fresh_db_settings() -> Generator[None, None, None]:
+    """Re-read DBSettings from the env per test, so a monkeypatched PGQUEUER_* var
+    is seen and does not stay cached into the next test."""
+    db_settings.cache_clear()
+    yield
+    db_settings.cache_clear()
 
 
 @pytest.fixture
@@ -36,7 +73,7 @@ def queries(driver: InMemoryDriver) -> InMemoryQueries:
     return InMemoryQueries(driver=driver)
 
 
-class PGQueuerPostgresContainer(DockerContainer):
+class PgQueuerPostgresContainer(DockerContainer):  # type: ignore[misc]
     """Postgres container with modern wait strategy support
     (libpq env defaults: PGUSER, PGPASSWORD, PGDATABASE, PGPORT)."""
 
@@ -62,7 +99,21 @@ class PGQueuerPostgresContainer(DockerContainer):
         self.with_env("POSTGRES_USER", self.username)
         self.with_env("POSTGRES_PASSWORD", self.password)
         self.with_env("POSTGRES_DB", self.dbname)
-        self.waiting_for(LogMessageWaitStrategy("database system is ready to accept connections"))
+        # Readiness comes from docker's own healthcheck (as in ci.yml service
+        # containers), probing pg_isready over TCP: the image's initdb
+        # bootstrap server listens only on the unix socket and logs a
+        # misleading "ready to accept connections" line, so the container
+        # cannot report healthy before the real server accepts TCP.
+        self._kwargs.setdefault(
+            "healthcheck",
+            {
+                "test": ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", self.username],
+                "interval": 500_000_000,  # docker durations are nanoseconds
+                "timeout": 2_000_000_000,
+                "retries": 120,
+            },
+        )
+        self.waiting_for(HealthcheckWaitStrategy())
 
     def get_connection_url(self, host: str | None = None) -> str:
         if self._container is None:
@@ -81,7 +132,28 @@ class PGQueuerPostgresContainer(DockerContainer):
 @pytest.fixture(scope="session", autouse=True)
 def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
     """Provide uvloop if available; fallback to default policy."""
-    return asyncio.DefaultEventLoopPolicy() if uvloop is None else uvloop.EventLoopPolicy()
+    policy: asyncio.AbstractEventLoopPolicy = (
+        uvloop.EventLoopPolicy() if HAS_UVLOOP else asyncio.DefaultEventLoopPolicy()
+    )
+    return policy
+
+
+CONNECTION_ENV_VARS = (
+    "PGQUEUER_DSN",
+    "PGDSN",
+    "PGQUEUER_POOL_MIN_SIZE",
+    "PGQUEUER_POOL_MAX_SIZE",
+    "PGQUEUER_CONNECT_TIMEOUT",
+    "PGQUEUER_APPLICATION_NAME",
+    "PGCONNECT_TIMEOUT",
+)
+
+
+@pytest.fixture
+def clean_connection_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear connection-related env vars so tests see a deterministic environment."""
+    for var in CONNECTION_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture(scope="session")
@@ -94,6 +166,10 @@ async def postgres_container() -> AsyncGenerator[str, None]:
 
     # https://postgresqlco.nf/doc/en/param/vacuum_buffer_usage_limit/
     # Assume worst case for backwards compatibility
+    #
+    # Memory is bounded per container (shared_buffers, max_wal_size, tmpfs size)
+    # because each xdist worker starts its own container and the data dir lives
+    # on tmpfs (RAM).
     commands = [
         "postgres",
         "-c",
@@ -107,19 +183,22 @@ async def postgres_container() -> AsyncGenerator[str, None]:
         "-c",
         "checkpoint_timeout=30min",
         "-c",
-        "max_wal_size=4GB",
+        "max_wal_size=512MB",
         "-c",
         "checkpoint_completion_target=0.9",
         "-c",
-        "shared_buffers=256MB",
+        "shared_buffers=128MB",
         "-c",
         "autovacuum_naptime=5s",
     ] + (["-c", "vacuum_buffer_usage_limit=8MB"] if int(postgres_version) >= 16 else [])
 
     container = (
-        PGQueuerPostgresContainer(f"postgres:{postgres_version}", driver=None)
+        PgQueuerPostgresContainer(
+            f"postgres:{postgres_version}",
+            driver=None,
+            tmpfs={"/var/lib/pg/data": "rw,size=1g"},
+        )
         .with_command(commands)
-        .with_kwargs(tmpfs={"/var/lib/pg/data": "rw"})
         .with_envs(PGDATA="/var/lib/pg/data")
     )
 
@@ -127,39 +206,86 @@ async def postgres_container() -> AsyncGenerator[str, None]:
         yield running.get_connection_url()
 
 
-@pytest.fixture(scope="session")
-async def migrated_db(postgres_container: str) -> AsyncGenerator[str, None]:
-    """Ensure the database is migrated before running tests."""
-
-    parent = f"parent_{uuid.uuid4().hex}"
-
-    async with asyncpg.create_pool(dsn=build_dsn_for(postgres_container, "/postgres")) as pool:
-        await pool.execute(f"CREATE DATABASE {parent}")
-
-    async with asyncpg.create_pool(dsn=build_dsn_for(postgres_container, f"/{parent}")) as pool:
-        await Queries(AsyncpgPoolDriver(pool)).install()
-
-    yield build_dsn_for(postgres_container, f"/{parent}")
-
-
 def build_dsn_for(base_url: str, path: str) -> str:
     """Build a DSN for the specified path."""
     return urlunparse(urlparse(base_url)._replace(path=path))
 
 
-@pytest_asyncio.fixture(scope="function")
-async def dsn(migrated_db: str) -> AsyncGenerator[str, None]:
-    parent = urlparse(migrated_db).path.strip("/")
+@dataclasses.dataclass(frozen=True)
+class MaintenanceDb:
+    """CREATE / DROP DATABASE against the ``postgres`` maintenance database.
+
+    Opened once per xdist worker and lives on pytest-asyncio's session loop.
+    Tests never touch it: the fixtures below run on the session loop too and
+    hand each test a plain DSN string, so nothing crosses between event loops.
+
+    Before this, every test opened a 10-connection asyncpg pool just to run
+    these two statements (~190ms per test, ~45s of CI wall time).
+    """
+
+    pool: asyncpg.Pool
+    background: TaskManager
+
+    async def create_database(self, name: str, *, template: str | None = None) -> None:
+        stmt = f'CREATE DATABASE "{name}"'
+        if template is not None:
+            stmt += f' TEMPLATE "{template}"'
+        await self.pool.execute(stmt)
+
+    def drop_database_in_background(self, name: str) -> None:
+        # Not awaited: the task runs while the next test sets up, and the
+        # session fixture gathers whatever is left at exit.
+        # FORCE terminates backends a test may have left open. Dropping at all
+        # keeps the 1 GB tmpfs data dir bounded: each clone copies the ~8 MiB
+        # template, so a worker would run out of space mid-suite.
+        stmt = f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'
+        self.background.add(asyncio.create_task(self.pool.execute(stmt)))
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def maintenance_db(postgres_container: str) -> AsyncGenerator[MaintenanceDb, None]:
+    dsn = build_dsn_for(postgres_container, "/postgres")
+    # Two connections: one creates the next test's database while the other
+    # drops the previous one. asyncpg rejects concurrent work on one connection.
+    async with (
+        asyncpg.create_pool(dsn, min_size=2, max_size=2) as pool,
+        TaskManager() as background,
+    ):
+        yield MaintenanceDb(pool, background)
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def migrated_db(
+    postgres_container: str,
+    maintenance_db: MaintenanceDb,
+) -> AsyncGenerator[str, None]:
+    """Create the template database and install the pgqueuer schema into it once."""
+    template = f"parent_{uuid.uuid4().hex}"
+    await maintenance_db.create_database(template)
+
+    dsn = build_dsn_for(postgres_container, f"/{template}")
+    conn = await asyncpg.connect(dsn=dsn)
+    try:
+        await Queries(AsyncpgDriver(conn)).install()
+    finally:
+        await conn.close()
+
+    yield dsn
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def dsn(migrated_db: str, maintenance_db: MaintenanceDb) -> AsyncGenerator[str, None]:
+    """A fresh database per test, cloned from the migrated template.
+
+    Runs on the session loop so it can share the maintenance connections.
+    The test itself runs on its own function loop and only sees the DSN.
+    """
+    template = urlparse(migrated_db).path.strip("/")
     child = f"test_{uuid.uuid4().hex}"
 
-    async with asyncpg.create_pool(dsn=build_dsn_for(migrated_db, path="/postgres")) as pool:
-        # Create a short-lived test db from the template dbname on the container
-        await pool.execute(f"CREATE DATABASE {child} TEMPLATE {parent}")
-
-        yield build_dsn_for(migrated_db, path=f"/{child}")
-
-        # Clean up the test db
-        await pool.execute(f'DROP DATABASE IF EXISTS "{child}" WITH (FORCE)')
+    await maintenance_db.create_database(child, template=template)
+    yield build_dsn_for(migrated_db, f"/{child}")
+    maintenance_db.drop_database_in_background(child)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -170,11 +296,6 @@ async def apgdriver(dsn: str) -> AsyncGenerator[AsyncpgDriver, None]:
         yield driver
     finally:
         await conn.close()
-
-
-@pytest.fixture
-def apg_queries(apgdriver: AsyncpgDriver) -> Queries:
-    return Queries(apgdriver)
 
 
 @pytest_asyncio.fixture(scope="function")

@@ -1,0 +1,135 @@
+"""Offline SQL emission commands; never connect to a database."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Annotated
+
+import typer
+
+from pgqueuer.adapters.persistence import qb, schema_ddl
+from pgqueuer.domain.settings import db_settings
+
+sql_app = typer.Typer(
+    help=(
+        "Emit PgQueuer SQL to stdout without connecting to a database. "
+        "Output is deterministic, semicolon-terminated SQL suitable for "
+        "piping to psql or saving as a migration file."
+    ),
+    no_args_is_help=True,
+)
+
+# Shared option/argument definitions; the executing twins in cli.py reuse these
+# so `pgq sql X` and `pgq X` stay flag-compatible without drifting help text.
+DurabilityOption = Annotated[
+    qb.Durability,
+    typer.Option("--durability", "-d", help="Durability level for tables."),
+]
+CreateSchemaOption = Annotated[
+    bool,
+    typer.Option(
+        "--create-schema/--no-create-schema",
+        help=(
+            "Include CREATE SCHEMA IF NOT EXISTS when --schema is set. Disable when "
+            "the role lacks CREATE on the database and the schema already exists."
+        ),
+    ),
+]
+WidenIdOption = Annotated[
+    bool,
+    typer.Option(
+        "--widen-id/--no-widen-id",
+        help=(
+            "Widen legacy int4 id columns and sequences to BIGINT. Takes an "
+            "ACCESS EXCLUSIVE lock and rewrites each table; use --no-widen-id "
+            "to skip and apply the widening out-of-band."
+        ),
+    ),
+]
+DurabilityArgument = Annotated[
+    qb.Durability,
+    typer.Argument(
+        help=(
+            "The durability mode to set: 'volatile' (all unlogged), "
+            "'balanced' (main table logged, others unlogged), 'durable' (all logged)."
+        ),
+    ),
+]
+
+
+def render_upgrade(settings: qb.DBSettings) -> str:
+    return "\n\n".join(schema_ddl.render_converge(settings))
+
+
+def render_plan(statements: Sequence[str], settings: qb.DBSettings) -> str:
+    """A computed plan as a file: header first, so it cannot be mistaken for a migration.
+
+    Empty when there is nothing to do, so a redirect leaves an empty file
+    rather than one holding a stray newline.
+    """
+    if not statements:
+        return ""
+    header = (
+        f"{schema_ddl.provenance(settings)}\n"
+        "-- Computed from this database's catalog: the delta for this database\n"
+        "-- only. Replaying it elsewhere assumes the other database drifted the\n"
+        "-- same way. For a script that suits any installation of this release,\n"
+        "-- use 'pgq sql upgrade'."
+    )
+    return "\n\n".join([header, *statements])
+
+
+def render_durability(settings: qb.DBSettings) -> str:
+    qbe = qb.QueryBuilderEnvironment(settings)
+    return "\n\n".join(qbe.build_alter_durability_query())
+
+
+def render_autovac(rollback: bool) -> str:
+    qbe = qb.QueryBuilderEnvironment()
+    return (
+        qbe.build_optimize_autovacuum_rollback_query()
+        if rollback
+        else qbe.build_optimize_autovacuum_query()
+    )
+
+
+@sql_app.command(help="SQL to create the PgQueuer schema.")
+def install(
+    durability: DurabilityOption = qb.Durability.durable,
+    create_schema: CreateSchemaOption = True,
+) -> None:
+    settings = qb.DBSettings(durability=durability)
+    typer.echo(schema_ddl.render_install(settings, create_schema=create_schema))
+
+
+@sql_app.command(help="SQL to drop all PgQueuer objects.")
+def uninstall() -> None:
+    typer.echo(schema_ddl.render_uninstall(db_settings()))
+
+
+@sql_app.command(
+    help=(
+        "SQL to migrate an existing installation to the current version. "
+        "Re-states every object behind IF NOT EXISTS; for the exact delta a "
+        "database needs, use 'pgq upgrade --plan'."
+    )
+)
+def upgrade(
+    durability: DurabilityOption = qb.Durability.durable,
+    widen_id: WidenIdOption = True,
+) -> None:
+    typer.echo(render_upgrade(qb.DBSettings(durability=durability, widen_id=widen_id)))
+
+
+@sql_app.command(help="SQL to switch table durability without data loss.")
+def durability(
+    durability: DurabilityArgument,
+) -> None:
+    typer.echo(render_durability(qb.DBSettings(durability=durability)))
+
+
+@sql_app.command(help="SQL for recommended autovacuum settings (--rollback to reset).")
+def autovac(
+    rollback: bool = typer.Option(False, help="Reset to defaults instead."),
+) -> None:
+    typer.echo(render_autovac(rollback))

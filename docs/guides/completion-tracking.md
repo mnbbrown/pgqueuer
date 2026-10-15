@@ -1,16 +1,16 @@
 # Completion Tracking
 
-`CompletionWatcher` lets you **await** the final status of any job, live-streamed via
-PostgreSQL `LISTEN/NOTIFY`, with zero manual polling.
+`CompletionWatcher` lets you **await** the final status of a job using PostgreSQL
+`LISTEN/NOTIFY` instead of polling.
 
 ## Parameters
 
 | Parameter | Type | Default | Purpose |
 |-----------|------|---------|---------|
-| `refresh_interval` | `timedelta` | **5 s** | Safety-net poll in case a `NOTIFY` was lost |
+| `refresh_interval` | `timedelta \| None` | **5 s** | Safety-net poll in case a `NOTIFY` was lost. Pass `None` to disable polling and rely solely on notifications |
 | `debounce` | `timedelta` | **50 ms** | Coalesces bursts of `NOTIFY`s to reduce query load |
 
-## Basic Usage
+## Basic usage
 
 ```python
 from pgqueuer.core.completion import CompletionWatcher
@@ -23,7 +23,11 @@ async with CompletionWatcher(driver, queries=queries) as watcher:
     # status: "successful", "exception", "canceled", or "deleted"
 ```
 
-### Completion Watcher State Flow
+Leaving the `async with` block waits for every waiter that is still pending, and
+the refresh poll keeps running until they resolve. If the block exits with an
+exception or a cancellation, pending waiters are cancelled instead.
+
+### Completion watcher state flow
 
 The watcher monitors a job's progression until it reaches a **terminal state**:
 
@@ -50,7 +54,12 @@ The watcher monitors a job's progression until it reaches a **terminal state**:
         └───────────┘ └────────┘
 ```
 
-## Tracking Many Jobs at Once
+!!! note "`failed` is not a terminal state for the watcher"
+    A held job (`on_failure="hold"`) lands in `failed`, but `wait_for` resolves
+    only on `successful`, `exception`, `canceled`, or `deleted`. A held job stays
+    unresolved until it is re-queued and reaches one of those states.
+
+## Tracking many jobs at once
 
 ```python
 from asyncio import gather
@@ -68,12 +77,15 @@ async with CompletionWatcher(driver, queries=queries) as w:
     )
 ```
 
+!!! note "Batches enqueued with `on_conflict=\"skip\"`"
+    Skipped duplicates come back as `None` instead of a job id. Filter them out before
+    waiting: `[w.wait_for(j) for j in job_ids if j is not None]`.
+
 Terminal states: `canceled`, `deleted`, `exception`, `successful`.
 
-## Helper Patterns
+## Helper patterns
 
-Below are two ready-to-use patterns you can copy into your own code for common
-completion-tracking scenarios.
+Two patterns to copy into your own code.
 
 ### Wait for all jobs
 
@@ -130,17 +142,18 @@ async def wait_for_first(
     return next(iter(done)).result()
 ```
 
-## Notification Reliability
+## Notification reliability
 
-To maximise reliability without heavy polling:
+Two settings keep the watcher reliable without leaning on the refresh poll.
 
-1. **Listener health check** — Enable `--shutdown-on-listener-failure` on the `QueueManager`
-   so it stops (and can be restarted by a supervisor) if the LISTEN channel becomes unhealthy.
+Run with `pgq run --shutdown-on-listener-failure` (or pass
+`shutdown_on_listener_failure=True` to `QueueManager.run()`) so the manager stops when the
+LISTEN channel goes unhealthy and a supervisor can restart it.
 
-2. **Minimize the refresh poll** — Set a long `refresh_interval` to rely primarily on
-   notifications when your channel is stable:
+Then, if the channel is stable, raise `refresh_interval` so notifications carry the traffic
+and the poll stays a fallback:
 
-    ```python
-    async with CompletionWatcher(driver, queries=Queries(driver), refresh_interval=timedelta(minutes=5)) as w:
-        status = await w.wait_for(job_id)
-    ```
+```python
+async with CompletionWatcher(driver, queries=Queries(driver), refresh_interval=timedelta(minutes=5)) as w:
+    status = await w.wait_for(job_id)
+```

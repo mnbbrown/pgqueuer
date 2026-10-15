@@ -2,9 +2,9 @@
 
 This page covers the knobs available for tuning PgQueuer throughput and latency in production.
 
-## Batch Size
+## Batch size
 
-`batch_size` controls how many jobs are fetched from the database in a single `FOR UPDATE SKIP LOCKED` query.
+`batch_size` controls how many jobs are fetched from the database in a single `FOR UPDATE SKIP LOCKED` query. Per the PostgreSQL manual, the `LIMIT` this maps to also bounds how many rows the statement locks per round-trip; see [Row Locking & SKIP LOCKED](../reference/skip-locked.md) for the mechanics.
 
 ```python
 await pgq.run(batch_size=25, dequeue_timeout=timedelta(seconds=10))
@@ -14,6 +14,7 @@ await pgq.run(batch_size=25, dequeue_timeout=timedelta(seconds=10))
 |-----------|---------|--------|
 | `batch_size` | `10` | Jobs fetched per dequeue round-trip |
 | `dequeue_timeout` | `30 s` | How long to wait for new NOTIFY before polling |
+| `log_aggregation_interval` | `30 s` | How often to roll `pgqueuer_log` into `pgqueuer_statistics`; skipped on ticks where the worker logged no jobs, `0` disables (aggregate on read) |
 
 **Tuning guidance:**
 - Increase `batch_size` when jobs are short-lived (< 1 s) and you see many dequeue round-trips
@@ -21,7 +22,7 @@ await pgq.run(batch_size=25, dequeue_timeout=timedelta(seconds=10))
 - Decrease it when jobs are long-running and you want finer concurrency control.
 - `max_concurrent_tasks` must be at least `2 × batch_size`; PgQueuer enforces this.
 
-## Concurrency Limits
+## Concurrency limits
 
 Limit concurrent execution globally or per-entrypoint:
 
@@ -35,10 +36,12 @@ async def resize_image(job: Job) -> None:
     ...
 ```
 
-Use per-entrypoint limits when specific tasks share a scarce external resource (e.g., an API
-with rate limits). Use `max_concurrent_tasks` as a safety ceiling on total asyncio tasks.
+`concurrency_limit` is enforced **globally at the database level** across every worker; set
+`concurrency_limit=4` and at most 4 such jobs run across your entire fleet. Use it when tasks
+share a scarce external resource (e.g., an API with rate limits). `max_concurrent_tasks`, by
+contrast, is a per-process safety ceiling on total asyncio tasks.
 
-## Connection Pooling
+## Connection pooling
 
 For high-throughput deployments, use a connection pool driver instead of a single connection:
 
@@ -57,7 +60,7 @@ pgq = PgQueuer(driver)
 - Start with `max_size = 2 × expected_concurrent_jobs` and adjust based on `pg_stat_activity`.
 - Avoid pools larger than your PostgreSQL `max_connections` allows.
 
-## Durability vs. Throughput
+## Durability vs. throughput
 
 Choose the durability level that matches your risk tolerance:
 
@@ -78,7 +81,7 @@ pgq durability balanced
     Use only for jobs that are safe to drop and re-enqueue (e.g., cache-warming, fire-and-forget
     analytics).
 
-## Autovacuum Tuning
+## Autovacuum tuning
 
 The `pgqueuer` table is high-churn: rows are inserted and then deleted rapidly. Without tuned
 autovacuum, dead tuple bloat accumulates and slows down index scans.
@@ -98,8 +101,8 @@ What this sets on `pgqueuer` and `pgqueuer_schedules` (high-churn tables):
 | `autovacuum_vacuum_cost_delay` | `0` | No throttling |
 | `fillfactor` | `70` | Leave 30% free for HOT updates |
 
-`pgqueuer_log` uses conservative settings (vacuum at 95% dead-tuple ratio) since it is
-append-only.
+`pgqueuer_log` and `pgqueuer_statistics` use conservative settings (vacuum at 95% dead-tuple
+ratio) since they are append-only.
 
 Revert to system defaults:
 
@@ -107,17 +110,17 @@ Revert to system defaults:
 pgq autovac --rollback
 ```
 
-## NOTIFY Channel and Polling Fallback
+## NOTIFY channel and polling fallback
 
-PgQueuer uses `LISTEN/NOTIFY` for near-instant job pickup. A trigger fires on every insert
+PgQueuer uses `LISTEN/NOTIFY` for low-latency job pickup. A trigger fires on every insert
 into `pgqueuer` and sends a notification on the `ch_pgqueuer` channel.
 
 **What can go wrong:** pgBouncer in transaction-pooling mode drops `LISTEN` subscriptions
 between transactions. PgQueuer handles this in two ways:
 
-1. **Polling fallback** — `QueueManager` re-polls after `dequeue_timeout` even without a
+1. **Polling fallback**: `QueueManager` re-polls after `dequeue_timeout` even without a
    NOTIFY, so jobs are never permanently stuck.
-2. **Listener health check** — start with `--shutdown-on-listener-failure` so a supervisor
+2. **Listener health check**: start with `--shutdown-on-listener-failure` so a supervisor
    can restart a manager whose LISTEN channel has become unhealthy:
 
 ```bash
@@ -137,14 +140,16 @@ PgQueuer installs all required indexes automatically. The most important for thr
 CREATE INDEX ON pgqueuer (priority ASC, id DESC)
 INCLUDE (id) WHERE status = 'queued';
 
--- Used for heartbeat-based retry detection
-CREATE INDEX ON pgqueuer (heartbeat ASC, id DESC)
+-- Used to find stale 'picked' jobs for crash/retry recovery
+CREATE INDEX ON pgqueuer (updated ASC, id DESC)
 INCLUDE (id) WHERE status = 'picked';
 ```
 
-These partial indexes are maintained by `pgq install` and `pgq upgrade`. Do not drop them.
+These partial indexes are maintained by `pgq install` and `pgq upgrade`. Do not drop them:
+both commands render the same declaration, so an index you drop is one `pgq upgrade`
+will put back.
 
-## Quick-Reference Checklist
+## Quick-reference checklist
 
 - [ ] Run `pgq autovac` after installation
 - [ ] Choose a `durability` level appropriate for your crash recovery requirements

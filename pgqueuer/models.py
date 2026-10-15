@@ -1,5 +1,7 @@
 """Backward-compatibility shim. Canonical: pgqueuer.domain.models"""
 
+from __future__ import annotations
+
 from pgqueuer.domain.models import (
     AnyEvent,
     CancellationEvent,
@@ -23,8 +25,12 @@ from pgqueuer.domain.types import (
     Channel,
     CronEntrypoint,
     CronExpression,
+    HealthCheckId,
     JobId,
+    QueueEntrypoint,
+    QueueManagerId,
     ScheduleId,
+    Slot,
 )
 
 __all__ = [
@@ -39,15 +45,19 @@ __all__ = [
     "Event",
     "HealthCheckEvent",
     "JOB_STATUS",
+    "HealthCheckId",
     "Job",
     "JobId",
     "Log",
     "LogStatistics",
     "OPERATIONS",
+    "QueueEntrypoint",
+    "QueueManagerId",
     "QueueStatistics",
     "Schedule",
     "ScheduleContext",
     "ScheduleId",
+    "Slot",
     "TableChangedEvent",
     "TracebackRecord",
 ]

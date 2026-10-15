@@ -1,9 +1,8 @@
 # Deferred Execution
 
-The `execute_after` attribute enables deferred job execution, allowing you to control when
-a job becomes eligible for processing.
+The `execute_after` attribute controls when a job becomes eligible for processing.
 
-## How It Works
+## How it works
 
 `execute_after` specifies the **earliest** time a job can be picked for execution. If not
 provided, the job is eligible immediately (`NOW()`).
@@ -38,11 +37,11 @@ deferred jobs are never picked early.
     `execute_after` only accepts a `timedelta` offset from the current time (or `None` for
     immediate execution). Absolute `datetime` values are **not** supported.
 
-## Combining with Priority
+## Combining with priority
 
 Deferred jobs participate in the normal priority queue once their `execute_after` time passes:
 
 ```python
-# High priority but deferred — will jump the queue once eligible
+# High priority but deferred: will jump the queue once eligible
 await queries.enqueue("urgent_task", b"data", priority=10, execute_after=timedelta(hours=1))
 ```

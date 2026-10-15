@@ -1,22 +1,31 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Generator
+from typing import TYPE_CHECKING, AsyncIterator, Generator
 
-try:
+if TYPE_CHECKING:
     import logfire
     import logfire.propagate
+
+try:
+    import logfire  # noqa: F811
+    import logfire.propagate  # noqa: F811
+
+    HAS_LOGFIRE = True
 except ImportError:
-    logfire = None  # type: ignore[assignment]
+    HAS_LOGFIRE = False
 
 from pgqueuer.domain.models import Job
 from pgqueuer.ports.tracing import TracingProtocol
 
 
 class LogfireTracing(TracingProtocol):
-    def trace_publish(self, entrypoints: list[str]) -> Generator[dict, None, None]:
-        if logfire is None:
-            yield {}
+    def trace_publish(self, entrypoints: list[str]) -> Generator[dict[str, object], None, None]:
+        if not HAS_LOGFIRE:
+            # One header per entrypoint: merge_tracing_headers zips against
+            # the entrypoint list with strict=True.
+            for _ in entrypoints:
+                yield {}
             return
 
         with logfire.span("Enqueue"):
@@ -26,17 +35,8 @@ class LogfireTracing(TracingProtocol):
 
     @asynccontextmanager
     async def trace_process(self, job: Job) -> AsyncIterator[None]:
-        """
-        Synchronous context manager for tracing queue consumer job processing.
-
-        Args:
-            job (Job): The job being processed, containing headers and metadata.
-
-        Yields:
-            None: This context manager does not return a value but manages the tracing lifecycle.
-        """
-
-        if logfire is None or job.headers is None:
+        """Wrap consumer processing of *job* in a Logfire span when SDK + headers present."""
+        if not HAS_LOGFIRE or job.headers is None:
             yield
             return
 

@@ -33,7 +33,7 @@ Migrate PgQueuer to a Ports & Adapters structure using Python `Protocol` classes
 definitions and dependency injection to wire adapters. The migration is incremental
 (strangler fig) and must not break the public API.
 
-### Constraint: Zero Unnecessary Breaking Changes
+### Constraint: zero unnecessary breaking changes
 
 The following imports must continue to work throughout all phases:
 
@@ -47,17 +47,17 @@ from pgqueuer import (
 The decorator APIs `.entrypoint()` and `.schedule()` must remain stable. When modules move
 to new paths, thin re-export shims preserve the old import locations.
 
-### Port Definitions
+### Port definitions
 
 Ports are `Protocol` classes living in `pgqueuer/ports/`. They capture what the core needs
 without specifying how.
 
-**QueueRepositoryPort** — persistence for the job queue:
+**QueueRepositoryPort**: persistence for the job queue:
 
 ```python
 class QueueRepositoryPort(Protocol):
     async def dequeue(self, batch_size, entrypoints, queue_manager_id, global_concurrency_limit) -> list[Job]: ...
-    async def enqueue(self, entrypoint, payload, priority, ...) -> list[JobId]: ...
+    async def enqueue(self, entrypoint, payload, priority, ..., on_conflict="raise") -> list[JobId] | list[JobId | None]: ...
     async def log_jobs(self, job_status) -> None: ...
     async def clear_queue(self, entrypoint=None) -> None: ...
     async def queue_size(self) -> list[QueueStatistics]: ...
@@ -66,7 +66,7 @@ class QueueRepositoryPort(Protocol):
     async def queued_work(self, entrypoints) -> int: ...
 ```
 
-**ScheduleRepositoryPort** — persistence for cron schedules:
+**ScheduleRepositoryPort**: persistence for cron schedules:
 
 ```python
 class ScheduleRepositoryPort(Protocol):
@@ -77,7 +77,7 @@ class ScheduleRepositoryPort(Protocol):
     async def delete_schedule(self, ids, entrypoints) -> None: ...
 ```
 
-**NotificationPort** — PostgreSQL NOTIFY abstraction:
+**NotificationPort**: PostgreSQL NOTIFY abstraction:
 
 ```python
 class NotificationPort(Protocol):
@@ -85,7 +85,7 @@ class NotificationPort(Protocol):
     async def notify_health_check(self, health_check_event_id) -> None: ...
 ```
 
-**SchemaManagementPort** — DDL operations:
+**SchemaManagementPort**: DDL operations:
 
 ```python
 class SchemaManagementPort(Protocol):
@@ -101,16 +101,16 @@ class SchemaManagementPort(Protocol):
 The existing `Queries` class satisfies all four ports via structural subtyping. No
 inheritance or registration required.
 
-### Existing Ports (Already In Place)
+### Existing ports (already in place)
 
-- **`Driver`** (`pgqueuer.ports.driver`) — database execution abstraction.
+- **`Driver`** (`pgqueuer.ports.driver`): database execution abstraction.
   Methods: `fetch`, `execute`, `add_listener`, `notify`. Adapters:
-  `AsyncpgDriver`, `AsyncpgPoolDriver`, `PsycopgDriver`, `PsycopgPoolDriver`,
-  `SyncPsycopgDriver`, and the in-memory driver.
-- **`TracingProtocol`** (`pgqueuer.ports.tracing`) — distributed tracing.
+  `AsyncpgDriver`, `AsyncpgPoolDriver`, `PsycopgDriver`, `SyncPsycopgDriver`,
+  and the in-memory driver.
+- **`TracingProtocol`** (`pgqueuer.ports.tracing`): distributed tracing.
   Adapters: `LogfireTracing`, `SentryTracing`, `OpenTelemetryTracing`.
 
-### Dependency Injection Pattern
+### Dependency injection pattern
 
 `QueueManager` and `SchedulerManager` accept a `queries` argument (a `RepositoryPort`)
 as the first positional parameter. The underlying driver is accessed via
@@ -121,7 +121,7 @@ as the first positional parameter. The underlying driver is accessed via
 class QueueManager:
     queries: RepositoryPort
     channel: models.Channel = dataclasses.field(
-        default=models.Channel(DBSettings().channel),
+        default_factory=lambda: models.Channel(db_settings().channel),
     )
 ```
 
@@ -136,7 +136,7 @@ qm = QueueManager(Queries(driver))
 when a caller passes a `Driver` directly, so `PgQueuer(driver)` still works.
 `QueueManager` and `SchedulerManager` no longer build adapters themselves.
 
-### Target Directory Layout
+### Target directory layout
 
 ```
 pgqueuer/
@@ -144,7 +144,7 @@ pgqueuer/
 
   domain/
     models.py                 # Job, Schedule, Event, Context, statistics
-    types.py                  # JobId, JOB_STATUS, Channel, etc.
+    types.py                  # JobId, QueueEntrypoint, QueueManagerId, HealthCheckId, Slot, etc.
     errors.py                 # Exception hierarchy
     settings.py               # DBSettings, Durability, DurabilityPolicy
 
@@ -162,7 +162,7 @@ pgqueuer/
     executors.py              # AbstractEntrypointExecutor, EntrypointExecutor
     listeners.py              # EventRouter, PGNoticeEventListener
     buffers.py                # TimedOverflowBuffer and typed variants
-    heartbeat.py, cache.py, tm.py, logconfig.py, completion.py
+    heartbeat.py, tm.py, logconfig.py, completion.py
 
   adapters/
     drivers/
@@ -186,27 +186,27 @@ root: `pgqueuer.db`, `pgqueuer.queries`, `pgqueuer.qm`, `pgqueuer.sm`,
 `pgqueuer.executors`, `pgqueuer.errors`, `pgqueuer.applications`,
 `pgqueuer.factories`, `pgqueuer.types`, and `pgqueuer.models`.
 
-Internal-only modules (`buffers`, `cache`, `cli`, `completion`, `heartbeat`,
+Internal-only modules (`buffers`, `cli`, `completion`, `heartbeat`,
 `listeners`, `logconfig`, `qb`, `query_helpers`, `supervisor`, `tm`, `tracing`)
 were exposed at the package root in pre-v1 releases. In v1.0.0 those shims were
-removed — import from the canonical location under `pgqueuer.core.*`,
+removed; import from the canonical location under `pgqueuer.core.*`,
 `pgqueuer.adapters.*`, or `pgqueuer.ports.*` instead. See breaking change #11
 in the v1.0.0 release notes for the full mapping.
 
-### Migration Phases
+### Migration phases
 
-**Phase 0** — ~~Deprecate unused infrastructure fields in executor parameters.~~ Done — deprecated fields removed.
+**Phase 0**: ~~Deprecate unused infrastructure fields in executor parameters.~~ Done; deprecated fields removed.
 
-**Phase 1** — Extract port protocols. Purely additive.
+**Phase 1**: Extract port protocols. Purely additive.
 
-**Phase 2** — Dependency injection for `QueueManager` and `SchedulerManager`.
+**Phase 2**: Dependency injection for `QueueManager` and `SchedulerManager`.
 
-**Phase 3** — Inject tracing instead of global singleton.
+**Phase 3**: Inject tracing instead of global singleton.
 
-**Phase 4** — Directory restructure. Move modules into `domain/`, `ports/`, `core/`,
+**Phase 4**: Directory restructure. Move modules into `domain/`, `ports/`, `core/`,
 `adapters/`. Old paths become re-export shims.
 
-**Phase 5** — Enforce boundaries via `import-linter` CI rules.
+**Phase 5**: Enforce boundaries via `import-linter` CI rules.
 
 Phase dependency graph:
 
@@ -231,7 +231,7 @@ Phase 3 ──┘
 - Developers must learn the directory conventions and respect import boundaries.
 - Protocol definitions add surface area that must stay in sync with `Queries`.
 
-### Risks and Mitigations
+### Risks and mitigations
 
 | Risk | Mitigation |
 |------|-----------|

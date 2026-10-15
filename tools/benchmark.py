@@ -12,7 +12,7 @@ from enum import Enum
 from itertools import count
 from pathlib import Path
 from statistics import quantiles
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 import typer
 import uvloop
@@ -23,13 +23,17 @@ from tqdm.asyncio import tqdm
 from pgqueuer import PgQueuer, types
 from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
 from pgqueuer.db import AsyncpgDriver, AsyncpgPoolDriver, PsycopgDriver
-from pgqueuer.domain.settings import add_prefix
 from pgqueuer.models import Job
 from pgqueuer.ports import RepositoryPort
 from pgqueuer.queries import Queries
 
 
-def job_progress_bar(total: int | None = None) -> tqdm:
+def tablefmt() -> str:
+    """Tabulate table format; PGQUEUER_TABLEFMT preferred, legacy TABLEFMT honored."""
+    return os.environ.get("PGQUEUER_TABLEFMT", os.environ.get("TABLEFMT", "pretty"))
+
+
+def job_progress_bar(total: int | None = None) -> tqdm[NoReturn]:
     """Return a progress bar configured for job throughput measurements."""
     return tqdm(total=total, ascii=True, unit=" job", unit_scale=True, file=sys.stdout)
 
@@ -98,7 +102,7 @@ class BenchmarkResult(BaseModel):
             tabulate(
                 rows,
                 headers=["Field", "Value"],
-                tablefmt=os.environ.get(add_prefix("TABLEFMT"), "pretty"),
+                tablefmt=tablefmt(),
                 colalign=("left", "left"),
             )
         )
@@ -152,7 +156,7 @@ class ThroughputSettings(BaseModel):
                     ["Output JSON", self.output_json or "None"],
                 ],
                 headers=["Field", "Value"],
-                tablefmt=os.environ.get(add_prefix("TABLEFMT"), "pretty"),
+                tablefmt=tablefmt(),
                 colalign=("left", "left"),
             )
         )
@@ -196,7 +200,7 @@ class DrainSettings(BaseModel):
                     ["Output JSON", self.output_json or "None"],
                 ],
                 headers=["Field", "Value"],
-                tablefmt=os.environ.get(add_prefix("TABLEFMT"), "pretty"),
+                tablefmt=tablefmt(),
                 colalign=("left", "left"),
             )
         )
@@ -255,7 +259,7 @@ class SerializeDrainSettings(BaseModel):
                     ["Output JSON", self.output_json or "None"],
                 ],
                 headers=["Field", "Value"],
-                tablefmt=os.environ.get(add_prefix("TABLEFMT"), "pretty"),
+                tablefmt=tablefmt(),
                 colalign=("left", "left"),
             )
         )
@@ -301,7 +305,7 @@ async def make_queries(driver: DriverEnum, conninfo: str = "") -> RepositoryPort
 class Consumer:
     pgq: PgQueuer
     batch_size: int
-    bar: tqdm
+    bar: tqdm[NoReturn]
     mode: types.QueueExecutionMode = types.QueueExecutionMode.continuous
     serialize_dispatch_per_key: bool = False
     dequeue_durations: list[float] | None = None
@@ -323,7 +327,7 @@ class Producer:
     shutdown: asyncio.Event
     queries: RepositoryPort
     batch_size: int
-    cnt: count
+    cnt: count[int]
 
     async def run(self) -> None:
         while not self.shutdown.is_set():
@@ -442,12 +446,12 @@ class ThroughputStrategy:
             created_at=datetime.now(timezone.utc),
             driver=self.settings.driver,
             strategy=StrategyEnum.throughput,
-            elapsed=self.tqdm_format_dict.get("elapsed", 0),
+            elapsed=timedelta(seconds=float(self.tqdm_format_dict.get("elapsed", 0))),
             github_ref_name=os.environ.get("REF_NAME", ""),
             queued=sum(x.count for x in qsize),
             rate=float(self.tqdm_format_dict.get("n", 0))
             / max(float(self.tqdm_format_dict.get("elapsed", 1)), 1),
-            steps=self.tqdm_format_dict.get("n", 0),
+            steps=int(self.tqdm_format_dict.get("n", 0)),
         )
 
     async def teardown(self) -> None:  # pragma: no cover - nothing to clean up
@@ -686,7 +690,7 @@ def main(
         tp_settings = ThroughputSettings(
             driver=driver,
             strategy=strategy,
-            timer=timer,
+            timer=timedelta(seconds=timer),
             dequeue=dequeue,
             dequeue_batch_size=dequeue_batch_size,
             enqueue=enqueue,

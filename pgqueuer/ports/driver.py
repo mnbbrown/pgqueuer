@@ -1,24 +1,68 @@
-"""Port protocols for database drivers.
-
-These Protocol classes define the contracts for database access.
-"""
+"""Port protocols for database drivers."""
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Protocol
+from typing import Callable, Protocol, TypeAlias, runtime_checkable
 
 from typing_extensions import Self
+
+NotifyCallback: TypeAlias = Callable[[str | bytes | bytearray], None]
+"""Callback that receives the payload of a NOTIFY."""
+
+
+@runtime_checkable
+class SqlStateError(Protocol):
+    """Driver exception carrying a PostgreSQL SQLSTATE code.
+
+    Both asyncpg and psycopg errors expose ``sqlstate``; matching on the
+    shape keeps the persistence layer free of driver imports.
+    """
+
+    @property
+    def sqlstate(self) -> str | None: ...
+
+
+@runtime_checkable
+class ConstraintNamed(Protocol):
+    """Exception or diagnostic that names the violated constraint."""
+
+    @property
+    def constraint_name(self) -> str | None: ...
+
+
+@runtime_checkable
+class DiagnosticError(Protocol):
+    """psycopg-style error whose ``diag`` carries constraint details."""
+
+    @property
+    def diag(self) -> object: ...
+
+
+@runtime_checkable
+class ListenerRemover(Protocol):
+    """Driver that can unregister a callback added with ``add_listener``.
+
+    Separate from ``Driver`` so existing custom drivers still satisfy ``Driver``.
+    """
+
+    async def remove_listener(
+        self,
+        channel: str,
+        callback: NotifyCallback,
+    ) -> None:
+        """Stop delivering NOTIFY payloads on *channel* to *callback*."""
+        ...
 
 
 class TaskManagerPort(Protocol):
     """Protocol for managing background asyncio tasks."""
 
-    tasks: set[asyncio.Task]
+    tasks: set[asyncio.Task[object]]
 
-    def add(self, task: asyncio.Task) -> None: ...
+    def add(self, task: asyncio.Task[object]) -> None: ...
 
-    async def gather_tasks(self, return_exceptions: bool = True) -> list[BaseException | None]: ...
+    async def gather_tasks(self, return_exceptions: bool = True) -> list[object]: ...
 
     async def __aenter__(self) -> "TaskManagerPort": ...
 
@@ -26,64 +70,28 @@ class TaskManagerPort(Protocol):
 
 
 class Driver(Protocol):
-    """
-    Protocol defining the essential database operations for drivers.
-
-    The `Driver` protocol specifies the methods that a database driver must implement
-    to be compatible with the system. This includes methods for fetching records,
-    executing queries, adding listeners for notifications, and managing the driver's lifecycle.
-    """
+    """Async database driver contract: fetch/execute/notify/listen + lifecycle."""
 
     async def fetch(
         self,
         query: str,
-        *args: Any,
-    ) -> list[dict]:
-        """
-        Fetch multiple records from the database.
-
-        Args:
-            query (str): The SQL query to execute.
-            *args (Any): Positional arguments to substitute into the query.
-
-        Returns:
-            list[dict]: A list of dictionaries representing the fetched records.
-        """
+        *args: object,
+    ) -> list[dict[str, object]]:
         raise NotImplementedError
 
     async def execute(
         self,
         query: str,
-        *args: Any,
+        *args: object,
     ) -> str:
-        """
-        Execute a SQL query and return the status message.
-
-        Args:
-            query (str): The SQL query to execute.
-            *args (Any): Positional arguments to substitute into the query.
-
-        Returns:
-            str: The status message returned by the database after execution.
-        """
         raise NotImplementedError
 
     async def add_listener(
         self,
         channel: str,
-        callback: Callable[[str | bytes | bytearray], None],
+        callback: NotifyCallback,
     ) -> None:
-        """
-        Add a listener for a PostgreSQL NOTIFY channel.
-
-        Registers a callback function to be called whenever a notification is received
-        on the specified channel.
-
-        Args:
-            channel (str): The name of the PostgreSQL channel to listen on.
-            callback (Callable[[str | bytes | bytearray], None]): The function to call when a
-                notification is received.
-        """
+        """Register *callback* to receive payloads from NOTIFY on *channel*."""
         raise NotImplementedError
 
     async def notify(self, channel: str, payload: str) -> None:
@@ -92,62 +100,27 @@ class Driver(Protocol):
 
     @property
     def shutdown(self) -> asyncio.Event:
-        """
-        An asyncio.Event indicating the liveness of the driver.
-
-        This event can be used to signal when the driver is shutting down or no longer active.
-        """
+        """Set when the driver should stop accepting new work."""
         raise NotImplementedError
 
     @property
     def tm(self) -> TaskManagerPort:
-        """
-        TaskManager instance for managing background tasks.
-
-        Provides a way to manage and await background tasks associated with the driver.
-        """
+        """TaskManager tracking the driver's background tasks (e.g. notify watchers)."""
         raise NotImplementedError
 
     async def __aenter__(self) -> Self:
-        """
-        Enter the runtime context related to this object.
-
-        Returns:
-            Self: Returns self to allow the driver to be used as an asynchronous context manager.
-        """
         raise NotImplementedError
 
     async def __aexit__(self, *_: object) -> None:
-        """
-        Exit the runtime context and perform cleanup actions.
-
-        Args:
-            *_ (object): Ignored arguments.
-        """
         raise NotImplementedError
 
 
 class SyncDriver(Protocol):
-    """
-    Protocol defining the essential database operations for synchronous drivers.
-
-    The `SyncDriver` protocol specifies the methods that a synchronous database driver
-    must implement to be compatible with the system. This includes methods for fetching records.
-    """
+    """Synchronous database driver contract: fetch only."""
 
     def fetch(
         self,
         query: str,
-        *args: Any,
-    ) -> list[dict]:
-        """
-        Fetch multiple records from the database synchronously.
-
-        Args:
-            query (str): The SQL query to execute.
-            *args (Any): Positional arguments to substitute into the query.
-
-        Returns:
-            list[dict]: A list of dictionaries representing the fetched records.
-        """
+        *args: object,
+    ) -> list[dict[str, object]]:
         raise NotImplementedError

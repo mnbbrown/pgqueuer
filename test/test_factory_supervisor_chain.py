@@ -11,7 +11,7 @@ import asyncio
 import functools
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
-from typing import AsyncGenerator, Generator
+from typing import Any, AsyncGenerator, Generator
 
 import async_timeout
 import pytest
@@ -154,7 +154,7 @@ async def test_coroutine_factory_rejected_with_migration() -> None:
 
     with pytest.raises(TypeError, match="AsyncContextManager") as exc_info:
         await supervisor.runit(
-            factory=factory,  # type: ignore[arg-type]
+            factory=factory,
             dequeue_timeout=timedelta(seconds=1),
             batch_size=10,
             restart_delay=timedelta(seconds=0),
@@ -176,7 +176,7 @@ async def test_sync_cm_factory_rejected_with_migration() -> None:
 
     with pytest.raises(TypeError, match="AsyncContextManager") as exc_info:
         await supervisor.runit(
-            factory=factory,  # type: ignore[arg-type]
+            factory=factory,
             dequeue_timeout=timedelta(seconds=1),
             batch_size=10,
             restart_delay=timedelta(seconds=0),
@@ -196,7 +196,7 @@ async def test_arbitrary_return_rejected_with_migration() -> None:
 
     with pytest.raises(TypeError, match="AsyncContextManager") as exc_info:
         await supervisor.runit(
-            factory=factory,  # type: ignore[arg-type]
+            factory=factory,
             dequeue_timeout=timedelta(seconds=1),
             batch_size=10,
             restart_delay=timedelta(seconds=0),
@@ -237,12 +237,15 @@ async def test_shutdown_injected_into_pgqueuer() -> None:
         )
     )
     await asyncio.sleep(0.1)
-    assert pgq.shutdown is shutdown
-    assert pgq.qm.shutdown is shutdown
-    assert pgq.sm.shutdown is shutdown
+    # Process shutdown is forwarded into a per-cycle event (not identity-shared),
+    # so PgQueuer.run's finally cannot latch the supervisor loop.
+    assert not pgq.shutdown.is_set()
     shutdown.set()
     async with async_timeout.timeout(2):
+        await pgq.shutdown.wait()
         await task
+    assert pgq.qm.shutdown.is_set()
+    assert pgq.sm.shutdown.is_set()
 
 
 async def test_shutdown_injected_into_queue_manager() -> None:
@@ -267,9 +270,10 @@ async def test_shutdown_injected_into_queue_manager() -> None:
         )
     )
     await asyncio.sleep(0.1)
-    assert qm.shutdown is shutdown
+    assert not qm.shutdown.is_set()
     shutdown.set()
     async with async_timeout.timeout(2):
+        await qm.shutdown.wait()
         await task
 
 
@@ -295,9 +299,10 @@ async def test_shutdown_injected_into_scheduler_manager() -> None:
         )
     )
     await asyncio.sleep(0.1)
-    assert sm.shutdown is shutdown
+    assert not sm.shutdown.is_set()
     shutdown.set()
     async with async_timeout.timeout(2):
+        await sm.shutdown.wait()
         await task
 
 
@@ -310,7 +315,7 @@ async def test_asynccm_factory_setup_raises_propagates() -> None:
     @asynccontextmanager
     async def factory() -> AsyncGenerator[PgQueuer, None]:
         raise RuntimeError("setup failed")
-        yield  # unreachable, needed for generator
+        yield  # type: ignore[unreachable]  # keeps this a generator
 
     with pytest.raises(RuntimeError, match="setup failed"):
         await supervisor.runit(
@@ -356,7 +361,7 @@ async def test_factory_raises_restart_on_failure_retries() -> None:
         nonlocal call_count
         call_count += 1
         raise RuntimeError("transient error")
-        yield  # unreachable, needed for generator
+        yield  # type: ignore[unreachable]  # keeps this a generator
 
     shutdown = asyncio.Event()
     task = asyncio.create_task(
@@ -389,7 +394,7 @@ async def test_run_manager_dispatches_to_queue_manager() -> None:
     qm.shutdown.set()
 
     original_run = qm.run
-    called_with: dict = {}
+    called_with: dict[str, Any] = {}
 
     async def spy_run(**kwargs: object) -> None:
         called_with.update(kwargs)
@@ -424,7 +429,7 @@ async def test_run_manager_dispatches_to_scheduler_manager() -> None:
         called = True
         return await original_run()
 
-    sm.run = spy_run  # type: ignore[method-assign]
+    sm.run = spy_run
 
     await supervisor.run_manager(
         sm,
@@ -441,7 +446,7 @@ async def test_run_manager_dispatches_to_pgqueuer() -> None:
     pgq = _make_pgqueuer()
     pgq.shutdown.set()
 
-    called_with: dict = {}
+    called_with: dict[str, Any] = {}
     original_run = pgq.run
 
     async def spy_run(**kwargs: object) -> None:

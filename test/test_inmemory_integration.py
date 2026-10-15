@@ -6,12 +6,10 @@ import time
 import uuid
 from datetime import timedelta
 
-import pytest
-
 from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
 from pgqueuer.core.applications import PgQueuer
 from pgqueuer.domain.models import Job
-from pgqueuer.domain.types import QueueExecutionMode
+from pgqueuer.domain.types import QueueEntrypoint, QueueExecutionMode, QueueManagerId
 
 # ---------------------------------------------------------------------------
 # PgQueuer.in_memory() factory
@@ -31,7 +29,6 @@ def test_in_memory_factory_creates_instance() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_qm_drain_processes_all_jobs() -> None:
     pq = PgQueuer.in_memory()
     processed: list[int] = []
@@ -61,7 +58,6 @@ async def test_qm_drain_processes_all_jobs() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_performance_enqueue_dequeue() -> None:
     """10k enqueue + dequeue cycle should complete quickly."""
     driver = InMemoryDriver()
@@ -83,11 +79,11 @@ async def test_performance_enqueue_dequeue() -> None:
 
     from pgqueuer.ports.repository import EntrypointExecutionParameter
 
-    qm_id = uuid.uuid4()
+    qm_id = QueueManagerId(uuid.uuid4())
     t0 = time.perf_counter()
     dequeued = await queries.dequeue(
         n,
-        {"perf_ep": EntrypointExecutionParameter(0)},
+        {QueueEntrypoint("perf_ep"): EntrypointExecutionParameter(0)},
         qm_id,
         None,
         heartbeat_timeout=timedelta(seconds=30),

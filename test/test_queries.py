@@ -7,6 +7,9 @@ import psycopg
 import pytest
 
 from pgqueuer import db, errors, models, queries
+from pgqueuer.adapters.persistence.query_helpers import cell
+from pgqueuer.domain.settings import DBSettings
+from pgqueuer.domain.types import QueueEntrypoint, QueueManagerId
 
 
 @pytest.mark.parametrize("N", (1, 2, 64))
@@ -19,6 +22,26 @@ async def test_queries_put(apgdriver: db.Driver, N: int) -> None:
         await q.enqueue("placeholder", None)
 
     assert sum(x.count for x in await q.queue_size()) == N
+
+
+async def test_enqueue_rejects_short_payload_without_null_padding(apgdriver: db.Driver) -> None:
+    q = queries.Queries(apgdriver)
+    await q.enqueue("existing", b"keep")
+
+    with pytest.raises(ValueError, match="payload"):
+        await q.enqueue(["a", "b"], [b"first"], [1, 2])
+
+    assert sum(x.count for x in await q.queue_size()) == 1
+
+
+def test_sync_enqueue_rejects_short_payload_without_null_padding(pgdriver: db.SyncDriver) -> None:
+    q = queries.SyncQueries(pgdriver)
+    q.enqueue("existing", b"keep")
+
+    with pytest.raises(ValueError, match="payload"):
+        q.enqueue(["a", "b"], [b"first"], [1, 2])
+
+    assert sum(x.count for x in q.queue_size()) == 1
 
 
 @pytest.mark.parametrize("N", (1, 2, 64))
@@ -37,8 +60,8 @@ async def test_queries_next_jobs(
     seen = list[int]()
     while jobs := await q.dequeue(
         batch_size=10,
-        entrypoints={"placeholder": queries.EntrypointExecutionParameter(0)},
-        queue_manager_id=uuid.uuid4(),
+        entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=timedelta(seconds=30),
     ):
@@ -70,9 +93,9 @@ async def test_queries_next_jobs_concurrent(
 
     async def consumer() -> None:
         while jobs := await q.dequeue(
-            entrypoints={"placeholder": queries.EntrypointExecutionParameter(1)},
+            entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(1)},
             batch_size=10,
-            queue_manager_id=uuid.uuid4(),
+            queue_manager_id=QueueManagerId(uuid.uuid4()),
             global_concurrency_limit=1000,
             heartbeat_timeout=timedelta(seconds=30),
         ):
@@ -117,8 +140,8 @@ async def test_move_job_log(
 
     while jobs := await q.dequeue(
         batch_size=10,
-        entrypoints={"placeholder": queries.EntrypointExecutionParameter(0)},
-        queue_manager_id=uuid.uuid4(),
+        entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=timedelta(seconds=30),
     ):
@@ -191,9 +214,9 @@ async def test_queue_priority(
     )
 
     while next_jobs := await q.dequeue(
-        entrypoints={"placeholder": queries.EntrypointExecutionParameter(0)},
+        entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)},
         batch_size=10,
-        queue_manager_id=uuid.uuid4(),
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=timedelta(seconds=30),
     ):
@@ -202,6 +225,193 @@ async def test_queue_priority(
             await q.log_jobs([(job, "successful", None)])
 
     assert jobs == sorted(jobs, key=lambda x: x.priority, reverse=True)
+
+
+@pytest.mark.parametrize("batch_size", (1, 3, 10))
+async def test_queue_priority_across_entrypoints(
+    apgdriver: db.Driver,
+    batch_size: int,
+) -> None:
+    """Draining several entrypoints yields one global priority DESC, id ASC order (#668)."""
+    q = queries.Queries(apgdriver)
+
+    entrypoints = ["alpha", "beta", "gamma"]
+    # Tie priorities across entrypoints so the id tiebreak spans entrypoints.
+    enqueue_ep = [entrypoints[n % len(entrypoints)] for n in range(60)]
+    enqueue_prio = [n % 5 for n in range(60)]
+
+    await q.enqueue(
+        enqueue_ep,
+        [f"{n}".encode() for n in range(60)],
+        enqueue_prio,
+    )
+
+    drained = list[models.Job]()
+    while next_jobs := await q.dequeue(
+        entrypoints={
+            QueueEntrypoint(ep): queries.EntrypointExecutionParameter(0) for ep in entrypoints
+        },
+        batch_size=batch_size,
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    ):
+        assert next_jobs == sorted(next_jobs, key=lambda j: (-j.priority, j.id))
+        for job in next_jobs:
+            drained.append(job)
+            await q.log_jobs([(job, "successful", None)])
+
+    assert len(drained) == 60
+    assert len({job.id for job in drained}) == 60
+    assert drained == sorted(drained, key=lambda j: (-j.priority, j.id))
+
+
+async def test_stale_job_priority_beats_fresh_work(apgdriver: db.Driver) -> None:
+    """A stale high-priority job outranks fresh lower-priority work (#684)."""
+    q = queries.Queries(apgdriver)
+    entrypoints = {QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)}
+    heartbeat_timeout = timedelta(seconds=0.01)
+
+    await q.enqueue("placeholder", b"stale-hi", priority=10)
+    picked = await q.dequeue(
+        batch_size=10,
+        entrypoints=entrypoints,
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(picked) == 1
+    stale_id = picked[0].id
+
+    await q.enqueue(["placeholder"] * 3, [b"fresh-lo"] * 3, [0] * 3)
+    await asyncio.sleep(heartbeat_timeout.total_seconds())
+
+    recovered = await q.dequeue(
+        batch_size=1,
+        entrypoints=entrypoints,
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=heartbeat_timeout,
+    )
+    assert [j.id for j in recovered] == [stale_id]
+
+
+@pytest.mark.parametrize("batch_size", (1, 5, 7))
+async def test_dequeue_caps_at_batch_size_across_entrypoints(
+    apgdriver: db.Driver,
+    batch_size: int,
+) -> None:
+    """A single dequeue returns at most batch_size jobs total across all entrypoints (#668)."""
+    q = queries.Queries(apgdriver)
+
+    entrypoints = ["a", "b", "c", "d"]
+    per_ep = 5
+    enqueue_ep = [ep for ep in entrypoints for _ in range(per_ep)]
+    total = len(enqueue_ep)
+
+    await q.enqueue(enqueue_ep, [None] * total, [0] * total)
+
+    picked = await q.dequeue(
+        batch_size=batch_size,
+        entrypoints={
+            QueueEntrypoint(ep): queries.EntrypointExecutionParameter(0) for ep in entrypoints
+        },
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+
+    assert len(picked) == min(batch_size, total)
+
+
+async def test_has_queued_work_existence_contract(apgdriver: db.Driver) -> None:
+    """queued_work reports positive when work exists, zero otherwise, ignoring picked rows."""
+    q = queries.Queries(apgdriver)
+
+    assert await q.queued_work([QueueEntrypoint("foo")]) == 0
+
+    await q.enqueue(["foo"] * 3, [None] * 3, [0] * 3)
+
+    assert await q.queued_work([QueueEntrypoint("foo")]) > 0
+    assert await q.queued_work([QueueEntrypoint("bar")]) == 0
+
+    picked = await q.dequeue(
+        batch_size=10,
+        entrypoints={QueueEntrypoint("foo"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(picked) == 3
+    assert await q.queued_work([QueueEntrypoint("foo")]) == 0
+
+
+async def test_dequeue_caps_picks_to_entrypoint_remaining_slots(apgdriver: db.Driver) -> None:
+    """One dequeue never picks more jobs for an entrypoint than its free slots."""
+    q = queries.Queries(apgdriver)
+
+    await q.enqueue(["tight"] * 10, [None] * 10, [0] * 10)
+    await q.enqueue(["loose"] * 10, [None] * 10, [0] * 10)
+
+    picked = await q.dequeue(
+        batch_size=10,
+        entrypoints={
+            QueueEntrypoint("tight"): queries.EntrypointExecutionParameter(2),
+            QueueEntrypoint("loose"): queries.EntrypointExecutionParameter(0),
+        },
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=None,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+
+    tight = [job for job in picked if job.entrypoint == "tight"]
+    assert len(tight) <= 2
+    assert len(picked) == 10
+
+
+async def test_dequeue_hard_caps_worker_budget(apgdriver: db.Driver) -> None:
+    """A worker's picked total never exceeds global_concurrency_limit, even mid-batch."""
+    q = queries.Queries(apgdriver)
+    queue_manager_id = QueueManagerId(uuid.uuid4())
+
+    await q.enqueue(["fetch"] * 10, [None] * 10, [0] * 10)
+
+    async def dequeue() -> list[models.Job]:
+        return await q.dequeue(
+            batch_size=4,
+            entrypoints={QueueEntrypoint("fetch"): queries.EntrypointExecutionParameter(0)},
+            queue_manager_id=queue_manager_id,
+            global_concurrency_limit=5,
+            heartbeat_timeout=timedelta(seconds=30),
+        )
+
+    assert len(await dequeue()) == 4
+    assert len(await dequeue()) == 1
+    assert len(await dequeue()) == 0
+
+
+async def test_eligible_queued_work_excludes_deferred(apgdriver: db.Driver) -> None:
+    """eligible_queued_work ignores jobs whose execute_after is in the future."""
+    q = queries.Queries(apgdriver)
+
+    await q.enqueue("foo", None, 0)
+    await q.enqueue("foo", None, 0, execute_after=timedelta(seconds=30))
+
+    assert await q.queued_work([QueueEntrypoint("foo")]) > 0
+    assert await q.eligible_queued_work([QueueEntrypoint("foo")]) > 0
+
+    picked = await q.dequeue(
+        batch_size=10,
+        entrypoints={QueueEntrypoint("foo"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(picked) == 1
+
+    # Only the deferred job remains: still queued work, but none eligible.
+    assert await q.queued_work([QueueEntrypoint("foo")]) > 0
+    assert await q.eligible_queued_work([QueueEntrypoint("foo")]) == 0
 
 
 @pytest.mark.parametrize("N", (1, 2, 64))
@@ -222,8 +432,8 @@ async def test_queue_retry_timer(
     # Pick all jobs, and mark then as "in progress"
     while _ := await q.dequeue(
         batch_size=10,
-        entrypoints={"placeholder": queries.EntrypointExecutionParameter(0)},
-        queue_manager_id=uuid.uuid4(),
+        entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=timedelta(seconds=30),
     ):
@@ -233,8 +443,10 @@ async def test_queue_retry_timer(
         len(
             await q.dequeue(
                 batch_size=10,
-                entrypoints={"placeholder": queries.EntrypointExecutionParameter(0)},
-                queue_manager_id=uuid.uuid4(),
+                entrypoints={
+                    QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)
+                },
+                queue_manager_id=QueueManagerId(uuid.uuid4()),
                 global_concurrency_limit=1000,
                 heartbeat_timeout=timedelta(seconds=30),
             ),
@@ -247,9 +459,9 @@ async def test_queue_retry_timer(
 
     # Re-fetch, should get the same number of jobs as queued (N).
     while next_jobs := await q.dequeue(
-        entrypoints={"placeholder": queries.EntrypointExecutionParameter(0)},
+        entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)},
         batch_size=10,
-        queue_manager_id=uuid.uuid4(),
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=retry_timer,
     ):
@@ -275,11 +487,13 @@ async def test_queue_log_queued_picked_successful(
 
     # Pick all jobs
     picked_jobs = []
-    queue_manager_id = uuid.uuid4()
+    queue_manager_id = QueueManagerId(uuid.uuid4())
     while jobs := await q.dequeue(
         batch_size=10,
         entrypoints={
-            "test_queue_log_queued_picked_successful": queries.EntrypointExecutionParameter(0)
+            QueueEntrypoint(
+                "test_queue_log_queued_picked_successful"
+            ): queries.EntrypointExecutionParameter(0)
         },
         queue_manager_id=queue_manager_id,
         global_concurrency_limit=1000,
@@ -349,7 +563,7 @@ async def test_queue_log_fetches_inserted_rows(apgdriver: db.Driver) -> None:
     logs = await q.queue_log()
 
     assert sorted(logs, key=lambda log: log.job_id) == sorted(
-        [models.Log(**entry) for entry in entries], key=lambda log: log.job_id
+        [models.Log.model_validate(entry) for entry in entries], key=lambda log: log.job_id
     )
 
 
@@ -370,11 +584,13 @@ async def test_queue_log_queued_picked_exception(
 
     # Pick all jobs
     picked_jobs = []
-    queue_manager_id = uuid.uuid4()
+    queue_manager_id = QueueManagerId(uuid.uuid4())
     while jobs := await q.dequeue(
         batch_size=10,
         entrypoints={
-            "test_queue_log_queued_picked_exception": queries.EntrypointExecutionParameter(0)
+            QueueEntrypoint(
+                "test_queue_log_queued_picked_exception"
+            ): queries.EntrypointExecutionParameter(0)
         },
         queue_manager_id=queue_manager_id,
         global_concurrency_limit=1000,
@@ -501,139 +717,220 @@ async def test_queue_log_queued_dedupe_key_raises_contains_dedupe_key(
     assert dedupe_key in raised.value.dedupe_key
 
 
-async def test_enqueue_if_no_dedupe_skips_without_exception(
+async def test_enqueue_on_conflict_skip_single(
     apgdriver: db.Driver,
     pgdriver: db.SyncDriver,
 ) -> None:
     aq = queries.Queries(apgdriver)
-    dedupe_key = "test_enqueue_if_no_dedupe_skips_without_exception"
 
-    first_id = await aq.enqueue_if_no_dedupe("ep", b"first", dedupe_key=dedupe_key)
-    assert first_id is not None
-    assert await aq.enqueue_if_no_dedupe("ep", b"duplicate", dedupe_key=dedupe_key) is None
+    (first,) = await aq.enqueue("ep", None, dedupe_key="k", on_conflict="skip")
+    assert first is not None
+    assert sum(x.count for x in await aq.queue_size()) == 1
+
+    assert await aq.enqueue("ep", None, dedupe_key="k", on_conflict="skip") == [None]
+    assert sum(x.count for x in await aq.queue_size()) == 1
+
+    sq = queries.SyncQueries(pgdriver)
+    assert sq.enqueue("ep", None, dedupe_key="k", on_conflict="skip") == [None]
+    assert sum(x.count for x in sq.queue_size()) == 1
+
+
+async def fetch_jobs_by_id(
+    driver: db.Driver, ids: list[models.JobId | None]
+) -> dict[object, dict[str, object]]:
+    sql = f"SELECT id, entrypoint, payload FROM {DBSettings().queue_table} WHERE id = ANY($1)"
+    return {r["id"]: r for r in await driver.fetch(sql, [x for x in ids if x is not None])}
+
+
+async def test_enqueue_on_conflict_skip_batch_preserves_shape(apgdriver: db.Driver) -> None:
+    """Skip mode returns one entry per input; ids land on the matching rows."""
+    aq = queries.Queries(apgdriver)
+
+    await aq.enqueue("existing", None, dedupe_key="b")
+
+    ids = await aq.enqueue(
+        ["ep_0", "ep_1", "ep_2"],
+        [b"0", b"1", b"2"],
+        [0, 0, 0],
+        dedupe_key=["a", "b", "c"],
+        on_conflict="skip",
+    )
+    assert [x is None for x in ids] == [False, True, False]
+
+    rows = await fetch_jobs_by_id(apgdriver, ids)
+    for position in (0, 2):
+        assert rows[ids[position]]["entrypoint"] == f"ep_{position}"
+        assert rows[ids[position]]["payload"] == f"{position}".encode()
+
+
+async def test_enqueue_on_conflict_skip_interleaved_null_keys(apgdriver: db.Driver) -> None:
+    aq = queries.Queries(apgdriver)
+
+    await aq.enqueue("existing", None, dedupe_key="dup")
+
+    ids = await aq.enqueue(
+        ["ep_0", "ep_1", "ep_2", "ep_3"],
+        [b"0", b"1", b"2", b"3"],
+        [0, 0, 0, 0],
+        dedupe_key=[None, "dup", None, "new"],
+        on_conflict="skip",
+    )
+    assert [x is None for x in ids] == [False, True, False, False]
+
+    rows = await fetch_jobs_by_id(apgdriver, ids)
+    for position in (0, 2, 3):
+        assert rows[ids[position]]["entrypoint"] == f"ep_{position}"
+        assert rows[ids[position]]["payload"] == f"{position}".encode()
+
+
+async def test_enqueue_on_conflict_skip_within_batch_duplicate(apgdriver: db.Driver) -> None:
+    aq = queries.Queries(apgdriver)
+
+    ids = await aq.enqueue(
+        ["ep", "ep"],
+        [None, None],
+        [0, 0],
+        dedupe_key=["k", "k"],
+        on_conflict="skip",
+    )
+    assert ids[0] is not None
+    assert ids[1] is None
+    assert sum(x.count for x in await aq.queue_size()) == 1
+
+
+async def test_enqueue_on_conflict_skip_no_log_for_skipped(apgdriver: db.Driver) -> None:
+    aq = queries.Queries(apgdriver)
+
+    (first,) = await aq.enqueue("ep", None, dedupe_key="k")
+    ids = await aq.enqueue(
+        ["ep", "ep"],
+        [None, None],
+        [0, 0],
+        dedupe_key=["k", "other"],
+        on_conflict="skip",
+    )
+    assert ids[0] is None
+    second = ids[1]
+    assert second is not None
+
+    logged_job_ids = [log.job_id for log in await aq.queue_log() if log.status == "queued"]
+    assert sorted(logged_job_ids) == sorted([first, second])
+
+
+async def test_enqueue_on_conflict_skip_all_new_keys(apgdriver: db.Driver) -> None:
+    aq = queries.Queries(apgdriver)
+
+    ids = await aq.enqueue(
+        ["ep_a", "ep_b"],
+        [None, None],
+        [0, 0],
+        dedupe_key=["a", "b"],
+        on_conflict="skip",
+    )
+    assert all(x is not None for x in ids)
+    assert sum(x.count for x in await aq.queue_size()) == 2
+
+
+@pytest.mark.parametrize("batch_size", (2, 10))
+async def test_enqueue_on_conflict_skip_concurrent(
+    dsn: str,
+    batch_size: int,
+    apgdriver: db.Driver,
+) -> None:
+    async with asyncpg.create_pool(dsn=dsn) as pool:
+        results = await asyncio.gather(
+            *[
+                queries.Queries(db.AsyncpgPoolDriver(pool)).enqueue(
+                    "ep",
+                    None,
+                    dedupe_key="test_enqueue_on_conflict_skip_concurrent",
+                    on_conflict="skip",
+                )
+                for _ in range(batch_size)
+            ],
+        )
+
+    inserted = [x for (x,) in results if x is not None]
+    assert len(inserted) == 1
+    assert sum(x.count for x in await queries.Queries(apgdriver).queue_size()) == 1
+
+
+async def test_enqueue_on_conflict_update_priority_only_raises(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    """A duplicate raises the active job's priority, and never lowers it (#679)."""
+    aq = queries.Queries(apgdriver)
+    (job_id,) = await aq.enqueue("ep", None, priority=1, dedupe_key="k")
+
+    bumped = await aq.enqueue("ep", None, 5, dedupe_key="k", on_conflict="update_priority")
+    assert bumped == [job_id]
+    assert [(x.priority, x.count) for x in await aq.queue_size()] == [(5, 1)]
+
+    lowered = await aq.enqueue("ep", None, 2, dedupe_key="k", on_conflict="update_priority")
+    assert lowered == [job_id]
+    assert [(x.priority, x.count) for x in await aq.queue_size()] == [(5, 1)]
+
+    sq = queries.SyncQueries(pgdriver)
+    assert sq.enqueue("ep", None, 9, dedupe_key="k", on_conflict="update_priority") == [job_id]
+    assert [(x.priority, x.count) for x in sq.queue_size()] == [(9, 1)]
+
+
+async def test_enqueue_on_conflict_update_priority_batch(apgdriver: db.Driver) -> None:
+    """New keys insert, an active key maps to its job, and only new jobs are logged (#679)."""
+    aq = queries.Queries(apgdriver)
+    (existing,) = await aq.enqueue("ep", None, dedupe_key="dup")
+
+    ids = await aq.enqueue(
+        ["ep", "ep", "ep", "ep"],
+        [None, None, None, None],
+        [3, 3, 3, 3],
+        dedupe_key=[None, "dup", None, "new"],
+        on_conflict="update_priority",
+    )
+
+    assert ids[1] == existing
+    assert len(set(ids)) == 4
+    assert sum(x.count for x in await aq.queue_size()) == 4
+    logged = [log.job_id for log in await aq.queue_log() if log.status == "queued"]
+    assert sorted(logged) == sorted([existing, ids[0], ids[2], ids[3]])
+
+
+async def test_enqueue_on_conflict_update_priority_rejects_repeated_key(
+    apgdriver: db.Driver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+
+    with pytest.raises(ValueError, match="at most once"):
+        await aq.enqueue(
+            ["ep", "ep"],
+            [None, None],
+            [0, 0],
+            dedupe_key=["k", "k"],
+            on_conflict="update_priority",
+        )
+    assert await aq.queue_size() == []
+
+
+async def test_enqueue_on_conflict_update_priority_moves_job_ahead(apgdriver: db.Driver) -> None:
+    """The bumped job is dequeued first; once picked, a duplicate adds no job (#679)."""
+    aq = queries.Queries(apgdriver)
+    (job_id,) = await aq.enqueue("ep", None, priority=0, dedupe_key="k")
+    await aq.enqueue("ep", None, priority=1)
+    await aq.enqueue("ep", None, 10, dedupe_key="k", on_conflict="update_priority")
 
     jobs = await aq.dequeue(
-        batch_size=10,
-        entrypoints={"ep": queries.EntrypointExecutionParameter(0)},
-        queue_manager_id=uuid.uuid4(),
-        global_concurrency_limit=1000,
-        heartbeat_timeout=timedelta(seconds=30),
-    )
-    assert len(jobs) == 1
-    assert await aq.enqueue_if_no_dedupe("ep", b"picked", dedupe_key=dedupe_key) is None
-
-    await aq.log_jobs([(jobs[0], "successful", None)])
-    assert await aq.enqueue_if_no_dedupe("ep", b"fresh", dedupe_key=dedupe_key) is not None
-
-    sq = queries.SyncQueries(pgdriver)
-    sync_key = "test_enqueue_if_no_dedupe_skips_without_exception_sync"
-    assert sq.enqueue_if_no_dedupe("sync_ep", None, dedupe_key=sync_key) is not None
-    assert sq.enqueue_if_no_dedupe("sync_ep", None, dedupe_key=sync_key) is None
-
-
-async def test_enqueue_if_no_dedupe_retries_picked_conflict(
-    apgdriver: db.Driver,
-    pgdriver: db.SyncDriver,
-) -> None:
-    aq = queries.Queries(apgdriver)
-    dedupe_key = "test_enqueue_if_no_dedupe_retries_picked_conflict"
-
-    await aq.enqueue("ep", None, dedupe_key=dedupe_key)
-    jobs = await aq.dequeue(
-        batch_size=10,
-        entrypoints={"ep": queries.EntrypointExecutionParameter(0)},
-        queue_manager_id=uuid.uuid4(),
-        global_concurrency_limit=1000,
-        heartbeat_timeout=timedelta(seconds=30),
-    )
-    assert len(jobs) == 1
-
-    enqueue_task = asyncio.create_task(aq.enqueue_if_no_dedupe("ep", None, dedupe_key=dedupe_key))
-    await asyncio.sleep(0.02)
-    await aq.log_jobs([(jobs[0], "successful", None)])
-
-    assert await enqueue_task is not None
-
-    sync_key = "test_enqueue_if_no_dedupe_retries_picked_conflict_sync"
-    await aq.enqueue("sync_ep", None, dedupe_key=sync_key)
-    sync_jobs = await aq.dequeue(
-        batch_size=10,
-        entrypoints={"sync_ep": queries.EntrypointExecutionParameter(0)},
-        queue_manager_id=uuid.uuid4(),
-        global_concurrency_limit=1000,
-        heartbeat_timeout=timedelta(seconds=30),
-    )
-    assert len(sync_jobs) == 1
-
-    sq = queries.SyncQueries(pgdriver)
-    sync_enqueue_task = asyncio.create_task(
-        asyncio.to_thread(sq.enqueue_if_no_dedupe, "sync_ep", None, dedupe_key=sync_key)
-    )
-    await asyncio.sleep(0.02)
-    await aq.log_jobs([(sync_jobs[0], "successful", None)])
-
-    assert await sync_enqueue_task is not None
-
-
-async def test_enqueue_if_no_queued_skips_only_queued_jobs(
-    apgdriver: db.Driver,
-    pgdriver: db.SyncDriver,
-) -> None:
-    aq = queries.Queries(apgdriver)
-
-    first_id = await aq.enqueue_if_no_queued("ep", b"first", serialize_key="resource-1")
-    assert first_id is not None
-    assert await aq.enqueue_if_no_queued("ep", b"duplicate", serialize_key="resource-1") is None
-    assert await aq.enqueue_if_no_queued("other", b"other", serialize_key="resource-1") is not None
-    assert await aq.enqueue_if_no_queued("ep", b"other", serialize_key="resource-2") is not None
-
-    jobs = await aq.dequeue(
-        batch_size=10,
-        entrypoints={"ep": queries.EntrypointExecutionParameter(0)},
-        queue_manager_id=uuid.uuid4(),
-        global_concurrency_limit=1000,
-        heartbeat_timeout=timedelta(seconds=30),
-    )
-    assert {job.payload for job in jobs} == {b"first", b"other"}
-
-    followup_id = await aq.enqueue_if_no_queued("ep", b"followup", serialize_key="resource-1")
-    assert followup_id is not None
-    assert followup_id != first_id
-
-    sq = queries.SyncQueries(pgdriver)
-    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is not None
-    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None
-
-
-async def test_enqueue_if_no_queued_blocks_on_deferred_jobs(
-    apgdriver: db.Driver,
-    pgdriver: db.SyncDriver,
-) -> None:
-    # A future-scheduled queued row still covers the work (it will run and
-    # observe current state), so it must block duplicates — this is what
-    # makes debouncing via a deferred execute_after composable.
-    aq = queries.Queries(apgdriver)
-
-    deferred_id = await aq.enqueue_if_no_queued(
-        "ep",
-        b"deferred",
-        serialize_key="resource-1",
-        execute_after=timedelta(hours=4),
-    )
-    assert deferred_id is not None
-
-    assert await aq.enqueue_if_no_queued("ep", b"duplicate", serialize_key="resource-1") is None
-
-    sq = queries.SyncQueries(pgdriver)
-    sync_deferred_id = sq.enqueue_if_no_queued(
-        "sync_ep",
+        1,
+        {QueueEntrypoint("ep"): queries.EntrypointExecutionParameter(0)},
+        QueueManagerId(uuid.uuid4()),
         None,
-        serialize_key="sync-resource",
-        execute_after=timedelta(hours=4),
+        heartbeat_timeout=timedelta(seconds=30),
     )
-    assert sync_deferred_id is not None
+    assert [job.id for job in jobs] == [job_id]
 
-    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None
+    again = await aq.enqueue("ep", None, 20, dedupe_key="k", on_conflict="update_priority")
+    assert again == [job_id]
+    assert sum(x.count for x in await aq.queue_size()) == 2
 
 
 @pytest.mark.parametrize("limit", (None, 10))
@@ -653,9 +950,9 @@ async def test_log_statistics(
 
     # Log jobs
     jobs = await q.dequeue(
-        entrypoints={"placeholder": queries.EntrypointExecutionParameter(0)},
+        entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)},
         batch_size=N,
-        queue_manager_id=uuid.uuid4(),
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=timedelta(seconds=30),
     )
@@ -672,15 +969,120 @@ async def test_log_statistics(
     assert sum(x.count for x in stats) == 3 * N
 
 
+async def _unaggregated_count(q: queries.Queries) -> int:
+    rows = await q.driver.fetch(q.qbq.build_unaggregated_log_count_query())
+    return cell(rows[0], "unaggregated", int)
+
+
+async def _log_n_successful(q: queries.Queries, N: int) -> None:
+    await q.enqueue(["placeholder"] * N, [None] * N, [0] * N)
+    jobs = await q.dequeue(
+        entrypoints={QueueEntrypoint("placeholder"): queries.EntrypointExecutionParameter(0)},
+        batch_size=N,
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == N
+    for job in jobs:
+        await q.log_jobs([(job, "successful", None)])
+
+
+async def test_aggregate_logs_populates_statistics_without_read(apgdriver: db.Driver) -> None:
+    """aggregate_logs folds log rows into statistics with no log_statistics read."""
+    q = queries.Queries(apgdriver)
+    N = 5
+    await _log_n_successful(q, N)
+
+    assert await _unaggregated_count(q) > 0
+
+    await q.aggregate_logs()
+
+    assert await _unaggregated_count(q) == 0
+    stats_query = q.qbq.build_log_statistics_query(limit=None, last=None)
+    stats = await q.driver.fetch(stats_query.sql, *stats_query.args)
+    assert sum(cell(r, "count", int) for r in stats) == 3 * N  # queued + picked + successful
+
+
+async def test_aggregate_logs_advisory_lock_skips_when_held(
+    apgdriver: db.Driver,
+    dsn: str,
+) -> None:
+    """aggregate_logs no-ops while another session holds the aggregation advisory lock."""
+    q = queries.Queries(apgdriver)
+    N = 4
+    await _log_n_successful(q, N)
+
+    lock_key = f"hashtext('{q.qbq.qualified.statistics_table}')"
+
+    # Hold the advisory xact lock in a separate session for the duration.
+    holder = await asyncpg.connect(dsn=dsn)
+    try:
+        tx = holder.transaction()
+        await tx.start()
+        await holder.execute(f"SELECT pg_advisory_xact_lock({lock_key})")
+
+        # Lock held -> aggregation must be a no-op.
+        await q.aggregate_logs()
+        assert await _unaggregated_count(q) == 3 * N
+
+        await tx.rollback()  # release the lock
+    finally:
+        await holder.close()
+
+    # Lock free -> aggregation proceeds.
+    await q.aggregate_logs()
+    assert await _unaggregated_count(q) == 0
+
+
+async def test_upgrade_from_legacy_composite_index_still_aggregates(
+    apgdriver: db.Driver,
+) -> None:
+    """An install carrying #668's composite aggregation index upgrades and aggregates.
+
+    Reverting the index only matters if the migration SQL is sound: the
+    schema-qualified DROP must find the index, the CREATE must not collide, and
+    re-running upgrade must stay a no-op. Drive the real upgrade + aggregation
+    path against a seeded legacy composite so a broken migration fails here --
+    the index shape alone has no behavioral effect worth asserting.
+    """
+    log_table = DBSettings().queue_table_log
+    index = f"{log_table}_not_aggregated"
+    q = queries.Queries(apgdriver)
+
+    # Recreate the fattened index #668 shipped to fresh installs of its era.
+    await apgdriver.execute(f"DROP INDEX {index};")
+    await apgdriver.execute(
+        f"CREATE INDEX {index} ON {log_table} "
+        "(entrypoint, priority, status, created) WHERE not aggregated;"
+    )
+
+    # Upgrade rebuilds the index and stays idempotent across repeated runs.
+    await q.upgrade()
+    assert await q.table_has_index(log_table, index)
+    await q.upgrade()
+    assert await q.table_has_index(log_table, index)
+
+    # The aggregation path that relies on this index still folds log -> stats.
+    N = 5
+    await _log_n_successful(q, N)
+    assert await _unaggregated_count(q) > 0
+    await q.aggregate_logs()
+    assert await _unaggregated_count(q) == 0
+    stats_query = q.qbq.build_log_statistics_query(limit=None, last=None)
+    stats = await q.driver.fetch(stats_query.sql, *stats_query.args)
+    assert sum(cell(r, "count", int) for r in stats) == 3 * N  # queued + picked + successful
+
+
 async def test_enqueue_with_headers(apgdriver: db.Driver) -> None:
     q = queries.Queries(apgdriver)
     headers = {"trace": "abc"}
     await q.enqueue("header_task", None, headers=headers)
 
     jobs = await q.dequeue(
-        entrypoints={"header_task": queries.EntrypointExecutionParameter(0)},
+        entrypoints={QueueEntrypoint("header_task"): queries.EntrypointExecutionParameter(0)},
         batch_size=1,
-        queue_manager_id=uuid.uuid4(),
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
         global_concurrency_limit=1000,
         heartbeat_timeout=timedelta(seconds=30),
     )
@@ -742,3 +1144,138 @@ async def test_queries_from_psycopg_connection(dsn: str) -> None:
         assert sum(x.count for x in queue_sizes) > 0
     finally:
         await connection.close()
+
+
+async def test_enqueue_if_no_dedupe_skips_without_exception(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+    dedupe_key = "test_enqueue_if_no_dedupe_skips_without_exception"
+
+    first_id = await aq.enqueue_if_no_dedupe("ep", b"first", dedupe_key=dedupe_key)
+    assert first_id is not None
+    assert await aq.enqueue_if_no_dedupe("ep", b"duplicate", dedupe_key=dedupe_key) is None
+
+    jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={QueueEntrypoint("ep"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == 1
+    assert await aq.enqueue_if_no_dedupe("ep", b"picked", dedupe_key=dedupe_key) is None
+
+    await aq.log_jobs([(jobs[0], "successful", None)])
+    assert await aq.enqueue_if_no_dedupe("ep", b"fresh", dedupe_key=dedupe_key) is not None
+
+    sq = queries.SyncQueries(pgdriver)
+    sync_key = "test_enqueue_if_no_dedupe_skips_without_exception_sync"
+    assert sq.enqueue_if_no_dedupe("sync_ep", None, dedupe_key=sync_key) is not None
+    assert sq.enqueue_if_no_dedupe("sync_ep", None, dedupe_key=sync_key) is None
+
+
+async def test_enqueue_if_no_dedupe_retries_picked_conflict(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+    dedupe_key = "test_enqueue_if_no_dedupe_retries_picked_conflict"
+
+    await aq.enqueue("ep", None, dedupe_key=dedupe_key)
+    jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={QueueEntrypoint("ep"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(jobs) == 1
+
+    enqueue_task = asyncio.create_task(aq.enqueue_if_no_dedupe("ep", None, dedupe_key=dedupe_key))
+    await asyncio.sleep(0.02)
+    await aq.log_jobs([(jobs[0], "successful", None)])
+
+    assert await enqueue_task is not None
+
+    sync_key = "test_enqueue_if_no_dedupe_retries_picked_conflict_sync"
+    await aq.enqueue("sync_ep", None, dedupe_key=sync_key)
+    sync_jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={QueueEntrypoint("sync_ep"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert len(sync_jobs) == 1
+
+    sq = queries.SyncQueries(pgdriver)
+    sync_enqueue_task = asyncio.create_task(
+        asyncio.to_thread(sq.enqueue_if_no_dedupe, "sync_ep", None, dedupe_key=sync_key)
+    )
+    await asyncio.sleep(0.02)
+    await aq.log_jobs([(sync_jobs[0], "successful", None)])
+
+    assert await sync_enqueue_task is not None
+
+
+async def test_enqueue_if_no_queued_skips_only_queued_jobs(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    aq = queries.Queries(apgdriver)
+
+    first_id = await aq.enqueue_if_no_queued("ep", b"first", serialize_key="resource-1")
+    assert first_id is not None
+    assert await aq.enqueue_if_no_queued("ep", b"duplicate", serialize_key="resource-1") is None
+    assert await aq.enqueue_if_no_queued("other", b"other", serialize_key="resource-1") is not None
+    assert await aq.enqueue_if_no_queued("ep", b"other", serialize_key="resource-2") is not None
+
+    jobs = await aq.dequeue(
+        batch_size=10,
+        entrypoints={QueueEntrypoint("ep"): queries.EntrypointExecutionParameter(0)},
+        queue_manager_id=QueueManagerId(uuid.uuid4()),
+        global_concurrency_limit=1000,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    assert {job.payload for job in jobs} == {b"first", b"other"}
+
+    followup_id = await aq.enqueue_if_no_queued("ep", b"followup", serialize_key="resource-1")
+    assert followup_id is not None
+    assert followup_id != first_id
+
+    sq = queries.SyncQueries(pgdriver)
+    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is not None
+    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None
+
+
+async def test_enqueue_if_no_queued_blocks_on_deferred_jobs(
+    apgdriver: db.Driver,
+    pgdriver: db.SyncDriver,
+) -> None:
+    # A future-scheduled queued row still covers the work (it will run and
+    # observe current state), so it must block duplicates — this is what
+    # makes debouncing via a deferred execute_after composable.
+    aq = queries.Queries(apgdriver)
+
+    deferred_id = await aq.enqueue_if_no_queued(
+        "ep",
+        b"deferred",
+        serialize_key="resource-1",
+        execute_after=timedelta(hours=4),
+    )
+    assert deferred_id is not None
+
+    assert await aq.enqueue_if_no_queued("ep", b"duplicate", serialize_key="resource-1") is None
+
+    sq = queries.SyncQueries(pgdriver)
+    sync_deferred_id = sq.enqueue_if_no_queued(
+        "sync_ep",
+        None,
+        serialize_key="sync-resource",
+        execute_after=timedelta(hours=4),
+    )
+    assert sync_deferred_id is not None
+
+    assert sq.enqueue_if_no_queued("sync_ep", None, serialize_key="sync-resource") is None

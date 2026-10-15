@@ -2,7 +2,7 @@ import asyncio
 import inspect
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
-from typing import AsyncContextManager, AsyncGenerator, Callable
+from typing import AsyncContextManager, AsyncGenerator, Callable, Iterable
 
 import asyncpg
 import psycopg
@@ -125,6 +125,27 @@ async def test_notify(
 
 
 @pytest.mark.parametrize("driver", drivers())
+@pytest.mark.parametrize("channel", ["MyChan", "my-app.events", "'; DROP TABLE x --"])
+async def test_notify_channel_needs_quoting(
+    dsn: str,
+    driver: Callable[..., AsyncContextManager[Driver]],
+    channel: str,
+) -> None:
+    """LISTEN must quote the channel so it matches pg_notify's string literal (#947).
+
+    Unquoted, MyChan folds to mychan and never receives, and the other two were
+    rejected by the psycopg driver outright.
+    """
+    event = asyncio.Future[str | bytearray | bytes]()
+
+    async with driver(dsn) as d:
+        await d.add_listener(channel, event.set_result)
+        async with driver(dsn) as ad:
+            await ad.notify(channel, "hello")
+        assert await asyncio.wait_for(event, timeout=1) == "hello"
+
+
+@pytest.mark.parametrize("driver", drivers())
 @pytest.mark.parametrize(
     "query, name",
     (
@@ -144,15 +165,19 @@ async def test_notify(
 )
 async def test_valid_query_syntax(
     dsn: str,
-    query: Callable[..., str],
+    query: Callable[..., str | Iterable[str]],
     name: str,
     driver: Callable[..., AsyncContextManager[Driver]],
 ) -> None:
     if name == "build_install_query":
         pytest.skip()
+    if any(
+        p.default is inspect.Parameter.empty for p in inspect.signature(query).parameters.values()
+    ):
+        pytest.skip("builder requires arguments; covered by dedicated tests")
 
     sql = query()
-    sql = sql if isinstance(sql, str) else f"\n{'-' * 50}\n".join(x for x in sql)
+    sql = sql if isinstance(sql, str) else f"\n{'-' * 50}\n".join(sql)
     assert isinstance(sql, str)
 
     def rolledback(sql: str) -> str:
@@ -240,3 +265,13 @@ async def test_no_autocommit_raises(dsn: str) -> None:
     with pytest.raises(RuntimeError):
         async with await psycopg.AsyncConnection.connect(conninfo=dsn) as conn:
             PsycopgDriver(conn)
+
+
+async def test_a_one_connection_pool_queries_but_cannot_listen(dsn: str) -> None:
+    """A listener holds a connection for good, so only listening needs a second one."""
+    async with asyncpg.create_pool(dsn=dsn, min_size=1, max_size=1) as pool:
+        driver = AsyncpgPoolDriver(pool)
+        assert await driver.fetch("SELECT 1 AS one") == [{"one": 1}]
+
+        with pytest.raises(RuntimeError, match="Pool max size"):
+            await driver.add_listener(Channel("ch_one_connection"), lambda _: None)

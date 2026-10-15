@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+from pgqueuer.domain.schema.model import TIMESTAMP, Index, Table, column, index
+from pgqueuer.domain.settings import DBSettings
+from pgqueuer.domain.types import SqlType, TableName
+
+
+def queue_table(settings: DBSettings) -> Table:
+    status = settings.queue_status_type
+    return Table(
+        name=TableName(settings.queue_table),
+        unlogged=settings.durability.config.queue_table == "UNLOGGED",
+        id_sequence_type=SqlType("bigint"),
+        columns=(
+            column("id", "bigint", not_null=True, kind="serial", primary_key=True),
+            column("priority", "integer", not_null=True),
+            column("queue_manager_id", "uuid"),
+            column("created", TIMESTAMP, not_null=True, default="now()"),
+            column("updated", TIMESTAMP, not_null=True, default="now()"),
+            column("heartbeat", TIMESTAMP, not_null=True, default="now()"),
+            column("execute_after", TIMESTAMP, not_null=True, default="now()"),
+            column("status", status, not_null=True),
+            column("entrypoint", "text", not_null=True),
+            column("dedupe_key", "text"),
+            column("payload", "bytea"),
+            column("headers", "jsonb"),
+            column("attempts", "integer", not_null=True, default="0"),
+            column("slot", "bigint"),
+            column("serialize_key", "text"),
+        ),
+    )
+
+
+def dedupe_predicate(settings: DBSettings) -> str:
+    """Partial-index predicate of ``{queue_table}_unique_dedupe_key``.
+
+    An ``ON CONFLICT`` arbiter has to restate it for PostgreSQL to infer the
+    index, so the two are read from here rather than kept in step by hand.
+    """
+    status = settings.queue_status_type
+    return (
+        f"((status = ANY (ARRAY['queued'::{status}, 'picked'::{status}]))"
+        " AND (dedupe_key IS NOT NULL))"
+    )
+
+
+def queue_indexes(settings: DBSettings) -> tuple[Index, ...]:
+    queue = settings.queue_table
+    status = settings.queue_status_type
+    return (
+        index(
+            f"{queue}_priority_id_id1_idx",
+            queue,
+            f"USING btree (priority, id DESC) INCLUDE (id) WHERE (status = 'queued'::{status})",
+        ),
+        index(
+            f"{queue}_updated_id_id1_idx",
+            queue,
+            f"USING btree (updated, id DESC) INCLUDE (id) WHERE (status = 'picked'::{status})",
+        ),
+        index(
+            f"{queue}_picked_heartbeat_idx",
+            queue,
+            f"USING btree (heartbeat) WHERE (status = 'picked'::{status})",
+        ),
+        index(
+            f"{queue}_queue_manager_id_idx",
+            queue,
+            "USING btree (queue_manager_id) WHERE (queue_manager_id IS NOT NULL)",
+        ),
+        index(
+            f"{queue}_ep_prio_id_idx",
+            queue,
+            f"USING btree (entrypoint, priority DESC, id) WHERE (status = 'queued'::{status})",
+        ),
+        index(
+            f"{queue}_ep_ea_idx",
+            queue,
+            f"USING btree (entrypoint, execute_after) WHERE (status = 'queued'::{status})",
+        ),
+        index(
+            f"{queue}_unique_dedupe_key",
+            queue,
+            f"USING btree (dedupe_key) WHERE {dedupe_predicate(settings)}",
+            unique=True,
+        ),
+        index(
+            f"{queue}_picked_serialize_key_idx",
+            queue,
+            f"USING btree (entrypoint, serialize_key) WHERE ((status = 'picked'::{status}) "
+            "AND (serialize_key IS NOT NULL))",
+            unique=True,
+        ),
+        index(
+            f"{queue}_queued_serialize_key_idx",
+            queue,
+            f"USING btree (entrypoint, serialize_key, priority DESC, id) "
+            f"WHERE ((status = 'queued'::{status}) AND (serialize_key IS NOT NULL))",
+        ),
+        index(
+            f"{queue}_picked_slot_idx",
+            queue,
+            f"USING btree (entrypoint, slot) WHERE ((status = 'picked'::{status}) AND (slot IS NOT NULL))",  # noqa: E501
+            unique=True,
+        ),
+    )
