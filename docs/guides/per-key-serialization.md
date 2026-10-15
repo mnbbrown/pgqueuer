@@ -6,8 +6,9 @@ jobs, per-mailbox sync, per-conversation LLM jobs, per-aggregate domain
 commands. The shape mirrors AWS SQS FIFO `MessageGroupId`, GCP Pub/Sub
 `ordering_key`, Kafka partition-by-key, and RabbitMQ Single Active Consumer.
 
-PgQueuer implements this via a per-job `serialize_key` and a per-entrypoint
-`serialize_dispatch_per_key` flag.
+PgQueuer enforces this for every job with a non-null `serialize_key`.
+The `serialize_dispatch_per_key` argument remains accepted for compatibility;
+setting it to `False` does not disable serialization for keyed jobs.
 
 ## Quick start
 
@@ -31,8 +32,8 @@ keys (or no key) run in parallel.
 
 ## Semantics
 
-When `serialize_dispatch_per_key=True` on an entrypoint, the dispatch query
-filters out any candidate row whose `(entrypoint, serialize_key)` is "blocked":
+The dispatch query filters out any keyed candidate whose
+`(entrypoint, serialize_key)` is blocked:
 
 1. **Another job with the same key is already `picked`** — at-most-one-running
    per key is enforced. A partial unique index acts as a safety net.
@@ -110,7 +111,7 @@ Mitigations:
 | Purpose | Collapse concurrent enqueues | Serialize concurrent dispatch |
 | Constraint | Unique across `queued`+`picked` | At-most-one in `picked` only |
 | N queued for same key? | No (`DuplicateJobError`) | Yes |
-| Default behavior | Always enforced | Opt-in per entrypoint |
+| Default behavior | Always enforced | Enforced whenever a key is supplied |
 | Use it for... | Idempotency at the API edge | Per-resource ordering |
 
 You can use both on the same job — they answer different questions:
@@ -197,8 +198,8 @@ the workflow name so unrelated entrypoints do not accidentally share a key.
 
 ### Performance
 
-The dispatch query has two extra index lookups per candidate row when the flag
-is enabled. Indexes used:
+The dispatch query has two extra index lookups per candidate row with a non-null
+key. Indexes used:
 
 - `pgqueuer_picked_serialize_key_idx` — partial unique on
   `(entrypoint, serialize_key) WHERE status = 'picked'`. Bounded by your max

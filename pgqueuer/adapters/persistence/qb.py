@@ -247,14 +247,8 @@ class QueryQueueBuilder:
         if budget_gated:
             global_limit = composer.bind(global_concurrency_limit)
 
-        serialized = [
-            entrypoint
-            for entrypoint, enabled in zip(
-                entrypoints, serialize_dispatch_per_key or [False] * len(entrypoints), strict=True
-            )
-            if enabled
-        ]
-        serial_eps = composer.bind(serialized)
+        # The unique picked-key index applies even when the entrypoint flag is off.
+        serial_eps = composer.bind(list(entrypoints))
         shape = (capacity_gated, budget_gated)
         if (cached_sql := self.dequeue_sql_cache.get(shape)) is not None:
             return ComposedQuery(sql=cached_sql, args=tuple(composer.values))

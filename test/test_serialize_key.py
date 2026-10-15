@@ -93,14 +93,20 @@ async def test_inmemory_null_serialize_key_unaffected(queries: InMemoryQueries) 
 
 
 @pytest.mark.asyncio
-async def test_inmemory_flag_off_no_per_key_behavior(queries: InMemoryQueries) -> None:
-    """With the flag off, all same-key jobs dispatch normally."""
+async def test_inmemory_key_serializes_even_with_flag_off(queries: InMemoryQueries) -> None:
+    """A serialize_key serializes dispatch regardless of the entrypoint flag.
+
+    The picked_serialize_key unique index enforces at-most-one-picked per
+    key unconditionally, so dispatch must respect it unconditionally —
+    otherwise the SQL adapter's dequeue UPDATE violates the index and
+    kills the worker (the in-memory adapter must match that contract).
+    """
     await queries.enqueue(["ep", "ep"], [None, None], [0, 0], serialize_key=["k", "k"])
     qm_id = QueueManagerId(uuid.uuid4())
-    # Default: serialize_dispatch_per_key=False
+    # Default: serialize_dispatch_per_key=False — key still serializes.
     params = {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)}
     jobs = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
-    assert len(jobs) == 2
+    assert len(jobs) == 1
 
 
 @pytest.mark.asyncio
@@ -335,3 +341,34 @@ async def test_qm_per_key_serial_at_most_one_running(apgdriver: Driver) -> None:
     await asyncio.gather(waiter(), *(run_consumer(q) for q in qms))
     # All jobs must have completed; no per-key invariant violated.
     assert completed == n_per_key * len(keys)
+
+
+async def test_pg_key_serializes_even_with_flag_off(apgdriver: Driver) -> None:
+    """Regression: dequeue with the flag OFF must not double-pick a key.
+
+    A trailing duplicate enqueued while the leader is picked (the
+    enqueue_if_no_queued trailing-wake-up pattern) used to be claimed by
+    flag-off entrypoints; the UPDATE then hit picked_serialize_key_idx with
+    UniqueViolationError and the whole dequeue — and worker — died.
+    """
+    q = Queries(apgdriver)
+    qm_id = QueueManagerId(uuid.uuid4())
+    # Flag OFF — the serialize_key alone must serialize dispatch.
+    params = {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)}
+
+    # Leader picked.
+    await q.enqueue("ep", None, priority=0, serialize_key="k")
+    first = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
+    assert len(first) == 1
+
+    # Trailing duplicate arrives while the leader runs.
+    await q.enqueue("ep", None, priority=0, serialize_key="k")
+
+    # Must claim nothing (previously: UniqueViolationError killed the worker).
+    second = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
+    assert len(second) == 0
+
+    # Leader completes → trailing job becomes eligible.
+    await q.log_jobs([(first[0], "successful", None)])
+    third = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
+    assert len(third) == 1

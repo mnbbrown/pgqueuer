@@ -488,9 +488,7 @@ class InMemoryQueries:
             if params.concurrency_limit > 0:
                 cap = min(cap, params.concurrency_limit - picked_per_ep.get(ep, 0))
             if cap > 0:
-                queued_candidates.extend(
-                    self._pop_ready_jobs(ep, cap, now, seen, params.serialize_dispatch_per_key)
-                )
+                queued_candidates.extend(self._pop_ready_jobs(ep, cap, now, seen, True))
 
         stale_candidates = self._collect_stale_candidates(now, entrypoints, heartbeat_timeout)
 
@@ -509,7 +507,7 @@ class InMemoryQueries:
             if len(selected) >= remaining:
                 break
             key = job["serialize_key"]
-            if entrypoints[job["entrypoint"]].serialize_dispatch_per_key and key is not None:
+            if key is not None:
                 if self.key_blocked(job, now) or (job["entrypoint"], key) in selected_keys:
                     continue
                 selected_keys.add((job["entrypoint"], key))
