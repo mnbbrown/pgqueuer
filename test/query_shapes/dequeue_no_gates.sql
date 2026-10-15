@@ -40,31 +40,15 @@ next_queued AS (
 
 -- Stale picked jobs whose heartbeat timed out.
 next_stale AS (
-        SELECT stale.id, stale.priority
-        FROM pgqueuer stale
-        WHERE stale.status = 'picked'
-          AND stale.entrypoint = ANY($2)
-          AND stale.heartbeat < NOW() - $4::interval
-          AND stale.execute_after < NOW()
-          AND NOT (
-        stale.entrypoint = ANY($5::text[])
-        AND stale.serialize_key IS NOT NULL
-        AND EXISTS (
-            SELECT 1 FROM pgqueuer other
-            WHERE other.entrypoint = stale.entrypoint
-              AND other.serialize_key = stale.serialize_key
-              AND other.id <> stale.id
-              AND (
-                other.status = 'picked'
-                OR (other.status = 'queued' AND other.execute_after < NOW()
-                    AND (other.priority > stale.priority
-                         OR (other.priority = stale.priority AND other.id < stale.id)))
-              )
-        )
-    )
-        ORDER BY stale.priority DESC, stale.id ASC
-        FOR UPDATE SKIP LOCKED
-        LIMIT $1
+    SELECT stale.id, stale.priority
+    FROM pgqueuer stale
+    WHERE stale.status = 'picked'
+      AND stale.entrypoint = ANY($2)
+      AND stale.heartbeat < NOW() - $4::interval
+      AND stale.execute_after < NOW()
+    ORDER BY stale.priority DESC, stale.id ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
 ),
 
 -- Merge both sets into one priority order so stale competes with fresh.
