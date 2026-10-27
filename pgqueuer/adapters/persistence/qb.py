@@ -809,11 +809,7 @@ class QueryQueueBuilder:
         )
 
     def build_update_heartbeat_query(self) -> str:
-        return f"""
-            UPDATE {self.qualified.queue_table} SET heartbeat = NOW()
-            WHERE id = ANY($1::bigint[])
-              AND ($2::uuid IS NULL OR queue_manager_id = $2::uuid)
-        """
+        return f"""UPDATE {self.qualified.queue_table} SET heartbeat = NOW() WHERE id = ANY($1::bigint[])"""  # noqa: E501
 
     def build_truncate_log_query(self) -> str:
         return f"TRUNCATE {self.qualified.queue_table_log}"

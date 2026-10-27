@@ -354,10 +354,8 @@ class InMemoryQueries:
     async def queue_log(self) -> list[models.Log]:
         return self.logs.to_models()
 
-    async def update_heartbeat(
-        self, job_ids: list[JobId], queue_manager_id: QueueManagerId | None = None
-    ) -> None:
-        self.job_table.touch(job_ids, utc_now(), queue_manager_id=queue_manager_id)
+    async def update_heartbeat(self, job_ids: list[JobId]) -> None:
+        self.job_table.touch(job_ids, utc_now())
 
     async def job_status(
         self,

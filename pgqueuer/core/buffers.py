@@ -131,9 +131,7 @@ class JobLogSink(Protocol):
 class HeartbeatSink(Protocol):
     """Narrow port: accepts batched heartbeat updates."""
 
-    async def update_heartbeat(
-        self, job_ids: list[types.JobId], queue_manager_id: types.QueueManagerId | None = None
-    ) -> None: ...
+    async def update_heartbeat(self, job_ids: list[types.JobId]) -> None: ...
 
 
 @dataclasses.dataclass
@@ -151,10 +149,6 @@ class HeartbeatBuffer(TimedOverflowBuffer[types.JobId]):
     """Batched buffer for heartbeat updates."""
 
     repository: HeartbeatSink
-    queue_manager_id: types.QueueManagerId | None = None
 
     async def flush_items(self, items: list[types.JobId]) -> None:
-        if self.queue_manager_id is None:
-            await self.repository.update_heartbeat(items)
-        else:
-            await self.repository.update_heartbeat(items, queue_manager_id=self.queue_manager_id)
+        await self.repository.update_heartbeat(items)

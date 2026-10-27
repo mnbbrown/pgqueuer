@@ -10,7 +10,7 @@ import pytest
 from pgqueuer import db, queries
 from pgqueuer.adapters.persistence.query_helpers import cell
 from pgqueuer.domain.settings import DBSettings
-from pgqueuer.domain.types import QueueEntrypoint, QueueManagerId
+from pgqueuer.domain.types import QueueEntrypoint
 from pgqueuer.models import Job
 from pgqueuer.qm import QueueManager
 from pgqueuer.types import JobId
@@ -274,9 +274,7 @@ async def test_job_not_retried_while_running(
     calls = 0
     qm = QueueManager(queries.Queries(apgdriver))
 
-    async def no_heartbeat(
-        job_ids: list[JobId], queue_manager_id: QueueManagerId | None = None
-    ) -> None:
+    async def no_heartbeat(job_ids: list[JobId]) -> None:
         return None
 
     # No heartbeat lands, so the running job goes stale and the worker's own dequeue re-picks it.

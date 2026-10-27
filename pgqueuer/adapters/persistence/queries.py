@@ -593,13 +593,10 @@ class Queries:
             ).model_dump_json(),
         )
 
-    async def update_heartbeat(
-        self, job_ids: list[types.JobId], queue_manager_id: types.QueueManagerId | None = None
-    ) -> None:
+    async def update_heartbeat(self, job_ids: list[types.JobId]) -> None:
         await self.driver.execute(
             self.qbq.build_update_heartbeat_query(),
             list(set(job_ids)),
-            queue_manager_id,
         )
 
     async def insert_schedule(

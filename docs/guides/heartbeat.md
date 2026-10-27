@@ -13,17 +13,6 @@ Anything with database access can act on that: PgQueuer itself re-picks jobs who
 heartbeat is older than `heartbeat_timeout`, and your own monitoring can compare
 `heartbeat` against `NOW()` to alert on stuck workers.
 
-## Ownership checks
-
-Worker heartbeat batches include the `queue_manager_id`. An update applies only
-when this ID matches the current job owner. After another worker takes over a
-job, delayed heartbeats from the previous worker cannot renew its lease.
-
-Direct calls to `Queries.update_heartbeat(job_ids)` retain the previous behavior.
-Pass `queue_manager_id` to check ownership. Custom repository implementations
-must accept this optional parameter. No schema migration is required. During a
-rolling deployment, old workers can still send updates without an owner check.
-
 ## Stall detection pattern
 
 You can query for stalled jobs directly in PostgreSQL:

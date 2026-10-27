@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -12,7 +10,7 @@ from pgqueuer.core.buffers import HeartbeatBuffer, HeartbeatSink
 from pgqueuer.core.heartbeat import Heartbeat
 from pgqueuer.core.qm import QueueManager
 from pgqueuer.domain.models import Job
-from pgqueuer.types import JobId, QueueManagerId
+from pgqueuer.types import JobId
 
 
 class _FakeHeartbeatSink:
@@ -21,9 +19,7 @@ class _FakeHeartbeatSink:
     def __init__(self, fn: Callable[[list[JobId]], Awaitable[None]]) -> None:
         self._fn = fn
 
-    async def update_heartbeat(
-        self, job_ids: list[JobId], queue_manager_id: QueueManagerId | None = None
-    ) -> None:
+    async def update_heartbeat(self, job_ids: list[JobId]) -> None:
         await self._fn(job_ids)
 
 
@@ -91,9 +87,7 @@ async def test_no_heartbeat_when_job_completes_before_interval() -> None:
     """
 
     class _NoopSink:
-        async def update_heartbeat(
-            self, _: list[JobId], queue_manager_id: QueueManagerId | None = None
-        ) -> None:
+        async def update_heartbeat(self, _: list[JobId]) -> None:
             pass
 
     class DummyBuffer(HeartbeatBuffer):
@@ -129,9 +123,7 @@ async def test_heartbeat_exit_propagates_caller_cancel() -> None:
             await release.wait()
 
     class _FakeSink:
-        async def update_heartbeat(
-            self, _: list[JobId], queue_manager_id: QueueManagerId | None = None
-        ) -> None:
+        async def update_heartbeat(self, _: list[JobId]) -> None:
             pass
 
     beat = Heartbeat(JobId(1), timedelta(milliseconds=10), BlockingBuffer())
@@ -157,9 +149,7 @@ async def test_heartbeat_exit_propagates_caller_cancel() -> None:
 
 async def test_heartbeat_keeps_buffer_ticking() -> None:
     class _NoopSink:
-        async def update_heartbeat(
-            self, _: list[JobId], queue_manager_id: QueueManagerId | None = None
-        ) -> None:
+        async def update_heartbeat(self, _: list[JobId]) -> None:
             pass
 
     class DummyBuffer(HeartbeatBuffer):
@@ -193,20 +183,10 @@ async def test_cadence_keeps_a_live_job_through_one_failed_flush(
         return Heartbeat(job_id, interval, buffer)
 
     def spy_buffer(
-        *,
-        max_size: int,
-        timeout: timedelta,
-        repository: HeartbeatSink,
-        queue_manager_id: QueueManagerId | None = None,
+        *, max_size: int, timeout: timedelta, repository: HeartbeatSink
     ) -> HeartbeatBuffer:
-        assert queue_manager_id == qm.queue_manager_id
         flushes.append(timeout)
-        return HeartbeatBuffer(
-            max_size=max_size,
-            timeout=timeout,
-            repository=repository,
-            queue_manager_id=queue_manager_id,
-        )
+        return HeartbeatBuffer(max_size=max_size, timeout=timeout, repository=repository)
 
     monkeypatch.setattr(heartbeat, "Heartbeat", spy_heartbeat)
     monkeypatch.setattr(buffers, "HeartbeatBuffer", spy_buffer)
