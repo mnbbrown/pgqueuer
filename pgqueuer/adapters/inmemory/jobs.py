@@ -573,10 +573,14 @@ class JobTable:
             self.ready.pop(QueueEntrypoint(name), None)
         return removed
 
-    def touch(self, ids: list[JobId], now: datetime) -> None:
+    def touch(
+        self, ids: list[JobId], now: datetime, queue_manager_id: QueueManagerId | None = None
+    ) -> None:
         for job_id in {int(raw_id) for raw_id in ids}:
             row = self.rows.get(job_id)
-            if row is not None:
+            if row is not None and (
+                queue_manager_id is None or row.queue_manager_id == queue_manager_id
+            ):
                 row.heartbeat = now
 
     def has_queued(self, entrypoints: list[QueueEntrypoint]) -> bool:
