@@ -521,6 +521,9 @@ class QueueManager:
             )
 
             while not self.shutdown.is_set():
+                # Changes during dequeue must remain pending for the next queue check.
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    notice_event_listener.get_nowait()
                 async for job in self.fetch_jobs(
                     batch_size, max_concurrent_tasks, heartbeat_timeout
                 ):
@@ -539,9 +542,6 @@ class QueueManager:
                         self.on_dispatch(
                             len(task_manager.tasks), max_concurrent_tasks or sys.maxsize
                         )
-
-                    with contextlib.suppress(asyncio.QueueEmpty):
-                        notice_event_listener.get_nowait()
 
                 await self._maybe_drain_shutdown(mode, task_manager)
                 await self._maybe_health_shutdown(

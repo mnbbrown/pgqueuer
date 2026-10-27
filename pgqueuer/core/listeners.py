@@ -49,7 +49,8 @@ def default_event_router(
     """Return an `EventRouter` wired with handlers for all known event types."""
 
     def on_table_changed(evt: models.TableChangedEvent) -> None:
-        notice_event_queue.put_nowait(evt)
+        if notice_event_queue.empty():
+            notice_event_queue.put_nowait(evt)
 
     def on_cancellation(evt: models.CancellationEvent) -> None:
         for jid in evt.ids:
