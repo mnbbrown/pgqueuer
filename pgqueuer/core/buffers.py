@@ -7,14 +7,14 @@ import dataclasses
 import random
 from contextlib import suppress
 from datetime import timedelta
-from typing import Generic, Protocol, TypeVar
-
-from typing_extensions import Self
+from typing import Generic, Protocol, Self, TypeAlias, TypeVar
 
 from pgqueuer.core import logconfig
 from pgqueuer.domain import models, types
 
 T = TypeVar("T")
+
+JobLogEntry: TypeAlias = tuple[models.Job, types.JOB_STATUS, models.TracebackRecord | None]
 
 
 @dataclasses.dataclass
@@ -29,6 +29,8 @@ class TimedOverflowBuffer(Generic[T]):
     timeout: timedelta = dataclasses.field(
         default_factory=lambda: timedelta(seconds=0.1),
     )
+    # Receives the items the shutdown flush could not write.
+    unwritten: list[T] = dataclasses.field(default_factory=list)
 
     events: asyncio.Queue[T] = dataclasses.field(
         init=False,
@@ -90,11 +92,12 @@ class TimedOverflowBuffer(Generic[T]):
             items = self.drain_queue()
             try:
                 await self.flush_items(items)
-            except Exception:
+            except Exception:  # noqa: BLE001 - best-effort flush at shutdown; items are requeued
                 logconfig.logger.warning("Shutdown flush failed, %d items remaining", len(items))
                 for item in items:
                     self.events.put_nowait(item)
                 await asyncio.sleep(0)
+        self.unwritten.extend(self.drain_queue())
 
     def drain_queue(self) -> list[T]:
         items: list[T] = []
@@ -114,26 +117,15 @@ class TimedOverflowBuffer(Generic[T]):
             if not self.lock.locked() and self.events.qsize() > 0:
                 await self.flush()
 
-            with suppress(asyncio.TimeoutError, TimeoutError):
-                await asyncio.wait_for(
-                    self.shutdown.wait(),
-                    timeout=self.timeout.total_seconds() * random.uniform(0.8, 1.2),
-                )
+            with suppress(TimeoutError):
+                async with asyncio.timeout(self.timeout.total_seconds() * random.uniform(0.8, 1.2)):  # noqa: S311 - timing jitter, not crypto
+                    await self.shutdown.wait()
 
 
 class JobLogSink(Protocol):
     """Narrow port: accepts batched job status log entries."""
 
-    async def log_jobs(
-        self,
-        job_status: list[
-            tuple[
-                models.Job,
-                types.JOB_STATUS,
-                models.TracebackRecord | None,
-            ]
-        ],
-    ) -> None: ...
+    async def log_jobs(self, job_status: list[JobLogEntry]) -> None: ...
 
 
 class HeartbeatSink(Protocol):
@@ -143,29 +135,12 @@ class HeartbeatSink(Protocol):
 
 
 @dataclasses.dataclass
-class JobStatusLogBuffer(
-    TimedOverflowBuffer[
-        tuple[
-            models.Job,
-            types.JOB_STATUS,
-            models.TracebackRecord | None,
-        ]
-    ]
-):
+class JobStatusLogBuffer(TimedOverflowBuffer[JobLogEntry]):
     """Batched buffer for job completion / failure log entries."""
 
     repository: JobLogSink
 
-    async def flush_items(
-        self,
-        items: list[
-            tuple[
-                models.Job,
-                types.JOB_STATUS,
-                models.TracebackRecord | None,
-            ]
-        ],
-    ) -> None:
+    async def flush_items(self, items: list[JobLogEntry]) -> None:
         await self.repository.log_jobs(items)
 
 

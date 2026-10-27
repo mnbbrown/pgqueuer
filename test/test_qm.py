@@ -5,7 +5,6 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-import async_timeout
 import pytest
 
 from pgqueuer import db
@@ -14,7 +13,7 @@ from pgqueuer.core.tm import TaskManager
 from pgqueuer.models import Job, Log
 from pgqueuer.qm import QueueManager
 from pgqueuer.queries import Queries
-from pgqueuer.types import QueueExecutionMode
+from pgqueuer.types import Channel, QueueExecutionMode
 from test.helpers import wait_until_empty_queue
 
 
@@ -63,7 +62,7 @@ async def test_job_fetch(
     for qm in qmpool:
 
         @qm.entrypoint("fetch")
-        async def fetch(context: Job) -> None:
+        async def fetch(context: Job, qm: QueueManager = qm) -> None:
             assert context.payload is not None
             assert qm.resources["test"] == "job_fetch"
             seen.append(int(context.payload))
@@ -84,8 +83,8 @@ async def test_job_fetch(
 
 async def test_pick_local_entrypoints(
     apgdriver: db.Driver,
-    N: int = 100,
 ) -> None:
+    N = 100
     q = Queries(apgdriver)
     qm = QueueManager(Queries(apgdriver), resources={"test": "pick_local"})
     pikced_by = list[str]()
@@ -115,8 +114,8 @@ async def test_pick_local_entrypoints(
 
 async def test_pick_set_queue_manager_id(
     apgdriver: db.Driver,
-    N: int = 100,
 ) -> None:
+    N = 100
     q = Queries(apgdriver)
     qm = QueueManager(Queries(apgdriver), resources={"test": "pick_qm_id"})
     qmids = set[uuid.UUID]()
@@ -157,7 +156,7 @@ async def test_drain_mode(
 
     await q.enqueue(["fetch"] * N, [None] * N, [0] * N)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await qm.run(mode=QueueExecutionMode.drain)
 
     assert len(jobs) == N
@@ -186,7 +185,7 @@ async def test_run_unlimited_budget_reaches_dequeue_as_none(
 
     await q.enqueue("fetch", None, 0)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await qm.run(mode=QueueExecutionMode.drain, max_concurrent_tasks=max_concurrent_tasks)
 
     assert seen
@@ -205,7 +204,7 @@ async def test_periodic_log_aggregation_loops_until_shutdown() -> None:
             if calls >= 3:
                 qm.shutdown.set()
 
-    qm = QueueManager(queries=Stub())  # type: ignore[arg-type]
+    qm = QueueManager(queries=Stub(), channel=Channel("test"))  # type: ignore[arg-type]
 
     async def keep_marking_work() -> None:
         # Stands in for `_dispatch` incrementing `jobs_logged` concurrently;
@@ -218,7 +217,7 @@ async def test_periodic_log_aggregation_loops_until_shutdown() -> None:
     qm.jobs_logged = 1
     marker = asyncio.ensure_future(keep_marking_work())
     try:
-        async with async_timeout.timeout(5):
+        async with asyncio.timeout(5):
             await qm._run_periodic_log_aggregation(timedelta(seconds=0))
     finally:
         marker.cancel()
@@ -237,14 +236,14 @@ async def test_periodic_log_aggregation_skips_when_idle() -> None:
             nonlocal calls
             calls += 1
 
-    qm = QueueManager(queries=Stub())  # type: ignore[arg-type]
+    qm = QueueManager(queries=Stub(), channel=Channel("test"))  # type: ignore[arg-type]
     task = asyncio.ensure_future(qm._run_periodic_log_aggregation(timedelta(seconds=0)))
     try:
         for _ in range(3):
             await asyncio.sleep(0)
     finally:
         qm.shutdown.set()
-        async with async_timeout.timeout(5):
+        async with asyncio.timeout(5):
             await task
     assert calls == 0
 
@@ -261,7 +260,7 @@ async def test_dispatch_increments_jobs_logged_counter(
 
     await qm.queries.enqueue(["fetch"] * 3, [None] * 3, [0] * 3)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await asyncio.gather(
             # Aggregation disabled so it doesn't race the counter it gates.
             qm.run(log_aggregation_interval=timedelta(0)),
@@ -284,9 +283,9 @@ async def test_periodic_log_aggregation_survives_aggregate_errors() -> None:
                 qm.shutdown.set()
             raise RuntimeError("boom")
 
-    qm = QueueManager(queries=Stub())  # type: ignore[arg-type]
+    qm = QueueManager(queries=Stub(), channel=Channel("test"))  # type: ignore[arg-type]
     qm.jobs_logged = 1
-    async with async_timeout.timeout(5):
+    async with asyncio.timeout(5):
         await qm._run_periodic_log_aggregation(timedelta(seconds=0))
     assert calls == 3
 
@@ -305,7 +304,7 @@ async def test_traceback_log(
 
     jids = await q.enqueue(["fetch"] * N, [None] * N, [0] * N)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await qm.run(mode=QueueExecutionMode.drain)
 
     logs = await q.queue_log()
@@ -329,7 +328,7 @@ async def test_max_concurrent_tasks(
         # Poll until the manager has ramped to its concurrency ceiling instead of
         # sampling once at a fixed delay, which races the ramp-up under load. The
         # global limit caps picks, so the count settles at exactly the ceiling.
-        async with async_timeout.timeout(5):
+        async with asyncio.timeout(5):
             while True:
                 logs = [log for log in await q.queue_log() if log.status == "picked"]
                 if len(logs) >= max_concurrent_tasks:
@@ -344,7 +343,7 @@ async def test_max_concurrent_tasks(
 
     await q.enqueue(["fetch"] * N, [None] * N, [0] * N)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await asyncio.gather(
             qm.run(max_concurrent_tasks=max_concurrent_tasks),
             log_sampler(),
@@ -398,7 +397,7 @@ async def test_run_failure_leaves_no_pending_lifecycle_tasks(
 
     before = asyncio.all_tasks()
     with pytest.raises(RuntimeError, match="boom"):
-        async with async_timeout.timeout(10):
+        async with asyncio.timeout(10):
             await qm.run(dequeue_timeout=timedelta(seconds=0.01))
 
     leaked = asyncio.all_tasks() - before
@@ -435,7 +434,7 @@ async def test_shutdown_mid_batch_leaves_no_stranded_picked_jobs(
 
     queries.dequeue = dequeue_then_shutdown
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await qm.run(dequeue_timeout=timedelta(seconds=0.01), batch_size=batch_size)
 
     assert len(processed) == batch_size * 2

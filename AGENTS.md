@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-PgQueuer is a Python library that turns PostgreSQL into a job queue using `LISTEN/NOTIFY` for instant notifications and `FOR UPDATE SKIP LOCKED` for worker coordination. Supports async (asyncpg, psycopg) and sync (psycopg) drivers, with an in-memory adapter for testing. Python >=3.10, async-first, MIT-licensed.
+PgQueuer is a Python library that turns PostgreSQL into a job queue using `LISTEN/NOTIFY` for instant notifications and `FOR UPDATE SKIP LOCKED` for worker coordination. Supports async (asyncpg, psycopg) and sync (psycopg) drivers, with an in-memory adapter for testing. Python >=3.11, async-first, MIT-licensed.
 
 ## Project Structure
 
@@ -38,7 +38,7 @@ uv sync --frozen && uv run ruff check . && uv run ruff format . --check && uv ru
 uv run ruff check .         # Lint (ruff)
 uv run ruff format . --check  # Format check
 uv run lint-imports         # Hexagonal architecture boundary validation
-uv run mypy .               # Type checking (strict, targets Python 3.10)
+uv run mypy .               # Type checking (strict, targets Python 3.11)
 
 # Run all tests (parallel by default: 2 xdist workers, one Postgres container each)
 uv run pytest
@@ -159,9 +159,9 @@ When deprecating dataclass fields, use a module-level `_SENTINEL = object()` def
 ### Formatting and Linting
 
 - **Formatter/linter**: ruff (line-length=100)
-- **Lint rules**: C, E, F, I, PIE, Q, RET, RSE, SIM, W, C90 (max-complexity=15)
+- **Lint rules**: `select = ["ALL"]` (max-complexity=15, google docstring convention). Every entry in `ignore` carries its reason in `pyproject.toml`; to ignore a new rule, add it there with a reason, or use `# noqa: <code>` with a reason at one site.
 - **isort**: combined-as-imports, furthest-to-closest relative imports
-- **Mypy** `strict = true` plus `warn_unreachable` and the error codes `truthy-bool`, `truthy-iterable`, `redundant-expr`, `unused-awaitable`, `possibly-undefined`, `ignore-without-code`; Pydantic plugin with `init_typed`; targets Python 3.10. Inside `pgqueuer/`, `tools/` and `examples/` the overrides add `disallow_any_explicit` and `disallow_any_unimported`. Run it as `uv run mypy . --no-incremental`; the incremental cache has reported green on stale signatures.
+- **Mypy** `strict = true` plus `warn_unreachable` and the error codes `truthy-bool`, `truthy-iterable`, `redundant-expr`, `unused-awaitable`, `possibly-undefined`, `ignore-without-code`; Pydantic plugin with `init_typed`; targets Python 3.11. Inside `pgqueuer/`, `tools/` and `examples/` the overrides add `disallow_any_explicit` and `disallow_any_unimported`. Run it as `uv run mypy . --no-incremental`; the incremental cache has reported green on stale signatures.
 
 ### Import Rules
 
@@ -170,7 +170,7 @@ When deprecating dataclass fields, use a module-level `_SENTINEL = object()` def
 3. Third-party packages
 4. Internal imports using absolute paths (`from pgqueuer.domain.models import Job`)
 
-**No local imports.** All imports must be at module top level. The only exception is `if TYPE_CHECKING:` blocks for avoiding circular imports at runtime.
+**No local imports.** All imports must be at module top level. Ruff enforces this (`PLC0415`). The exceptions are `if TYPE_CHECKING:` blocks, and third-party packages from optional extras (`asyncpg`, `psycopg`, `uvicorn`), which are imported where they are used so that installs without the extra keep working. Those sites are per-file ignores in `pyproject.toml` or carry `# noqa: PLC0415` with the reason.
 
 ### Type Annotations
 
@@ -178,7 +178,7 @@ When deprecating dataclass fields, use a module-level `_SENTINEL = object()` def
 - Use **native Python types**: `list[int]`, `dict[str, object]`, `int | None` (not `Optional`)
 - Use `NewType` for domain primitives: `JobId = NewType("JobId", int)`
 - Use `Literal` for string unions: `Literal["queued", "picked", "successful"]`
-- **Exhaustive dispatch.** When branching on a `Literal` or `Enum` value, handle every member in an explicit `if`/`elif` chain and terminate with `else: assert_never(value)` (`typing_extensions.assert_never`) so mypy proves totality. No bare fallthroughs, no catch-all `else` doing real work — adding a new member must produce a type error at every dispatch site.
+- **Exhaustive dispatch.** When branching on a `Literal` or `Enum` value, handle every member in an explicit `if`/`elif` chain and terminate with `else: assert_never(value)` (`typing.assert_never`) so mypy proves totality. No bare fallthroughs, no catch-all `else` doing real work — adding a new member must produce a type error at every dispatch site.
 - Use `Protocol` for structural subtyping (port interfaces)
 - Use `TypeAlias` for complex callable types
 - **`Any` is banned in `pgqueuer/`, `tools/` and `examples/`** (`disallow_any_explicit`). Use `object` and narrow with `isinstance`. Driver `*args` are `object`; rows come back as `dict[str, object]` and scalars are read through `query_helpers.cell(row, key, kind)`, multi-column rows through a pydantic model. User-owned bags (`Context.resources`) are `MutableMapping[str, object]`. `Callable[..., X]` counts as `Any`; declare a `Protocol` with `__call__(self, *args: object)` instead. Untyped third-party values are assigned to an `object`-annotated name before an `isinstance` check. Test code under `test/` may use `Any`.
@@ -416,4 +416,4 @@ chore: bump ruff to 0.8 (#101)
 
 ## CI Matrix
 
-Python 3.10--3.14 x Postgres 14--18 on Ubuntu. Windows tests run only `test/windows/test_shutdown.py`.
+Python 3.11--3.15 x Postgres 14--18 on Ubuntu. Windows tests run only `test/windows/test_shutdown.py`.

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Generator
 from datetime import timedelta
-from typing import Generator
-
-from typing_extensions import assert_never
+from typing import assert_never
 
 from pgqueuer.adapters.persistence import schema_ddl
 from pgqueuer.adapters.persistence.composer import ComposedQuery, SqlComposer
@@ -15,7 +14,6 @@ from pgqueuer.domain.settings import (
     Durability,
     DurabilityPolicy,
     QualifiedNames,
-    db_settings,
 )
 from pgqueuer.domain.types import (
     OnConflict,
@@ -40,15 +38,27 @@ __all__ = [
 class QueryBuilderEnvironment:
     """DDL/utility query builder bound to a :class:`DBSettings`."""
 
-    settings: DBSettings = dataclasses.field(default_factory=db_settings)
+    settings: DBSettings
 
     @property
     def qualified(self) -> QualifiedNames:
         return self.settings.qualified
 
-    def build_install_query(self, create_schema: bool = True) -> str:
-        """DDL: schema (optional), types, tables, indexes, trigger, and notify function."""
-        return schema_ddl.render_install(self.settings, create_schema=create_schema)
+    def build_install_query(
+        self,
+        create_schema: bool = True,
+        durability: Durability | None = None,
+    ) -> str:
+        """DDL: schema (optional), types, tables, indexes, trigger, and notify function.
+
+        *durability* overrides the configured level for this install only.
+        """
+        settings = (
+            self.settings
+            if durability is None
+            else self.settings.model_copy(update={"durability": durability})
+        )
+        return schema_ddl.render_install(settings, create_schema=create_schema)
 
     def build_uninstall_query(self) -> str:
         return schema_ddl.render_uninstall(self.settings)
@@ -114,12 +124,16 @@ class QueryBuilderEnvironment:
     FROM pg_enum
     JOIN pg_type ON pg_enum.enumtypid = pg_type.oid"""
 
-    def build_alter_durability_query(self) -> Generator[str, None, None]:
-        durability = self.settings.durability.config
-        yield f"""ALTER TABLE {self.qualified.queue_table} SET {"LOGGED" if durability.queue_table == "" else "UNLOGGED"};"""  # noqa
-        yield f"""ALTER TABLE {self.qualified.queue_table_log} SET {"LOGGED" if durability.queue_log_table == "" else "UNLOGGED"};"""  # noqa
-        yield f"""ALTER TABLE {self.qualified.statistics_table} SET {"LOGGED" if durability.statistics_table == "" else "UNLOGGED"};"""  # noqa
-        yield f"""ALTER TABLE {self.qualified.schedules_table} SET {"LOGGED" if durability.schedules_table == "" else "UNLOGGED"};"""  # noqa
+    def build_alter_durability_query(
+        self,
+        durability: Durability | None = None,
+    ) -> Generator[str, None, None]:
+        """ALTER statements for *durability*, or the configured level when None."""
+        config = (self.settings.durability if durability is None else durability).config
+        yield f"""ALTER TABLE {self.qualified.queue_table} SET {"LOGGED" if config.queue_table == "" else "UNLOGGED"};"""  # noqa: E501
+        yield f"""ALTER TABLE {self.qualified.queue_table_log} SET {"LOGGED" if config.queue_log_table == "" else "UNLOGGED"};"""  # noqa: E501
+        yield f"""ALTER TABLE {self.qualified.statistics_table} SET {"LOGGED" if config.statistics_table == "" else "UNLOGGED"};"""  # noqa: E501
+        yield f"""ALTER TABLE {self.qualified.schedules_table} SET {"LOGGED" if config.schedules_table == "" else "UNLOGGED"};"""  # noqa: E501
 
     def build_optimize_autovacuum_query(self) -> str:
         return f"""ALTER TABLE {self.qualified.queue_table} SET (
@@ -194,7 +208,7 @@ ALTER TABLE {self.qualified.statistics_table} RESET (
 
 @dataclasses.dataclass
 class QueryQueueBuilder:
-    settings: DBSettings = dataclasses.field(default_factory=db_settings)
+    settings: DBSettings
     # Rendered dequeue SQL per (capacity-gated, budget-gated) shape. The bind
     # order is fixed per shape, so cached text pairs with freshly bound args.
     dequeue_sql_cache: dict[tuple[bool, bool], str] = dataclasses.field(default_factory=dict)
@@ -203,7 +217,13 @@ class QueryQueueBuilder:
     def qualified(self) -> QualifiedNames:
         return self.settings.qualified
 
-    def build_dequeue_query(
+    @staticmethod
+    def due(alias: str = "") -> str:
+        """The one predicate for a job whose ``execute_after`` has been reached."""
+        column = f"{alias}.execute_after" if alias else "execute_after"
+        return f"{column} <= NOW()"
+
+    def build_dequeue_query(  # noqa: PLR0912, PLR0915 - one SQL builder for all gate combinations
         self,
         *,
         batch_size: int,
@@ -214,8 +234,7 @@ class QueryQueueBuilder:
         heartbeat_timeout: timedelta,
         serialize_dispatch_per_key: list[bool] | None = None,
     ) -> ComposedQuery:
-        """
-        Compose the dequeue statement for the concurrency gates actually in use.
+        """Compose the dequeue statement for the concurrency gates actually in use.
 
         Gate CTEs are selected from the runtime values: entrypoint capacity
         machinery only when some ``concurrency_limits`` entry is positive, the
@@ -266,7 +285,7 @@ class QueryQueueBuilder:
                       AND other.id <> {alias}.id
                       AND (
                         other.status = 'picked'
-                        OR (other.status = 'queued' AND other.execute_after < NOW()
+                        OR (other.status = 'queued' AND {self.due("other")}
                             AND (other.priority > {alias}.priority
                                  OR (other.priority = {alias}.priority AND other.id < {alias}.id)))
                       )
@@ -359,7 +378,7 @@ class QueryQueueBuilder:
                         FROM {queue_table} candidate
                         WHERE candidate.entrypoint = available.entrypoint
                           AND candidate.status = 'queued'
-                          AND candidate.execute_after < NOW()
+                          AND {self.due("candidate")}
                           {key_guard("candidate")}
                         ORDER BY candidate.priority DESC, candidate.id ASC
                         LIMIT {batch}
@@ -383,7 +402,7 @@ class QueryQueueBuilder:
                             FROM {queue_table} candidate
                             WHERE candidate.entrypoint = available.entrypoint
                               AND candidate.status = 'queued'
-                              AND candidate.execute_after < NOW()
+                              AND {self.due("candidate")}
                           {key_guard("candidate")}
                             ORDER BY candidate.priority DESC, candidate.id ASC
                             LIMIT LEAST({batch}, available.remaining)
@@ -393,7 +412,7 @@ class QueryQueueBuilder:
                             FROM {queue_table} target
                             WHERE target.id = capped.id
                               AND target.status = 'queued'
-                              AND target.execute_after < NOW()
+                              AND {self.due("target")}
                             FOR UPDATE OF target SKIP LOCKED
                         ) locked
                         ORDER BY locked.priority DESC, locked.id ASC
@@ -425,7 +444,7 @@ class QueryQueueBuilder:
                     FROM {queue_table} candidate
                     WHERE candidate.entrypoint = available.entrypoint
                       AND candidate.status = 'queued'
-                      AND candidate.execute_after < NOW()
+                      AND {self.due("candidate")}
                           {key_guard("candidate")}
                     ORDER BY candidate.priority DESC, candidate.id ASC
                     LIMIT {batch}
@@ -454,7 +473,7 @@ class QueryQueueBuilder:
                 WHERE stale.status = 'picked'
                   AND stale.entrypoint = ANY({eps})
                   AND stale.heartbeat < NOW() - {heartbeat}::interval
-                  AND stale.execute_after < NOW()
+                  AND {self.due("stale")}
                   {budget_and}
                 ORDER BY stale.priority DESC, stale.id ASC
                 FOR UPDATE SKIP LOCKED
@@ -605,7 +624,7 @@ class QueryQueueBuilder:
             FROM {self.qualified.queue_table}
             WHERE entrypoint = ANY($1)
               AND status = 'queued'
-              AND execute_after <= NOW()
+              AND {self.due()}
             LIMIT 1
         ) sub
         """
@@ -703,20 +722,32 @@ class QueryQueueBuilder:
     """
 
     def build_log_job_query(self) -> str:
+        # Owner check is re-read under READ COMMITTED. A NULL owner (admin cancel)
+        # removes queued and failed rows only; a picked row stays for its worker.
         return f"""WITH job_status AS (
             SELECT
                 UNNEST($1::bigint[])                            AS id,
                 UNNEST($2::{self.qualified.queue_status_type}[]) AS status,
-                UNNEST($3::JSONB[])                             AS traceback
+                UNNEST($3::JSONB[])                             AS traceback,
+                UNNEST($4::uuid[])                              AS queue_manager_id
         ), deleted AS (
-            DELETE FROM {self.qualified.queue_table}
-            WHERE id = ANY(SELECT js.id FROM job_status js WHERE js.status != 'failed')
-            RETURNING id, entrypoint, priority
+            DELETE FROM {self.qualified.queue_table} q
+            USING job_status js
+            WHERE q.id = js.id
+                AND js.status != 'failed'
+                AND (
+                    q.queue_manager_id = js.queue_manager_id
+                    OR (js.queue_manager_id IS NULL AND q.status <> 'picked')
+                )
+            RETURNING q.id, q.entrypoint, q.priority
         ), held AS (
-            UPDATE {self.qualified.queue_table}
+            UPDATE {self.qualified.queue_table} q
             SET status = 'failed', updated = NOW(), queue_manager_id = NULL
-            WHERE id = ANY(SELECT js.id FROM job_status js WHERE js.status = 'failed')
-            RETURNING id, entrypoint, priority
+            FROM job_status js
+            WHERE q.id = js.id
+                AND js.status = 'failed'
+                AND (js.queue_manager_id IS NULL OR q.queue_manager_id = js.queue_manager_id)
+            RETURNING q.id, q.entrypoint, q.priority
         ), all_resolved AS (
             SELECT id, entrypoint, priority FROM deleted
             UNION ALL
@@ -798,12 +829,22 @@ class QueryQueueBuilder:
         aggregation (losers see ``proceed = FALSE`` and no-op) -- used by the
         periodic background task. Without it ``proceed`` is an unconditional
         ``TRUE`` (the on-demand ``log_statistics`` read path).
+
+        Counts come from the rows this statement's UPDATE flagged, so a row
+        another aggregation flagged first is not counted twice.
         """
         log = self.qualified.queue_table_log
         stats = self.qualified.statistics_table
         proceed = f"pg_try_advisory_xact_lock(hashtext('{stats}'))" if advisory_lock else "TRUE"
         return f"""WITH guard AS (
             SELECT {proceed} AS proceed
+        ),
+        updated_logs AS (
+            UPDATE {log}
+            SET aggregated = TRUE
+            FROM guard
+            WHERE NOT aggregated AND guard.proceed
+            RETURNING entrypoint, priority, status, created
         ),
         log_aggregation AS (
             SELECT
@@ -812,23 +853,15 @@ class QueryQueueBuilder:
                 status,
                 COUNT(*) AS count,
                 date_trunc('sec', created) AS created
-            FROM {log}, guard
-            WHERE NOT aggregated AND guard.proceed
+            FROM updated_logs
             GROUP BY entrypoint, priority, status, date_trunc('sec', created)
-        ),
-        updated_logs AS (
-            UPDATE {log}
-            SET aggregated = TRUE
-            FROM guard
-            WHERE NOT aggregated AND guard.proceed
-            RETURNING id
         )
         INSERT INTO {stats} (count, created, entrypoint, priority, status)
         SELECT count, created, entrypoint, priority, status
         FROM log_aggregation
         ON CONFLICT ({UNIQUE_COUNT_KEY}) DO UPDATE SET
             count = {stats}.count + EXCLUDED.count
-        """  # noqa
+        """
 
     def build_retry_job_query(self) -> str:
         return f"""WITH retry AS (
@@ -840,10 +873,12 @@ class QueryQueueBuilder:
                 updated = NOW(),
                 queue_manager_id = NULL
             WHERE id = $1::bigint
+                AND ($4::uuid IS NULL OR queue_manager_id = $4::uuid)
             RETURNING id, entrypoint, priority
         )
         INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority, traceback)
         SELECT id, 'queued', entrypoint, priority, $3::JSONB FROM retry
+        RETURNING job_id
         """  # noqa: E501
 
     def build_requeue_jobs_query(self, reset_attempts: bool = True) -> str:
@@ -857,6 +892,7 @@ class QueryQueueBuilder:
         )
         INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority)
         SELECT id, 'queued', entrypoint, priority FROM requeued
+        RETURNING job_id
         """
 
     def build_list_failed_jobs_query(self, order: SortOrder = "DESC") -> str:
@@ -968,7 +1004,7 @@ class QueryQueueBuilder:
         return f"""SELECT execute_after - NOW() AS eta
         FROM {self.qualified.queue_table}
         WHERE status = 'queued'
-          AND execute_after > NOW()
+          AND NOT ({self.due()})
           AND entrypoint = ANY($1)
         ORDER BY execute_after
         LIMIT 1
@@ -1162,7 +1198,7 @@ class QueryQueueBuilder:
 
 @dataclasses.dataclass
 class QuerySchedulerBuilder:
-    settings: DBSettings = dataclasses.field(default_factory=db_settings)
+    settings: DBSettings
 
     @property
     def qualified(self) -> QualifiedNames:
@@ -1208,7 +1244,7 @@ class QuerySchedulerBuilder:
                 AND params.expression = {self.qualified.schedules_table}.expression
             ))
     WHERE (entrypoint, expression) IN (SELECT entrypoint, expression FROM picked_jobs)
-    RETURNING *;"""  # noqa: E501
+    RETURNING *;"""
 
     def build_set_schedule_queued_query(self) -> str:
         return f"""UPDATE {self.qualified.schedules_table} SET status = 'queued', last_run = NOW(), updated = NOW() WHERE id = ANY($1);"""  # noqa: E501
@@ -1220,7 +1256,20 @@ class QuerySchedulerBuilder:
         return f"""SELECT * FROM {self.qualified.schedules_table} ORDER BY last_run ASC"""
 
     def build_delete_schedule_query(self) -> str:
-        return f"""DELETE FROM {self.qualified.schedules_table} WHERE id = ANY($1) OR entrypoint = ANY($2)"""  # noqa: E501
+        # An empty keep deletes every row of the entrypoint. A listed pair is spared.
+        return f"""WITH keep AS (
+            SELECT UNNEST($3::text[]) AS entrypoint,
+                   UNNEST($4::text[]) AS expression
+        )
+        DELETE FROM {self.qualified.schedules_table}
+        WHERE id = ANY($1)
+            OR (
+                entrypoint = ANY($2)
+                AND (entrypoint, expression) NOT IN (
+                    SELECT entrypoint, expression FROM keep
+                )
+            )
+        """
 
     def build_truncate_schedule_query(self) -> str:
         return f"""TRUNCATE {self.qualified.schedules_table}"""

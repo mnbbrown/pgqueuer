@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-import async_timeout
 import asyncpg
 import pytest
 
@@ -52,7 +51,7 @@ async def test_lost_key_claim_leaves_worker_usable(dsn: str) -> None:
             assert picked[0].id != queued[0]
             competing = asyncio.create_task(claim(queries=loser))
             # The second snapshot cannot see the first worker's uncommitted job.
-            async with async_timeout.timeout(5):
+            async with asyncio.timeout(5):
                 while not await first.fetchval(
                     "SELECT $1 = ANY(pg_blocking_pids($2))",
                     first.get_server_pid(),
@@ -130,7 +129,7 @@ async def test_inmemory_stale_key_owner_recovers_before_queued_sibling(
         priority=10,
     )
     assert await claim() == []
-    queries._jobs[running[0]]["heartbeat"] = datetime.now(timezone.utc) - timedelta(minutes=1)
+    queries.jobs[running[0]].heartbeat = datetime.now(UTC) - timedelta(minutes=1)
     recovered = await claim()
     assert [job.id for job in recovered] == running
     assert await claim() == []

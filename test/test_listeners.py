@@ -1,11 +1,10 @@
 import asyncio
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import MutableMapping
+from collections.abc import MutableMapping
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from anyio import CancelScope
-from async_timeout import timeout
 
 from pgqueuer import db
 from pgqueuer.core.listeners import (
@@ -35,7 +34,7 @@ async def test_handle_table_changed_event() -> None:
     event = AnyEvent(
         root=TableChangedEvent(
             channel=Channel("channel_1"),
-            sent_at=datetime.now(tz=timezone.utc),
+            sent_at=datetime.now(tz=UTC),
             type="table_changed_event",
             operation="insert",
             table="jobs_table",
@@ -65,7 +64,7 @@ async def test_handle_cancellation_event() -> None:
     event = AnyEvent(
         root=CancellationEvent(
             channel=Channel("channel_1"),
-            sent_at=datetime.now(tz=timezone.utc),
+            sent_at=datetime.now(tz=UTC),
             type="cancellation_event",
             ids=[job_id],
         )
@@ -88,7 +87,7 @@ async def test_handle_health_check_event_event() -> None:
     event = AnyEvent(
         root=HealthCheckEvent(
             channel=Channel("channel_1"),
-            sent_at=datetime.now(timezone.utc),
+            sent_at=datetime.now(UTC),
             type="health_check_event",
             id=HealthCheckId(uuid.uuid4()),
         )
@@ -113,12 +112,12 @@ async def test_emit_stable_changed_insert(apgdriver: db.Driver) -> None:
         evnets.append,
     )
 
-    (job_id,) = await Queries(apgdriver).enqueue(
+    (_job_id,) = await Queries(apgdriver).enqueue(
         "test_emit_stable_changed_insert",
         None,
     )
 
-    async with timeout(1):
+    async with asyncio.timeout(1):
         while len(evnets) < 1:
             await asyncio.sleep(0)
 
@@ -142,7 +141,7 @@ async def test_emit_stable_changed_update(apgdriver: db.Driver) -> None:
         None,
     )
 
-    async with timeout(1):
+    async with asyncio.timeout(1):
         while len(evnets) < 1:
             await asyncio.sleep(0)
 
@@ -176,14 +175,14 @@ async def test_emits_truncate_table_truncate(apgdriver: db.Driver) -> None:
         "test_emits_truncate_table_truncate",
         None,
     )
-    async with timeout(1):
+    async with asyncio.timeout(1):
         while len(evnets) < 1:
             await asyncio.sleep(0)
 
     evnets.clear()
 
     await Queries(apgdriver).clear_queue()
-    async with timeout(1):
+    async with asyncio.timeout(1):
         while len(evnets) < 1:
             await asyncio.sleep(0)
 
@@ -208,7 +207,7 @@ async def test_pgqueuer_heartbeat_event_trigger(apgdriver: db.Driver) -> None:
         None,
     )
 
-    async with timeout(1):
+    async with asyncio.timeout(1):
         while len(evnets) < 1:
             await asyncio.sleep(0)
 
@@ -228,7 +227,7 @@ def _table_changed_event() -> AnyEvent:
     return AnyEvent(
         root=TableChangedEvent(
             channel=Channel("chan"),
-            sent_at=datetime.now(tz=timezone.utc),
+            sent_at=datetime.now(tz=UTC),
             type="table_changed_event",
             operation="insert",
             table="jobs_table",
@@ -256,7 +255,7 @@ def test_event_router_dispatches_each_type_once() -> None:
         on_cancellation=lambda evt: hits.append(evt.type),
         on_health_check=lambda evt: hits.append(evt.type),
     )
-    sent_at = datetime.now(tz=timezone.utc)
+    sent_at = datetime.now(tz=UTC)
 
     router(_table_changed_event())
     router(

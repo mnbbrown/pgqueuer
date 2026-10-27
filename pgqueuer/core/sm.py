@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from contextlib import suppress
 from datetime import timedelta
-from typing import Callable
 
 import croniter
 
@@ -52,7 +51,6 @@ class SchedulerManager:
 
         Raises ValueError on invalid cron, RuntimeError on duplicate (entrypoint, expression).
         """
-
         if not croniter.croniter.is_valid(expression):
             raise ValueError(f"Invalid cron expression: {expression}")
 
@@ -104,7 +102,12 @@ class SchedulerManager:
             )
 
         if to_clean := {k.entrypoint for k, v in self.registry.items() if v.parameters.clean_old}:
-            await self.queries.delete_schedule(ids=set(), entrypoints=to_clean)
+            # Spare expressions still registered, so a due next_run survives restart.
+            await self.queries.delete_schedule(
+                ids=set(),
+                entrypoints=to_clean,
+                keep={key for key in self.registry if key.entrypoint in to_clean},
+            )
 
         await self.queries.insert_schedule({k: v.next_in() for k, v in self.registry.items()})
 
@@ -140,11 +143,9 @@ class SchedulerManager:
                     else timedelta(seconds=0)
                 )
 
-                with suppress(TimeoutError, asyncio.TimeoutError):
-                    await asyncio.wait_for(
-                        self.shutdown.wait(),
-                        timeout=(wait + leeway).total_seconds(),
-                    )
+                with suppress(TimeoutError):
+                    async with asyncio.timeout((wait + leeway).total_seconds()):
+                        await self.shutdown.wait()
 
     async def dispatch(
         self,
@@ -197,8 +198,6 @@ class SchedulerManager:
             if self.shutdown.is_set():
                 await asyncio.sleep(1.0)
                 continue
-            with suppress(TimeoutError, asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    self.shutdown.wait(),
-                    timeout=1.0,
-                )
+            with suppress(TimeoutError):
+                async with asyncio.timeout(1.0):
+                    await self.shutdown.wait()

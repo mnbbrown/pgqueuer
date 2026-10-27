@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -215,7 +215,8 @@ class TestActions:
         response = await client.post("/jobs/requeue", data={"ids": str(job.id)})
         assert response.status_code == 204
         refreshed = await queries.queue_job_by_id(job.id)
-        assert refreshed is not None and refreshed.status == "queued"
+        assert refreshed is not None
+        assert refreshed.status == "queued"
 
     async def test_requeue_without_ids_is_noop(self, client: httpx.AsyncClient) -> None:
         assert (await client.post("/jobs/requeue", data={})).status_code == 204
@@ -319,7 +320,8 @@ class TestBroadcaster:
         assert "queue-change" in frame
 
         # The burst above collapsed into one pending signal at most.
-        assert broadcaster.subscribers and all(q.qsize() <= 1 for q in broadcaster.subscribers)
+        assert broadcaster.subscribers
+        assert all(q.qsize() <= 1 for q in broadcaster.subscribers)
         await stream.aclose()
         assert not broadcaster.subscribers
 
@@ -382,7 +384,7 @@ class TestTemplateFormatters:
 
     def test_fmt_dt(self) -> None:
         assert fmt_dt(None) == "–"
-        aware = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        aware = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
         assert fmt_dt(aware) == "2026-01-02 03:04:05"
 
     def test_fmt_rate(self) -> None:
@@ -392,7 +394,7 @@ class TestTemplateFormatters:
 
 class TestChartSlots:
     def now(self) -> datetime:
-        return datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+        return datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
 
     def bucket(
         self, minutes_ago: int, status: types.JOB_STATUS, count: int
@@ -435,11 +437,11 @@ class TestChartSlots:
 class TestThroughputChartSvg:
     def test_empty_is_blank(self) -> None:
         assert throughput_chart_svg([]) == ""
-        empty = chart_slots([], timedelta(hours=1), end=datetime.now(timezone.utc))
+        empty = chart_slots([], timedelta(hours=1), end=datetime.now(UTC))
         assert throughput_chart_svg(empty) == ""
 
     def test_stacked_rects_and_tooltip(self) -> None:
-        now = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
         slot = ChartSlot(
             start=now - timedelta(minutes=1),
             end=now,

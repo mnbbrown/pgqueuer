@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import traceback
 from collections.abc import MutableMapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, NamedTuple
 
 import anyio
@@ -28,7 +28,7 @@ from pgqueuer.domain.types import (
 
 def utc_now() -> datetime:
     """Return the current time in UTC."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Event(BaseModel):
@@ -40,7 +40,7 @@ class Event(BaseModel):
     received_at: AwareDatetime = Field(
         init=False,
         default_factory=lambda: datetime.now(
-            tz=timezone.utc,
+            tz=UTC,
         ),
     )
 
@@ -134,7 +134,8 @@ class Log(BaseModel):
     entrypoint: QueueEntrypoint
     traceback: Annotated[
         TracebackRecord | None,
-        BeforeValidator(lambda x: None if x is None else from_json(x)),
+        # asyncpg returns jsonb as text, psycopg as an already-parsed dict.
+        BeforeValidator(lambda x: x if x is None or isinstance(x, dict) else from_json(x)),
     ]
     aggregated: bool
 
@@ -186,8 +187,7 @@ class BlockedKey(BaseModel):
 
 @dataclasses.dataclass
 class Context:
-    """
-    Runtime context shared across components.
+    """Runtime context shared across components.
 
     Attributes:
         cancellation: The root CancelScope controlling shutdown of running tasks.
@@ -202,8 +202,7 @@ class Context:
 
 @dataclasses.dataclass
 class ScheduleContext:
-    """
-    Runtime context for scheduled tasks, mirroring Context for queue jobs.
+    """Runtime context for scheduled tasks, mirroring Context for queue jobs.
 
     Attributes:
         resources: A mutable mapping for user-provided, pre-initialized shared

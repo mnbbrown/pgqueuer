@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Generator
 from http import HTTPStatus
 from pathlib import Path
-from typing import Generator
 from urllib.parse import urlparse
 
 import pytest
@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from examples.flask_sync_usage import create_app
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, dsn: str) -> Generator[FlaskClient, None, None]:
     parsed = urlparse(dsn)
     monkeypatch.setenv("PGHOST", parsed.hostname or "")

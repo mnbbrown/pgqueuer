@@ -5,8 +5,9 @@ import dataclasses
 import functools
 import inspect
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Literal, TypeAlias, TypeVar, cast
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
+from typing import Literal, TypeAlias, TypeVar, cast
 
 from croniter import croniter
 
@@ -39,7 +40,7 @@ def is_async_callable(obj: object) -> bool:
         obj = obj.func
 
     return inspect.iscoroutinefunction(obj) or (
-        callable(obj) and inspect.iscoroutinefunction(getattr(obj, "__call__", None))
+        callable(obj) and inspect.iscoroutinefunction(getattr(obj, "__call__", None))  # noqa: B004 - inspects __call__
     )
 
 
@@ -150,7 +151,7 @@ class DatabaseRetryEntrypointExecutor(EntrypointExecutor):
         except errors.NonRetryableError as e:
             await self._handle_terminal(e, job, "non_retryable")
             raise
-        except (TimeoutError, asyncio.TimeoutError) as e:
+        except TimeoutError as e:
             # Treat as terminal "timeout" only when our wait_for produced it.
             # When max_time is None, a handler-raised TimeoutError falls through
             # to the generic retry classification.
@@ -158,7 +159,7 @@ class DatabaseRetryEntrypointExecutor(EntrypointExecutor):
                 await self._handle_terminal(e, job, "timeout")
                 raise
             await self._classify_and_retry(e, job)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - classify every handler failure for retry
             await self._classify_and_retry(e, job)
 
     async def _classify_and_retry(self, exc: Exception, job: models.Job) -> None:
@@ -170,10 +171,13 @@ class DatabaseRetryEntrypointExecutor(EntrypointExecutor):
         if job.attempts >= self.max_attempts:
             await self._handle_terminal(exc, job, "max_attempts")
             raise exc
-        delay = min(
-            self.initial_delay * (self.backoff_multiplier**job.attempts),
-            self.max_delay,
-        )
+        try:
+            delay = min(
+                self.initial_delay * (self.backoff_multiplier**job.attempts),
+                self.max_delay,
+            )
+        except OverflowError:
+            delay = self.max_delay
         raise errors.RetryRequested(delay=delay, reason=str(exc)) from exc
 
     async def _handle_terminal(
@@ -211,7 +215,7 @@ class AbstractScheduleExecutor(ABC):
         """Next scheduled fire time in UTC."""
         return datetime.fromtimestamp(
             croniter(self.parameters.expression, start_time=utc_now()).get_next(),
-            timezone.utc,
+            UTC,
         )
 
     def next_in(self) -> timedelta:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
-from typing import Callable
+from collections.abc import Callable
 
 try:
     from fastapi import Depends, HTTPException
@@ -13,7 +13,7 @@ except ImportError as e:
     ) from e
 
 USER_ENV = "PGQUEUER_WEB_USER"
-PASSWORD_ENV = "PGQUEUER_WEB_PASSWORD"
+PASSWORD_ENV = "PGQUEUER_WEB_PASSWORD"  # noqa: S105 - env var name, not a password
 
 
 def create_basic_auth_dependency() -> Callable[[HTTPBasicCredentials], None] | None:

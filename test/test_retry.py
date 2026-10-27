@@ -124,7 +124,7 @@ async def test_heartbeat_no_updates(apgdriver: db.Driver) -> None:
     )
 
     assert len(heartbeats) == 1
-    for k, v in heartbeats.items():
+    for v in heartbeats.values():
         assert len(v) == 2
         assert v[1] == v[0]
 
@@ -195,6 +195,7 @@ async def test_cancellation_marks_canceled_no_retry(apgdriver: db.Driver) -> Non
 async def test_heartbeat_db_datetime(apgdriver: db.Driver) -> None:
     retry_timer = timedelta(seconds=0.150)
     event = asyncio.Event()
+    started = asyncio.Event()
     qm = QueueManager(queries.Queries(apgdriver))
 
     async def fetch_db_heartbeat(jobid: JobId) -> timedelta:
@@ -205,16 +206,21 @@ async def test_heartbeat_db_datetime(apgdriver: db.Driver) -> None:
 
     @qm.entrypoint("fetch")
     async def fetch(context: Job) -> None:
+        started.set()
         await event.wait()
 
     jid, *_ = await qm.queries.enqueue(["fetch"], [None], [0])
 
     async def entrypoint_waiter() -> None:
+        await started.wait()
         await asyncio.sleep(retry_timer.total_seconds() * 2)
         event.set()
         qm.shutdown.set()
 
     async def poller() -> list[timedelta]:
+        # Until the job is picked, heartbeat holds the enqueue time and ages
+        # with however long qm.run takes to start.
+        await started.wait()
         samples = list[timedelta]()
         while not event.is_set():
             samples.append(await fetch_db_heartbeat(jid))
@@ -226,6 +232,7 @@ async def test_heartbeat_db_datetime(apgdriver: db.Driver) -> None:
         entrypoint_waiter(),
     )
 
+    assert samples
     leeway = retry_timer / 10
     for sample in samples:
         assert sample - leeway < retry_timer, (sample, retry_timer, sample - retry_timer)
@@ -284,16 +291,17 @@ async def test_job_not_retried_while_running(
 
     async def stopper() -> None:
         await asyncio.sleep(retry_timer.total_seconds() * 10)
-        waiter.set()
-        qm.shutdown.set()
+        try:
+            # Check while the handler is blocked, before shutdown races an in-flight dequeue.
+            assert calls == 1
+        finally:
+            qm.shutdown.set()
+            waiter.set()
 
     await asyncio.gather(
         qm.run(dequeue_timeout=timedelta(seconds=0), heartbeat_timeout=retry_timer),
         stopper(),
     )
-
-    # Expect only a single execution
-    assert calls == 1
 
 
 async def test_job_reruns_after_its_dispatch_dies_before_it_starts(apgdriver: db.Driver) -> None:
@@ -324,7 +332,7 @@ async def test_job_reruns_after_its_dispatch_dies_before_it_starts(apgdriver: db
     await qm.queries.enqueue(["fetch"], [None], [0])
 
     async def stopper() -> None:
-        with contextlib.suppress(asyncio.TimeoutError):
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(ran.wait(), timeout=3)
         qm.shutdown.set()
 

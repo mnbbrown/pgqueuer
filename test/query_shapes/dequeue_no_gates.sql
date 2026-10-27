@@ -13,7 +13,7 @@ next_queued AS (
             FROM pgqueuer candidate
             WHERE candidate.entrypoint = available.entrypoint
               AND candidate.status = 'queued'
-              AND candidate.execute_after < NOW()
+              AND candidate.execute_after <= NOW()
                   AND NOT (
         candidate.entrypoint = ANY($5::text[])
         AND candidate.serialize_key IS NOT NULL
@@ -24,7 +24,7 @@ next_queued AS (
               AND other.id <> candidate.id
               AND (
                 other.status = 'picked'
-                OR (other.status = 'queued' AND other.execute_after < NOW()
+                OR (other.status = 'queued' AND other.execute_after <= NOW()
                     AND (other.priority > candidate.priority
                          OR (other.priority = candidate.priority AND other.id < candidate.id)))
               )
@@ -45,7 +45,7 @@ next_stale AS (
     WHERE stale.status = 'picked'
       AND stale.entrypoint = ANY($2)
       AND stale.heartbeat < NOW() - $4::interval
-      AND stale.execute_after < NOW()
+      AND stale.execute_after <= NOW()
     ORDER BY stale.priority DESC, stale.id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $1

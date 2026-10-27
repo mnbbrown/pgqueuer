@@ -12,9 +12,12 @@ if TYPE_CHECKING:
     import asyncpg
     import psycopg
 
-from pydantic_core import to_json
-from typing_extensions import assert_never
+from typing import assert_never
 
+from pydantic_core import to_json
+
+from pgqueuer.adapters.drivers.asyncpg import AsyncpgDriver, AsyncpgPoolDriver
+from pgqueuer.adapters.drivers.psycopg import PsycopgDriver
 from pgqueuer.adapters.persistence import (
     qb,
     query_helpers,
@@ -27,6 +30,7 @@ from pgqueuer.core.logconfig import logger
 from pgqueuer.domain import errors, models, types
 from pgqueuer.domain.schema import model as models_schema
 from pgqueuer.domain.schema.declaration import target
+from pgqueuer.domain.settings import DBSettings
 from pgqueuer.domain.types import CronEntrypoint, HealthCheckId, QueueEntrypoint, QueueManagerId
 from pgqueuer.ports import tracing
 from pgqueuer.ports.driver import Driver, SyncDriver
@@ -68,43 +72,61 @@ class Queries:
 
     driver: Driver
 
-    qbe: qb.QueryBuilderEnvironment = dataclasses.field(
-        default_factory=qb.QueryBuilderEnvironment,
-    )
-    qbq: qb.QueryQueueBuilder = dataclasses.field(
-        default_factory=qb.QueryQueueBuilder,
-    )
-    qbs: qb.QuerySchedulerBuilder = dataclasses.field(
-        default_factory=qb.QuerySchedulerBuilder,
-    )
+    # Table, channel and schema names. The builders, and every caller holding
+    # these queries, read this one object; defaults to the PGQUEUER_* env vars.
+    settings: DBSettings = dataclasses.field(default_factory=DBSettings)
+
+    qbe: qb.QueryBuilderEnvironment = dataclasses.field(init=False)
+    qbq: qb.QueryQueueBuilder = dataclasses.field(init=False)
+    qbs: qb.QuerySchedulerBuilder = dataclasses.field(init=False)
 
     # Optional injected tracer; falls back to the global ``tracing.TRACER.tracer``.
     tracer: TracingProtocol | None = None
 
+    def __post_init__(self) -> None:
+        self.qbe = qb.QueryBuilderEnvironment(self.settings)
+        self.qbq = qb.QueryQueueBuilder(self.settings)
+        self.qbs = qb.QuerySchedulerBuilder(self.settings)
+
     @classmethod
-    def from_asyncpg_connection(cls, connection: "asyncpg.Connection") -> "Queries":
+    def from_asyncpg_connection(
+        cls,
+        connection: asyncpg.Connection,
+        settings: DBSettings | None = None,
+    ) -> Queries:
         """Build Queries over an asyncpg connection."""
-        from pgqueuer.adapters.drivers.asyncpg import AsyncpgDriver
-
-        return cls(AsyncpgDriver(connection))
+        return cls(AsyncpgDriver(connection), settings or DBSettings())
 
     @classmethod
-    def from_asyncpg_pool(cls, pool: "asyncpg.Pool") -> "Queries":
+    def from_asyncpg_pool(
+        cls,
+        pool: asyncpg.Pool,
+        settings: DBSettings | None = None,
+    ) -> Queries:
         """Build Queries over an asyncpg pool."""
-        from pgqueuer.adapters.drivers.asyncpg import AsyncpgPoolDriver
-
-        return cls(AsyncpgPoolDriver(pool))
+        return cls(AsyncpgPoolDriver(pool), settings or DBSettings())
 
     @classmethod
-    def from_psycopg_connection(cls, connection: "psycopg.AsyncConnection") -> "Queries":
+    def from_psycopg_connection(
+        cls,
+        connection: psycopg.AsyncConnection,
+        settings: DBSettings | None = None,
+    ) -> Queries:
         """Build Queries over a psycopg async connection (must have autocommit=True)."""
-        from pgqueuer.adapters.drivers.psycopg import PsycopgDriver
+        return cls(PsycopgDriver(connection), settings or DBSettings())
 
-        return cls(PsycopgDriver(connection))
+    async def install(
+        self,
+        create_schema: bool = True,
+        durability: qb.Durability | None = None,
+    ) -> None:
+        """Create the schema (when configured), tables, types, indexes, triggers, and functions.
 
-    async def install(self, create_schema: bool = True) -> None:
-        """Create the schema (when configured), tables, types, indexes, triggers, and functions."""
-        await self.driver.execute(self.qbe.build_install_query(create_schema=create_schema))
+        *durability* overrides the configured level for this install only.
+        """
+        await self.driver.execute(
+            self.qbe.build_install_query(create_schema=create_schema, durability=durability)
+        )
 
     async def uninstall(self) -> None:
         """Drop every PgQueuer schema object. Destructive."""
@@ -119,9 +141,16 @@ class Queries:
         live = await schema_inspect.inspect(self.driver, self.qbe.settings)
         return bool(live.tables or live.enums)
 
-    async def plan_upgrade(self) -> models_schema.Plan:
-        """What :meth:`upgrade` would do to this database, without doing it."""
-        settings = self.qbe.settings
+    async def plan_upgrade(self, widen_id: bool | None = None) -> models_schema.Plan:
+        """What :meth:`upgrade` would do to this database, without doing it.
+
+        *widen_id* overrides the configured ``widen_id`` for this plan only.
+        """
+        settings = (
+            self.qbe.settings
+            if widen_id is None
+            else self.qbe.settings.model_copy(update={"widen_id": widen_id})
+        )
         live = await schema_inspect.inspect(self.driver, settings)
         return schema_plan.plan(live, target(settings), settings)
 
@@ -140,7 +169,7 @@ class Queries:
         finally:
             await self.driver.execute("SELECT pg_advisory_unlock($1)", key)
 
-    async def apply_upgrade(self) -> models_schema.Plan:
+    async def apply_upgrade(self, widen_id: bool | None = None) -> models_schema.Plan:
         """Converge the installed schema onto the declaration; return what ran.
 
         One statement per round trip, never batched: ``ALTER TYPE ... ADD
@@ -148,7 +177,7 @@ class Queries:
         transaction. Planned inside the lock, so the result is what was applied.
         """
         async with self.schema_lock():
-            computed = await self.plan_upgrade()
+            computed = await self.plan_upgrade(widen_id)
             for statement in computed.statements:
                 await self.driver.execute(statement)
         for note in computed.notes:
@@ -162,9 +191,9 @@ class Queries:
         """
         await self.apply_upgrade()
 
-    async def alter_durability(self) -> None:
-        """Switch table durability mode without data loss."""
-        await self.driver.execute("\n\n".join(self.qbe.build_alter_durability_query()))
+    async def alter_durability(self, durability: qb.Durability | None = None) -> None:
+        """Switch table durability to *durability* (default: configured) without data loss."""
+        await self.driver.execute("\n\n".join(self.qbe.build_alter_durability_query(durability)))
 
     async def optimize_autovacuum(self) -> None:
         """Apply autovacuum settings."""
@@ -183,7 +212,6 @@ class Queries:
             table,
             column,
         )
-        assert len(rows) == 1
         (row,) = rows
         return cell(row, "exists", bool)
 
@@ -194,7 +222,6 @@ class Queries:
             table,
             index,
         )
-        assert len(rows) == 1
         (row,) = rows
         return cell(row, "exists", bool)
 
@@ -208,7 +235,6 @@ class Queries:
             self.qbe.build_has_table_query(),
             table,
         )
-        assert len(rows) == 1
         (row,) = rows
         return cell(row, "exists", bool)
 
@@ -217,7 +243,6 @@ class Queries:
             self.qbe.build_has_function_query(),
             function,
         )
-        assert len(rows) == 1
         (row,) = rows
         return cell(row, "exists", bool)
 
@@ -226,7 +251,6 @@ class Queries:
             self.qbe.build_has_trigger_query(),
             trigger,
         )
-        assert len(rows) == 1
         (row,) = rows
         return cell(row, "exists", bool)
 
@@ -238,14 +262,12 @@ class Queries:
         global_concurrency_limit: int | None,
         heartbeat_timeout: timedelta,
     ) -> list[models.Job]:
-        """
-        Retrieve and update jobs from the queue to be processed.
+        """Retrieve and update jobs from the queue to be processed.
 
         Selects jobs that are queued or whose heartbeat has gone stale
         (exceeding heartbeat_timeout), locks them with FOR UPDATE SKIP
         LOCKED, and atomically sets their status to 'picked'.
         """
-
         if batch_size < 1:
             raise ValueError("Batch size must be greater than or equal to one (1)")
 
@@ -371,7 +393,7 @@ class Queries:
 
         if on_conflict == "skip":
             return query_helpers.scatter_ids_by_ordinal(rows, len(normed_params.entrypoint))
-        if on_conflict == "raise" or on_conflict == "update_priority":
+        if on_conflict == "raise" or on_conflict == "update_priority":  # noqa: PLR1714 - mypy narrows ==, not in
             return [types.JobId(cell(row, "id", int)) for row in rows]
         assert_never(on_conflict)
 
@@ -385,8 +407,8 @@ class Queries:
         return cell(rows[0], "queued_work", int) if rows else 0
 
     async def clear_queue(self, entrypoint: str | list[str] | None = None) -> None:
-        """Delete jobs; restrict to *entrypoint* when given, else truncate."""
-        if entrypoint:
+        """Delete jobs; restrict to *entrypoint* unless it is None, which truncates."""
+        if entrypoint is not None:
             await self.driver.execute(
                 self.qbq.build_delete_from_queue_query(),
                 [entrypoint] if isinstance(entrypoint, str) else entrypoint,
@@ -395,12 +417,18 @@ class Queries:
             await self.driver.execute(self.qbq.build_truncate_queue_query())
 
     async def mark_job_as_cancelled(self, ids: list[types.JobId]) -> None:
-        """Log *ids* as 'canceled' and emit a cancellation NOTIFY."""
+        """Cancel *ids* and emit a cancellation NOTIFY.
+
+        A ``queued`` or ``failed`` row is logged ``canceled`` and removed. A
+        ``picked`` row stays until its worker logs the outcome, so the job keeps
+        its concurrency slot and dedupe key while the handler runs.
+        """
         await asyncio.gather(
             self.driver.execute(
                 self.qbq.build_log_job_query(),
                 ids,
                 ["canceled"] * len(ids),
+                [None] * len(ids),
                 [None] * len(ids),
             ),
             self.notify_job_cancellation(ids),
@@ -423,18 +451,19 @@ class Queries:
             ]
         ],
     ) -> None:
-        """
-        Move completed or failed jobs from the queue to the log table.
+        """Move completed or failed jobs from the queue to the log table.
 
         Jobs with status ``'failed'`` are held in the queue table (UPDATE)
         rather than deleted.  All other statuses are removed (DELETE) as before.
-        Both paths write an entry to the log table.
+        Both paths write an entry to the log table.  A job whose row another
+        worker has re-picked is skipped, so a stale worker cannot resolve it.
         """
         await self.driver.execute(
             self.qbq.build_log_job_query(),
             [job.id for job, _, _ in job_status],
             [status for _, status, _ in job_status],
             [tb.model_dump_json() if tb else None for _, _, tb in job_status],
+            [job.queue_manager_id for job, _, _ in job_status],
         )
 
     async def retry_job(
@@ -447,14 +476,17 @@ class Queries:
 
         Atomically updates the job in-place (status → queued, execute_after
         bumped, attempts incremented) and writes a log entry recording the
-        retry event.
+        retry event.  A no-op when another worker has re-picked the job.
         """
-        await self.driver.execute(
+        retried = await self.driver.fetch(
             self.qbq.build_retry_job_query(),
             job.id,
             delay,
             traceback_record.model_dump_json() if traceback_record else None,
+            job.queue_manager_id,
         )
+        if retried:
+            await self.notify_table_changed("update")
 
     async def requeue_jobs(self, ids: list[types.JobId], reset_attempts: bool = True) -> None:
         """Move failed jobs back to queued status for reprocessing.
@@ -462,10 +494,12 @@ class Queries:
         Resets attempts to 0 and sets execute_after to NOW().
         Only affects jobs with status ``'failed'``.
         """
-        await self.driver.execute(
-            self.qbq.build_requeue_jobs_query(reset_attempts=reset_attempts),
-            ids,
+        requeued = await self.driver.fetch(
+            self.qbq.build_requeue_jobs_query(reset_attempts=reset_attempts), ids
         )
+        # The statement-level trigger cannot tell UPDATEs apart, so it stays silent on them.
+        if requeued:
+            await self.notify_table_changed("update")
 
     async def list_failed_jobs(
         self,
@@ -480,8 +514,8 @@ class Queries:
         return [models.Job.model_validate(r) for r in rows]
 
     async def clear_statistics_log(self, entrypoint: str | list[str] | None = None) -> None:
-        """Delete statistics rows; restrict to *entrypoint* when given, else truncate."""
-        if entrypoint:
+        """Delete statistics rows; restrict to *entrypoint* unless it is None, which truncates."""
+        if entrypoint is not None:
             await self.driver.execute(
                 self.qbq.build_delete_from_log_statistics_query(),
                 [entrypoint] if isinstance(entrypoint, str) else entrypoint,
@@ -490,8 +524,8 @@ class Queries:
             await self.driver.execute(self.qbq.build_truncate_log_statistics_query())
 
     async def clear_queue_log(self, entrypoint: str | list[str] | None = None) -> None:
-        """Delete queue-log rows; restrict to *entrypoint* when given, else truncate."""
-        if entrypoint:
+        """Delete queue-log rows; restrict to *entrypoint* unless it is None, which truncates."""
+        if entrypoint is not None:
             await self.driver.execute(
                 self.qbq.build_delete_log_query(),
                 [entrypoint] if isinstance(entrypoint, str) else entrypoint,
@@ -531,6 +565,19 @@ class Queries:
                 ids=ids,
                 sent_at=models.utc_now(),
                 type="cancellation_event",
+            ).model_dump_json(),
+        )
+
+    async def notify_table_changed(self, operation: types.OPERATIONS) -> None:
+        """Emit a ``table_changed_event`` NOTIFY, as the queue table trigger does."""
+        await self.driver.notify(
+            self.qbq.settings.channel,
+            models.TableChangedEvent(
+                channel=self.qbq.settings.channel,
+                sent_at=models.utc_now(),
+                type="table_changed_event",
+                operation=operation,
+                table=self.qbq.settings.queue_table,
             ).model_dump_json(),
         )
 
@@ -601,11 +648,21 @@ class Queries:
         self,
         ids: set[types.ScheduleId],
         entrypoints: set[CronEntrypoint],
+        *,
+        keep: set[models.CronExpressionEntrypoint] | None = None,
     ) -> None:
+        """Delete schedules by id or entrypoint.
+
+        A pair in *keep* survives the entrypoint match. An id in *ids* is
+        deleted even when its pair is listed.
+        """
+        spared = keep or set()
         await self.driver.execute(
             self.qbs.build_delete_schedule_query(),
             list(ids),
             list(entrypoints),
+            [key.entrypoint for key in spared],
+            [key.expression for key in spared],
         )
 
     async def clear_schedule(self) -> None:
@@ -875,12 +932,16 @@ class SyncQueries:
 
     driver: SyncDriver
 
-    qbq: qb.QueryQueueBuilder = dataclasses.field(
-        default_factory=qb.QueryQueueBuilder,
-    )
+    # Table, channel and schema names; defaults to the PGQUEUER_* env vars.
+    settings: DBSettings = dataclasses.field(default_factory=DBSettings)
+
+    qbq: qb.QueryQueueBuilder = dataclasses.field(init=False)
 
     # Optional injected tracer; falls back to the global ``tracing.TRACER.tracer``.
     tracer: TracingProtocol | None = None
+
+    def __post_init__(self) -> None:
+        self.qbq = qb.QueryQueueBuilder(self.settings)
 
     @overload
     def enqueue(
@@ -990,7 +1051,7 @@ class SyncQueries:
 
         if on_conflict == "skip":
             return query_helpers.scatter_ids_by_ordinal(rows, len(normed_params.entrypoint))
-        if on_conflict == "raise" or on_conflict == "update_priority":
+        if on_conflict == "raise" or on_conflict == "update_priority":  # noqa: PLR1714 - mypy narrows ==, not in
             return [types.JobId(cell(row, "id", int)) for row in rows]
         assert_never(on_conflict)
 

@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 import uuid
 from datetime import timedelta
 from typing import Any
 
 import anyio
-import async_timeout
 import pytest
 
 from pgqueuer.adapters.inmemory import InMemoryQueries
@@ -24,7 +22,6 @@ from pgqueuer.domain.errors import RetryException, RetryRequested
 from pgqueuer.domain.models import Context, Job, TracebackRecord
 from pgqueuer.domain.types import (
     JobId,
-    OnFailure,
     QueueEntrypoint,
     QueueExecutionMode,
     QueueManagerId,
@@ -150,7 +147,7 @@ async def test_retry_requested_requeues_and_succeeds(n_jobs: int, batch_size: in
 
     await pq.qm.queries.enqueue(["retry_ep"] * n_jobs, [b"data"] * n_jobs, [0] * n_jobs)
 
-    async with async_timeout.timeout(5):
+    async with asyncio.timeout(5):
         await pq.qm.run(
             batch_size=batch_size,
             mode=QueueExecutionMode.drain,
@@ -210,30 +207,34 @@ async def test_unhandled_exception_remains_terminal() -> None:
     assert await pq.qm.queries.queue_size() == []
 
 
-@pytest.mark.parametrize(
-    ("on_failure", "status", "queue_status"),
-    (("delete", "exception", None), ("hold", "failed", "failed")),
-)
-async def test_failing_retry_job_records_the_job_as_failed(
-    monkeypatch: pytest.MonkeyPatch,
-    on_failure: OnFailure,
-    status: str,
-    queue_status: str | None,
-) -> None:
-    """A retry_job error goes down the failure path instead of leaving the row picked (#883)."""
+async def test_retry_write_is_retried_until_it_lands(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One failed retry write is tried again, and the handler runs with attempts 1 (#1030)."""
     pq = PgQueuer.in_memory()
+    seen: list[int] = []
+    writes = 0
+    original = pq.qm.queries.retry_job
 
-    @pq.entrypoint("retry_ep", on_failure=on_failure)
+    @pq.entrypoint("retry_ep")
     async def handler(job: Job) -> None:
-        raise RetryRequested
+        seen.append(job.attempts)
+        if job.attempts == 0:
+            raise RetryRequested(delay=timedelta(0))
 
-    async def failing_retry_job(*_: object) -> None:
-        raise ConnectionError("retry write failed")
+    async def flaky_retry_job(
+        job: Job,
+        delay: timedelta,
+        traceback_record: TracebackRecord | None,
+    ) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise ConnectionError("retry write failed")
+        await original(job, delay, traceback_record)
 
-    monkeypatch.setattr(pq.qm.queries, "retry_job", failing_retry_job)
+    monkeypatch.setattr(pq.qm.queries, "retry_job", flaky_retry_job)
     await pq.qm.queries.enqueue("retry_ep", b"data", priority=0)
 
-    async with async_timeout.timeout(5):
+    async with asyncio.timeout(5):
         await pq.qm.run(
             batch_size=10,
             mode=QueueExecutionMode.drain,
@@ -241,29 +242,56 @@ async def test_failing_retry_job_records_the_job_as_failed(
             dequeue_timeout=timedelta(seconds=1),
         )
 
-    (log,) = [log for log in await pq.qm.queries.queue_log() if log.status == status]
-    assert log.traceback is not None
-    assert log.traceback.exception_type == "ConnectionError"
-    assert [row.status for row in await pq.qm.queries.queue_size()] == (
-        [queue_status] if queue_status else []
-    )
+    assert seen == [0, 1]
+    assert writes == 2
+    assert await pq.qm.queries.queue_size() == []
+    assert [log.status for log in await pq.qm.queries.queue_log()][-1] == "successful"
 
 
-needs_exception_groups = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="asyncio.TaskGroup and ExceptionGroup need Python 3.11"
-)
+async def test_retry_write_stops_on_shutdown_and_leaves_the_job_picked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown during a failing retry write leaves the job picked (#1030)."""
+    pq = PgQueuer.in_memory()
+
+    @pq.entrypoint("retry_ep")
+    async def handler(job: Job) -> None:
+        raise RetryRequested
+
+    async def failing_retry_job(*_args: object) -> None:
+        pq.qm.shutdown.set()
+        raise ConnectionError("retry write failed")
+
+    monkeypatch.setattr(pq.qm.queries, "retry_job", failing_retry_job)
+    [job_id] = await pq.qm.queries.enqueue("retry_ep", b"data", priority=0)
+
+    async with asyncio.timeout(5):
+        await pq.qm.run(
+            batch_size=10,
+            mode=QueueExecutionMode.continuous,
+            max_concurrent_tasks=100,
+            dequeue_timeout=timedelta(seconds=1),
+        )
+
+    assert isinstance(pq.qm.queries, InMemoryQueries)
+    job = await pq.qm.queries.queue_job_by_id(job_id)
+    assert job is not None
+    assert job.status == "picked"
+    assert job.attempts == 0
+    logs = await pq.qm.queries.queue_log()
+    assert [log.status for log in logs] == ["queued", "picked"]
+    assert all(log.traceback is None for log in logs)
 
 
 async def raise_from_task_group(*errors: Exception) -> None:
     async def fail(error: Exception) -> None:
         raise error
 
-    async with asyncio.TaskGroup() as group:  # type: ignore[attr-defined,unused-ignore]
+    async with asyncio.TaskGroup() as group:
         for error in errors:
-            group.create_task(fail(error))
+            _ = group.create_task(fail(error))
 
 
-@needs_exception_groups
 @pytest.mark.parametrize(
     ("with_other_error", "status"), ((False, "successful"), (True, "exception"))
 )
@@ -282,7 +310,7 @@ async def test_retry_requested_from_task_group(with_other_error: bool, status: s
 
     await pq.qm.queries.enqueue("group_ep", b"data", priority=0)
 
-    async with async_timeout.timeout(5):
+    async with asyncio.timeout(5):
         await pq.qm.run(
             batch_size=10,
             mode=QueueExecutionMode.drain,
@@ -294,7 +322,6 @@ async def test_retry_requested_from_task_group(with_other_error: bool, status: s
     assert [log.status for log in await pq.qm.queries.queue_log()][-1] == status
 
 
-@needs_exception_groups
 async def test_database_retry_executor_honours_retry_from_task_group() -> None:
     """A grouped RetryRequested stays an explicit retry, outside max_attempts (#899)."""
     pq = PgQueuer.in_memory()
@@ -313,7 +340,7 @@ async def test_database_retry_executor_honours_retry_from_task_group() -> None:
 
     await pq.qm.queries.enqueue("group_retry_ep", b"data", priority=0)
 
-    async with async_timeout.timeout(5):
+    async with asyncio.timeout(5):
         await pq.qm.run(
             batch_size=10,
             mode=QueueExecutionMode.drain,
@@ -558,6 +585,60 @@ def test_database_retry_executor_backoff_caps_at_max_delay() -> None:
     assert len(set(delays)) > 1
 
 
+@pytest.mark.parametrize(
+    ("backoff_multiplier", "attempts", "expected"),
+    [
+        pytest.param(2.0, 3, timedelta(seconds=8), id="x2-below-cap"),
+        pytest.param(2.0, 46, timedelta(minutes=5), id="x2-last-in-timedelta-range"),
+        pytest.param(2.0, 47, timedelta(minutes=5), id="x2-past-timedelta-range"),
+        pytest.param(10.0, 14, timedelta(minutes=5), id="x10-past-timedelta-range"),
+        pytest.param(2.0, 1100, timedelta(minutes=5), id="x2-past-float-range"),
+    ],
+)
+async def test_database_retry_executor_caps_delay_past_timedelta_range(
+    backoff_multiplier: float,
+    attempts: int,
+    expected: timedelta,
+) -> None:
+    """A backoff too large for a timedelta is capped at max_delay instead of raising."""
+
+    async def handler(job: Job) -> None:
+        raise ValueError("still failing")
+
+    executor = DatabaseRetryEntrypointExecutor(
+        parameters=EntrypointExecutorParameters(
+            concurrency_limit=0,
+            func=handler,
+        ),
+        max_attempts=attempts + 1,
+        initial_delay=timedelta(seconds=1),
+        max_delay=timedelta(minutes=5),
+        backoff_multiplier=backoff_multiplier,
+    )
+    job = Job.model_validate(
+        {
+            "id": JobId(1),
+            "priority": 0,
+            "created": "2024-01-01T00:00:00Z",
+            "updated": "2024-01-01T00:00:00Z",
+            "heartbeat": "2024-01-01T00:00:00Z",
+            "execute_after": "2024-01-01T00:00:00Z",
+            "status": "picked",
+            "entrypoint": QueueEntrypoint("overflow_ep"),
+            "payload": None,
+            "attempts": attempts,
+            "queue_manager_id": None,
+            "headers": None,
+        }
+    )
+
+    with pytest.raises(RetryRequested) as excinfo:
+        await executor.execute(job, Context(cancellation=anyio.CancelScope()))
+
+    assert excinfo.value.delay == expected
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
 # ---------------------------------------------------------------------------
 # Postgres integration
 # ---------------------------------------------------------------------------
@@ -577,7 +658,7 @@ async def test_retry_requested_postgres(apgdriver: AsyncpgDriver) -> None:
 
     ids = await q.enqueue("pg_retry_ep", b"test-payload", priority=0)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await qm.run(
             mode=QueueExecutionMode.drain,
             dequeue_timeout=timedelta(seconds=1),
@@ -621,13 +702,60 @@ async def test_retry_preserves_payload_postgres(apgdriver: AsyncpgDriver) -> Non
 
     await q.enqueue("pg_payload_ep", b"critical-data", priority=0)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await qm.run(
             mode=QueueExecutionMode.drain,
             dequeue_timeout=timedelta(seconds=1),
         )
 
     assert payloads_seen == [b"critical-data", b"critical-data"]
+
+
+@pytest.mark.parametrize(
+    "max_attempts",
+    [
+        pytest.param(10, id="budget-below-overflow"),
+        pytest.param(20, id="budget-past-overflow"),
+    ],
+)
+async def test_database_retry_executor_uses_full_budget_postgres(
+    apgdriver: AsyncpgDriver,
+    max_attempts: int,
+) -> None:
+    """Every attempt in max_attempts runs, even once the uncapped backoff would overflow."""
+    q = Queries(apgdriver)
+    qm = QueueManager(Queries(apgdriver))
+    seen_attempts: list[int] = []
+
+    # 1 ms * 10**17 is past timedelta's range, so attempts 17 and up rely on the cap.
+    @qm.entrypoint(
+        "pg_long_budget_ep",
+        executor_factory=lambda params: DatabaseRetryEntrypointExecutor(
+            parameters=params,
+            max_attempts=max_attempts,
+            initial_delay=timedelta(milliseconds=1),
+            max_delay=timedelta(milliseconds=5),
+            backoff_multiplier=10.0,
+        ),
+    )
+    async def handler(job: Job) -> None:
+        seen_attempts.append(job.attempts)
+        raise ValueError("still failing")
+
+    (job_id,) = await q.enqueue("pg_long_budget_ep", None, priority=0)
+
+    async with asyncio.timeout(15):
+        await qm.run(
+            mode=QueueExecutionMode.drain,
+            dequeue_timeout=timedelta(seconds=1),
+        )
+
+    assert seen_attempts == list(range(max_attempts + 1))
+    (terminal,) = [
+        log for log in await q.queue_log() if log.job_id == job_id and log.status == "exception"
+    ]
+    assert terminal.traceback is not None
+    assert terminal.traceback.exception_type == "ValueError"
 
 
 # ---------------------------------------------------------------------------

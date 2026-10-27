@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import os
-import warnings
+from collections.abc import Callable
 from enum import Enum
-from typing import Annotated, Callable, Literal, TypeAlias
+from typing import Annotated, Literal, TypeAlias
 
 from pydantic import AliasChoices, Field, StringConstraints, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,31 +17,25 @@ _IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 
 # Object names are interpolated into SQL unquoted (schema DDL, TRUNCATE,
 # INSERT/SELECT), so every one is constrained to identifier characters before
-# it can reach a query string (#945).
+# it can reach a query string (#945). Like db_schema they are lowercased: the
+# DDL folds them, and the catalog lookups compare them as string literals.
 # Prefix is prepended to the default names, so it may be empty.
-IdentifierPrefix: TypeAlias = Annotated[str, StringConstraints(pattern=rf"^({_IDENT})?$")]
+IdentifierPrefix: TypeAlias = Annotated[
+    str, StringConstraints(pattern=rf"^({_IDENT})?$", to_lower=True)
+]
 # Rendered both as an unquoted identifier (folds to lowercase) and as a nspname
 # string literal (does not fold); normalize so both agree.
 SchemaName: TypeAlias = Annotated[str, StringConstraints(pattern=rf"^{_IDENT}$", to_lower=True)]
 # A dotted chain stays allowed (the legacy "schema.table" form), but each part
 # must itself be a plain identifier.
-ObjectName: TypeAlias = Annotated[str, StringConstraints(pattern=rf"^{_IDENT}(\.{_IDENT})*$")]
+ObjectName: TypeAlias = Annotated[
+    str, StringConstraints(pattern=rf"^{_IDENT}(\.{_IDENT})*$", to_lower=True)
+]
 # A NOTIFY channel goes into SQL as a string literal and asyncpg quotes it for
 # LISTEN, so dashes and dots work there; quotes, spaces and semicolons do not.
 ChannelName: TypeAlias = Annotated[
     Channel, StringConstraints(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 ]
-
-
-def add_prefix(string: str) -> str:
-    """Deprecated: ``DBSettings`` applies ``PGQUEUER_PREFIX`` itself via its ``prefix`` field."""
-    warnings.warn(
-        "add_prefix is deprecated; DBSettings reads PGQUEUER_PREFIX itself "
-        "(DBSettings(prefix=...) or the PGQUEUER_PREFIX environment variable).",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return f"{os.environ.get('PGQUEUER_PREFIX', '')}{string}"
 
 
 def name_env_alias(field_name: str) -> AliasChoices:
@@ -71,8 +64,7 @@ class DurabilityPolicy:
 
 
 class Durability(Enum):
-    """
-    Represents the durability levels for PgQueuer table installations.
+    """Represents the durability levels for PgQueuer table installations.
 
     Each durability level corresponds to a specific `DurabilityPolicy` instance that defines
     the logging configuration for all database tables.
@@ -279,12 +271,3 @@ class DBSettings(BaseSettings):
         DO-blocks which cannot take bind parameters.
         """
         return f"'{self.db_schema}'" if self.db_schema else "current_schema()"
-
-
-@functools.cache
-def db_settings() -> DBSettings:
-    """The process-wide ``DBSettings``, read from the environment once.
-
-    Clear with ``db_settings.cache_clear()`` after changing ``PGQUEUER_*`` env vars.
-    """
-    return DBSettings()

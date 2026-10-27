@@ -6,12 +6,12 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 from itertools import chain
+from typing import Self
 
 from pgqueuer.core import tm
 from pgqueuer.domain import models, types
-from pgqueuer.domain.settings import db_settings
+from pgqueuer.ports import RepositoryPort
 from pgqueuer.ports.driver import Driver, ListenerRemover
-from pgqueuer.ports.repository import QueueRepositoryPort
 
 
 @dataclass
@@ -33,7 +33,7 @@ class CompletionWatcher:
     """
 
     driver: Driver
-    queries: QueueRepositoryPort = field(kw_only=True)
+    queries: RepositoryPort = field(kw_only=True)
     refresh_interval: timedelta | None = field(
         default_factory=lambda: timedelta(seconds=5),
     )
@@ -73,10 +73,10 @@ class CompletionWatcher:
         repr=False,
     )
 
-    async def __aenter__(self) -> "CompletionWatcher":
+    async def __aenter__(self) -> Self:
         if self.refresh_interval is not None:
             self.task_manager.add(asyncio.create_task(self._poll_for_change(self.refresh_interval)))
-        await self.driver.add_listener(db_settings().channel, self._is_relevant_event)
+        await self.driver.add_listener(self.queries.qbe.settings.channel, self._is_relevant_event)
         self._schedule_refresh_waiters()
         return self
 
@@ -95,7 +95,9 @@ class CompletionWatcher:
             self.shutdown.set()
             await self.task_manager.gather_tasks()
             if isinstance(self.driver, ListenerRemover):
-                await self.driver.remove_listener(db_settings().channel, self._is_relevant_event)
+                await self.driver.remove_listener(
+                    self.queries.qbe.settings.channel, self._is_relevant_event
+                )
         return False
 
     def wait_for(self, jid: types.JobId) -> asyncio.Future[types.JOB_STATUS]:
@@ -120,11 +122,9 @@ class CompletionWatcher:
         """
         try:
             while self.refresh_requested:
-                with suppress(TimeoutError, asyncio.TimeoutError):
-                    await asyncio.wait_for(
-                        self.shutdown.wait(),
-                        timeout=self.debounce.total_seconds(),
-                    )
+                with suppress(TimeoutError):
+                    async with asyncio.timeout(self.debounce.total_seconds()):
+                        await self.shutdown.wait()
                 self.refresh_requested = False
                 await self._refresh_waiters()
         finally:
@@ -134,7 +134,7 @@ class CompletionWatcher:
         """LISTEN/NOTIFY callback -- schedules a debounced change check."""
         try:
             evt = models.AnyEvent.model_validate_json(payload)
-        except Exception:
+        except Exception:  # noqa: BLE001 - malformed NOTIFY payloads are ignored
             return
         if evt.root.type == "table_changed_event":
             self._schedule_refresh_waiters()
@@ -143,11 +143,9 @@ class CompletionWatcher:
         """Safety-net poller for missed NOTIFY events."""
         while not self.shutdown.is_set():
             try:
-                await asyncio.wait_for(
-                    self.shutdown.wait(),
-                    timeout=refresh_interval.total_seconds(),
-                )
-            except (TimeoutError, asyncio.TimeoutError):
+                async with asyncio.timeout(refresh_interval.total_seconds()):
+                    await self.shutdown.wait()
+            except TimeoutError:
                 self._schedule_refresh_waiters()
             except asyncio.CancelledError:
                 break

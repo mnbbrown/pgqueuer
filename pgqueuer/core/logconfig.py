@@ -24,14 +24,14 @@ class LogLevel(Enum):
 class ISOFormatter(logging.Formatter):
     """Outputs log timestamps in ISO 8601 format with timezone information."""
 
-    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:  # noqa: N802 - overrides logging.Formatter.formatTime
         return datetime.fromtimestamp(record.created).astimezone().isoformat()
 
 
 class MaxLevelFilter(logging.Filter):
     """Only allows log records up to a specified maximum logging level."""
 
-    def __init__(self, max_level: int):
+    def __init__(self, max_level: int) -> None:
         super().__init__()
         self.max_level = max_level
 

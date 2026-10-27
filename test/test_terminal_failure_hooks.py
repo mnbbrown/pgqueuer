@@ -20,7 +20,7 @@ from pgqueuer.domain.types import QueueExecutionMode
 from pgqueuer.queries import Queries
 
 
-class _BadInput(Exception):
+class BadInputError(Exception):
     pass
 
 
@@ -87,14 +87,14 @@ async def test_non_retryable_errors_skip_retry() -> None:
             parameters=params,
             max_attempts=10,
             initial_delay=timedelta(0),
-            non_retryable_errors=(_BadInput,),
+            non_retryable_errors=(BadInputError,),
             on_terminal_failure=on_terminal,
         ),
     )
     async def handler(job: Job) -> None:
         nonlocal invocations
         invocations += 1
-        raise _BadInput("malformed payload")
+        raise BadInputError("malformed payload")
 
     await pq.qm.queries.enqueue("validate_ep", b"data", priority=0)
     await pq.qm.run(
@@ -106,7 +106,7 @@ async def test_non_retryable_errors_skip_retry() -> None:
 
     # Handler runs exactly once: no retry despite max_attempts=10
     assert invocations == 1
-    assert calls == [("_BadInput", 0, "non_retryable")]
+    assert calls == [("BadInputError", 0, "non_retryable")]
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ any other handler error, following the entrypoint's `on_failure`.
 ```python
 from datetime import timedelta
 from pgqueuer.errors import RetryRequested
+from pgqueuer.models import Job
 
 @pgq.entrypoint("call_api")
 async def call_api(job: Job) -> None:
@@ -52,7 +53,10 @@ Use `DatabaseRetryEntrypointExecutor` to automatically convert any exception int
 database-level retry with exponential backoff:
 
 ```python
+from datetime import timedelta
+
 from pgqueuer.executors import DatabaseRetryEntrypointExecutor
+from pgqueuer.models import Job
 
 @pgq.entrypoint(
     "flaky_api",
@@ -95,6 +99,11 @@ await pgq.run(
 
 Any worker can then claim and re-run the stalled job. See
 [Heartbeat Monitoring](heartbeat.md) for stall detection queries.
+
+A worker that was only slow, not dead, can finish after another worker has re-picked its
+job. Its result is then dropped: completion, `on_failure="hold"` and `RetryRequested` only
+apply while the reporting worker still holds the job, so a late result cannot delete, hold
+or re-queue a job the new worker is running.
 
 !!! warning "Design for re-execution"
     A recovered job **will run again from the start**. Ensure your job functions are

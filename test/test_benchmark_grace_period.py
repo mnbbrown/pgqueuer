@@ -73,8 +73,10 @@ def test_dequeue_latency_summary() -> None:
     p50, p95, p99 = dequeue_latency_summary([0.001, 0.002, 0.003, 0.004])
 
     assert p50 == 3.0
-    assert p95 is not None and 3.0 < p95 < 4.0
-    assert p99 is not None and 3.0 < p99 < 4.0
+    assert p95 is not None
+    assert 3.0 < p95 < 4.0
+    assert p99 is not None
+    assert 3.0 < p99 < 4.0
 
 
 async def test_grace_period_calculation() -> None:

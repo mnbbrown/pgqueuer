@@ -13,15 +13,9 @@ from mcp.server.session import ServerSession
 
 from pgqueuer.adapters.connections import create_asyncpg_pool
 from pgqueuer.adapters.drivers.asyncpg import AsyncpgPoolDriver
-from pgqueuer.adapters.persistence.qb import (
-    DBSettings,
-    QueryBuilderEnvironment,
-    QueryQueueBuilder,
-    QuerySchedulerBuilder,
-)
 from pgqueuer.adapters.persistence.queries import Queries
 from pgqueuer.core.insights import InsightsService
-from pgqueuer.domain.settings import ConnectionSettings, db_settings
+from pgqueuer.domain.settings import ConnectionSettings, DBSettings
 
 
 class PgQueuerDatabase:
@@ -29,15 +23,9 @@ class PgQueuerDatabase:
 
     def __init__(self, pool: asyncpg.Pool, settings: DBSettings) -> None:
         self.pool = pool
-        self.qbq = QueryQueueBuilder(settings)
-        self.insights = InsightsService(
-            Queries(
-                AsyncpgPoolDriver(pool),
-                qbe=QueryBuilderEnvironment(settings),
-                qbq=self.qbq,
-                qbs=QuerySchedulerBuilder(settings),
-            )
-        )
+        queries = Queries(AsyncpgPoolDriver(pool), settings)
+        self.qbq = queries.qbq
+        self.insights = InsightsService(queries)
 
     async def fetch(self, sql: str, *args: object) -> list[dict[str, object]]:
         async with self.pool.acquire() as conn:
@@ -67,7 +55,7 @@ def _db(ctx: Ctx) -> PgQueuerDatabase:
     return ctx.request_context.lifespan_context
 
 
-def _register_tools(mcp: FastMCP[PgQueuerDatabase]) -> None:  # noqa: C901
+def _register_tools(mcp: FastMCP[PgQueuerDatabase]) -> None:
     """Register all read-only insight tools onto the given FastMCP instance."""
 
     @mcp.tool()
@@ -198,6 +186,7 @@ def _register_tools(mcp: FastMCP[PgQueuerDatabase]) -> None:  # noqa: C901
             -> period='P7D', look for highest exception total_count
         """
         d = _db(ctx)
+        await d.fetch(d.qbq.build_aggregate_log_data_to_statistics_query())
         interval = _parse_interval(period)
         return await d.fetch(d.qbq.build_throughput_summary_query(), interval)
 
@@ -446,7 +435,7 @@ def create_mcp_server(
              environment variables (PGHOST, PGPORT, PGUSER, PGPASSWORD,
              PGDATABASE) automatically.
         settings: PgQueuer DBSettings (table names, channel, etc.). If None,
-             the process-wide settings read from PGQUEUER_* env vars.
+             read from PGQUEUER_* env vars when the server starts.
         connection_settings: Pool sizing/timeouts. If None, read from
              PGQUEUER_* env vars at startup (PGQUEUER_POOL_MIN_SIZE,
              PGQUEUER_POOL_MAX_SIZE, PGQUEUER_CONNECT_TIMEOUT,
@@ -454,9 +443,9 @@ def create_mcp_server(
     """
 
     @asynccontextmanager
-    async def app_lifespan(server: FastMCP[PgQueuerDatabase]) -> AsyncIterator[PgQueuerDatabase]:
+    async def app_lifespan(_server: FastMCP[PgQueuerDatabase]) -> AsyncIterator[PgQueuerDatabase]:
         async with create_asyncpg_pool(dsn=dsn, settings=connection_settings) as pool:
-            yield PgQueuerDatabase(pool, settings or db_settings())
+            yield PgQueuerDatabase(pool, settings or DBSettings())
 
     mcp = FastMCP("pgqueuer", lifespan=app_lifespan)
 

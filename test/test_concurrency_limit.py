@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, AsyncGenerator, Awaitable, Callable
+from typing import Any
 
-import async_timeout
 import asyncpg
 import pytest
 import pytest_asyncio
@@ -43,10 +43,10 @@ async def test_max_concurrency(
     n_consumers: int,
     max_concurrency: int,
     apgdriver: Driver,
-    n_tasks: int = 500,
-    wait: int = 2,
 ) -> None:
     """concurrency_limit is enforced globally across all workers."""
+    n_tasks = 500
+    wait = 2
     await Queries(apgdriver).enqueue(
         ["fetch"] * n_tasks,
         [f"{i}".encode() for i in range(n_tasks)],
@@ -98,7 +98,7 @@ async def test_concurrency_entrypoint_isolation(
         await event.wait()
 
     async def timer() -> None:
-        async with async_timeout.timeout(10):
+        async with asyncio.timeout(10):
             while len(event._waiters) < 2 * concurrency_limit:
                 await asyncio.sleep(0.001)
             len_waiter = len(event._waiters)
@@ -145,7 +145,7 @@ async def test_tight_entrypoint_does_not_throttle_unlimited_entrypoint(
     q.dequeue = recording_dequeue  # type: ignore[assignment]
 
     async def timer() -> None:
-        async with async_timeout.timeout(10):
+        async with asyncio.timeout(10):
             while len(event._waiters) < N:
                 await asyncio.sleep(0.001)
             qm.shutdown.set()
@@ -184,7 +184,7 @@ async def _wait_until_done_or_lock_blocked(
     worker A's uncommitted claim" (wait_event_type = 'Lock'), so the test never
     relies on a fixed sleep for the interleaving.
     """
-    async with async_timeout.timeout(30):
+    async with asyncio.timeout(30):
         while not task.done():
             wait_event_type = await monitor.fetchval(
                 "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1",

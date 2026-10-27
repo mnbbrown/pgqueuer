@@ -1,6 +1,7 @@
 import asyncio
+import contextlib
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import psycopg
@@ -197,6 +198,80 @@ async def test_clear_queue(
     await q.clear_queue("placeholder0")
     assert sum(x.count for x in await q.queue_size()) == N - 1
     assert sum(x.status == "deleted" for x in await q.queue_log()) == N + 1
+
+
+async def test_clear_queue_empty_entrypoint_deletes_nothing(apgdriver: db.Driver) -> None:
+    """An empty entrypoint list matches no jobs; only None truncates."""
+    q = queries.Queries(apgdriver)
+    await q.enqueue(["a", "b"], [None, None], [0, 0])
+
+    await q.clear_queue([])
+
+    assert sum(x.count for x in await q.queue_size()) == 2
+    assert not any(x.status == "deleted" for x in await q.queue_log())
+
+
+async def test_clear_queue_log_empty_entrypoint_deletes_nothing(apgdriver: db.Driver) -> None:
+    q = queries.Queries(apgdriver)
+    await q.enqueue(["a", "b"], [None, None], [0, 0])
+
+    await q.clear_queue_log([])
+
+    assert len(await q.queue_log()) == 2
+
+
+async def test_clear_statistics_log_empty_entrypoint_deletes_nothing(apgdriver: db.Driver) -> None:
+    q = queries.Queries(apgdriver)
+    await q.enqueue(["a", "b"], [None, None], [0, 0])
+    before = await q.log_statistics(limit=None)
+    assert sum(x.count for x in before) == 2
+
+    await q.clear_statistics_log([])
+
+    assert await q.log_statistics(limit=None) == before
+
+
+async def test_clear_entrypoint_list_deletes_only_listed(apgdriver: db.Driver) -> None:
+    q = queries.Queries(apgdriver)
+    await q.enqueue(["a", "b"], [None, None], [0, 0])
+    await q.log_statistics(limit=None)
+
+    await q.clear_statistics_log(["a"])
+    await q.clear_queue(["a"])
+    await q.clear_queue_log(["a"])
+
+    assert {x.entrypoint for x in await q.log_statistics(limit=None)} == {"b"}
+    assert {x.entrypoint for x in await q.queue_size()} == {"b"}
+    assert {x.entrypoint for x in await q.queue_log()} == {"b"}
+
+
+async def test_clear_empty_string_entrypoint_deletes_only_that(apgdriver: db.Driver) -> None:
+    """A string filter names one entrypoint, including the empty string."""
+    q = queries.Queries(apgdriver)
+    await q.enqueue(["", "b"], [None, None], [0, 0])
+    await q.log_statistics(limit=None)
+
+    await q.clear_statistics_log("")
+    await q.clear_queue("")
+    await q.clear_queue_log("")
+
+    assert {x.entrypoint for x in await q.log_statistics(limit=None)} == {"b"}
+    assert {x.entrypoint for x in await q.queue_size()} == {"b"}
+    assert {x.entrypoint for x in await q.queue_log()} == {"b"}
+
+
+async def test_clear_none_truncates(apgdriver: db.Driver) -> None:
+    q = queries.Queries(apgdriver)
+    await q.enqueue(["a", "b"], [None, None], [0, 0])
+    await q.log_statistics(limit=None)
+
+    await q.clear_queue(None)
+    await q.clear_queue_log(None)
+    await q.clear_statistics_log(None)
+
+    assert await q.queue_size() == []
+    assert await q.queue_log() == []
+    assert await q.log_statistics(limit=None) == []
 
 
 @pytest.mark.parametrize("N", (1, 2, 64))
@@ -418,8 +493,8 @@ async def test_eligible_queued_work_excludes_deferred(apgdriver: db.Driver) -> N
 async def test_queue_retry_timer(
     apgdriver: db.Driver,
     N: int,
-    retry_timer: timedelta = timedelta(seconds=0.1),
 ) -> None:
+    retry_timer = timedelta(seconds=0.1)
     q = queries.Queries(apgdriver)
     jobs = list[models.Job]()
 
@@ -513,7 +588,7 @@ async def test_queue_log_fetches_inserted_rows(apgdriver: db.Driver) -> None:
     q = queries.Queries(apgdriver)
     await q.clear_queue_log()
 
-    created = datetime.now(timezone.utc)
+    created = datetime.now(UTC)
     entries = [
         {
             "created": created,
@@ -943,7 +1018,6 @@ async def test_log_statistics(
     N: int,
 ) -> None:
     q = queries.Queries(apgdriver)
-    # N = 10
 
     # Enqueue jobs
     await q.enqueue(["placeholder"] * N, [None] * N, [0] * N)
@@ -1033,6 +1107,116 @@ async def test_aggregate_logs_advisory_lock_skips_when_held(
     # Lock free -> aggregation proceeds.
     await q.aggregate_logs()
     assert await _unaggregated_count(q) == 0
+
+
+async def statistics_total(q: queries.Queries) -> int:
+    stats_query = q.qbq.build_log_statistics_query(limit=None, last=None)
+    stats = await q.driver.fetch(stats_query.sql, *stats_query.args)
+    return sum(cell(r, "count", int) for r in stats)
+
+
+async def read_statistics(q: queries.Queries, reader: str) -> None:
+    if reader == "log_statistics":
+        await q.log_statistics(limit=None)
+    elif reader == "throughput_summary":
+        await q.throughput_summary()
+    else:
+        await q.throughput_timeseries(timedelta(hours=1))
+
+
+async def wait_until_waiting_on_lock(dsn: str, pid: int) -> bool:
+    watcher = await asyncpg.connect(dsn=dsn)
+    try:
+        for _ in range(250):
+            waiting = await watcher.fetchval(
+                "SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $1",
+                pid,
+            )
+            if waiting:
+                return True
+            await asyncio.sleep(0.02)
+        return False
+    finally:
+        await watcher.close()
+
+
+@pytest.mark.parametrize(
+    "reader", ("log_statistics", "throughput_summary", "throughput_timeseries")
+)
+@pytest.mark.parametrize("holder_aggregates", ("aggregate_logs", "log_statistics"))
+async def test_overlapping_aggregation_counts_each_log_row_once(
+    apgdriver: db.Driver,
+    dsn: str,
+    holder_aggregates: str,
+    reader: str,
+) -> None:
+    """A stats read that overlaps another aggregation does not count its rows again."""
+    q = queries.Queries(apgdriver)
+    N = 4
+    await _log_n_successful(q, N)
+    assert await _unaggregated_count(q) == 3 * N
+    assert await statistics_total(q) == 0
+    rows = await apgdriver.fetch("SELECT pg_backend_pid() AS pid")
+    reader_pid = cell(rows[0], "pid", int)
+
+    # Another session (a worker's tick or another reader) has flagged the rows
+    # but not committed yet when this read starts.
+    holder = await asyncpg.connect(dsn=dsn)
+    read: asyncio.Task[None] | None = None
+    try:
+        hq = queries.Queries(db.AsyncpgDriver(holder))
+        tx = holder.transaction()
+        await tx.start()
+        if holder_aggregates == "aggregate_logs":
+            await hq.aggregate_logs()
+        else:
+            await hq.log_statistics(limit=None)
+        assert await _unaggregated_count(hq) == 0
+
+        read = asyncio.create_task(read_statistics(q, reader))
+        assert await wait_until_waiting_on_lock(dsn, reader_pid)
+        await tx.commit()
+        async with asyncio.timeout(10):
+            await read
+    finally:
+        if read is not None and not read.done():
+            read.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read
+        await holder.close()
+
+    assert await _unaggregated_count(q) == 0
+    assert await statistics_total(q) == 3 * N  # queued + picked + successful
+
+
+async def test_aggregate_logs_while_another_aggregation_is_uncommitted(
+    apgdriver: db.Driver,
+    dsn: str,
+) -> None:
+    """A second worker tick no-ops on the advisory lock; the first one's counts stand."""
+    q = queries.Queries(apgdriver)
+    N = 4
+    await _log_n_successful(q, N)
+
+    holder = await asyncpg.connect(dsn=dsn)
+    try:
+        hq = queries.Queries(db.AsyncpgDriver(holder))
+        tx = holder.transaction()
+        await tx.start()
+        await hq.aggregate_logs()
+        assert await _unaggregated_count(hq) == 0
+
+        async with asyncio.timeout(10):
+            await q.aggregate_logs()
+        # The second tick lost the advisory lock and did nothing.
+        assert await _unaggregated_count(q) == 3 * N
+        assert await statistics_total(q) == 0
+        await tx.commit()
+    finally:
+        await holder.close()
+
+    assert await _unaggregated_count(q) == 0
+    assert await statistics_total(q) == 3 * N
 
 
 async def test_upgrade_from_legacy_composite_index_still_aggregates(

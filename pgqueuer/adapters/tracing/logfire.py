@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Generator
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, AsyncIterator, Generator
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import logfire
     import logfire.propagate
 
 try:
-    import logfire  # noqa: F811
-    import logfire.propagate  # noqa: F811
+    import logfire
+    import logfire.propagate
 
     HAS_LOGFIRE = True
 except ImportError:

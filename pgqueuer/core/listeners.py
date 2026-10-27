@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import MutableMapping
-
-from typing_extensions import assert_never
+from typing import assert_never
 
 from pgqueuer.core import logconfig
 from pgqueuer.domain import models, types
@@ -79,7 +77,7 @@ async def initialize_notice_event_listener(
     def _process_payload(payload: str | bytes | bytearray) -> None:
         try:
             parsed = models.AnyEvent.model_validate_json(payload)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged; a bad event must not stop the listener
             logconfig.logger.critical(
                 "Error parsing notification payload: %s", payload, exc_info=exc
             )
@@ -87,7 +85,7 @@ async def initialize_notice_event_listener(
 
         try:
             event_handler(parsed)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - logged; a bad event must not stop the listener
             logconfig.logger.critical(
                 "Error while handling parsed event: %s", payload, exc_info=exc
             )
@@ -102,11 +100,9 @@ def wait_for_notice_event(
     """Wait for a table change event with a timeout, returning None on expiry."""
 
     async def suppressed_timeout() -> models.TableChangedEvent | None:
-        with contextlib.suppress(asyncio.TimeoutError):
-            return await asyncio.wait_for(
-                queue.get(),
-                timeout=timeout.total_seconds(),
-            )
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout.total_seconds()):
+                return await queue.get()
         return None
 
     return asyncio.create_task(suppressed_timeout())

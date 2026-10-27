@@ -1,36 +1,35 @@
-"""In-memory queries satisfying all four port protocols.
-
-Pure Python data structures — no SQL, no database driver calls.
-"""
+"""In-memory queries satisfying all four port protocols."""
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
-import heapq
-from datetime import datetime, timedelta
+from datetime import timedelta
 from time import monotonic
-from typing import Literal, NamedTuple, TypedDict, overload
+from typing import Literal, overload
 
 from pydantic_core import to_json
-from typing_extensions import assert_never
 
 from pgqueuer.adapters.inmemory.driver import InMemoryDriver
-from pgqueuer.adapters.persistence import qb, query_helpers
-from pgqueuer.adapters.persistence.query_helpers import merge_tracing_headers
+from pgqueuer.adapters.inmemory.jobs import JobRow, JobTable
+from pgqueuer.adapters.inmemory.logs import LogBook
+from pgqueuer.adapters.inmemory.schedules import ScheduleTable
+from pgqueuer.adapters.persistence import qb
+from pgqueuer.adapters.persistence.query_helpers import (
+    merge_tracing_headers,
+    normalize_enqueue_params,
+)
 from pgqueuer.domain import errors, models, types
 from pgqueuer.domain.models import utc_now
+from pgqueuer.domain.settings import DBSettings
 from pgqueuer.domain.types import (
-    JOB_STATUS,
     CronEntrypoint,
-    CronExpression,
     HealthCheckId,
     JobId,
     OnConflict,
     QueueEntrypoint,
     QueueManagerId,
     ScheduleId,
-    Slot,
     SortOrder,
 )
 from pgqueuer.ports import tracing
@@ -41,71 +40,13 @@ DEDUPE_CONFLICT_RETRY_TIMEOUT = timedelta(milliseconds=250)
 DEDUPE_CONFLICT_RETRY_INTERVAL = timedelta(milliseconds=10)
 
 
-class JobRow(TypedDict):
-    id: int
-    priority: int
-    created: datetime
-    updated: datetime
-    heartbeat: datetime
-    execute_after: datetime
-    status: JOB_STATUS
-    entrypoint: QueueEntrypoint
-    payload: bytes | None
-    attempts: int
-    queue_manager_id: QueueManagerId | None
-    slot: Slot | None
-    serialize_key: str | None
-    headers: str
-
-
-class LogRow(TypedDict):
-    id: int
-    created: datetime
-    job_id: int
-    status: JOB_STATUS
-    priority: int
-    entrypoint: QueueEntrypoint
-    traceback: str | None
-    aggregated: bool
-
-
-class StatisticsRow(TypedDict):
-    id: int
-    created: datetime
-    count: int
-    entrypoint: QueueEntrypoint
-    priority: int
-    status: JOB_STATUS
-
-
-class StatisticsBucket(NamedTuple):
-    entrypoint: QueueEntrypoint
-    priority: int
-    status: JOB_STATUS
-    created: datetime
-
-
-class ScheduleRow(TypedDict):
-    id: int
-    expression: CronExpression
-    entrypoint: CronEntrypoint
-    heartbeat: datetime
-    created: datetime
-    updated: datetime
-    next_run: datetime
-    last_run: datetime | None
-    status: JOB_STATUS
-
-
-def percentile_cont(values: list[float], fraction: float) -> float:
-    """Linear-interpolated percentile matching PostgreSQL's ``percentile_cont``."""
-    if not values:
-        raise ValueError("percentile of an empty sequence")
-    ordered = sorted(values)
-    rank = (len(ordered) - 1) * fraction
-    lower = int(rank)
-    upper = min(lower + 1, len(ordered) - 1)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
+def entrypoints_of(entrypoint: str | list[str] | None) -> set[str] | None:
+    """None clears every row. A name or list clears those entrypoints."""
+    if entrypoint is None:
+        return None
+    if isinstance(entrypoint, str):
+        return {entrypoint}
+    return set(entrypoint)
 
 
 @dataclasses.dataclass
@@ -114,40 +55,32 @@ class InMemoryQueries:
 
     driver: InMemoryDriver
 
-    qbe: qb.QueryBuilderEnvironment = dataclasses.field(
-        default_factory=qb.QueryBuilderEnvironment,
-    )
-    qbq: qb.QueryQueueBuilder = dataclasses.field(
-        default_factory=qb.QueryQueueBuilder,
-    )
-    qbs: qb.QuerySchedulerBuilder = dataclasses.field(
-        default_factory=qb.QuerySchedulerBuilder,
-    )
+    # Table, channel and schema names. The builders, and every caller holding
+    # these queries, read this one object; defaults to the PGQUEUER_* env vars.
+    settings: DBSettings = dataclasses.field(default_factory=DBSettings)
+
+    qbe: qb.QueryBuilderEnvironment = dataclasses.field(init=False)
+    qbq: qb.QueryQueueBuilder = dataclasses.field(init=False)
+    qbs: qb.QuerySchedulerBuilder = dataclasses.field(init=False)
 
     tracer: TracingProtocol | None = None
 
-    _jobs: dict[int, JobRow] = dataclasses.field(default_factory=dict, init=False)
-    _log: list[LogRow] = dataclasses.field(default_factory=list, init=False)
-    _statistics: list[StatisticsRow] = dataclasses.field(default_factory=list, init=False)
-    _schedules: dict[int, ScheduleRow] = dataclasses.field(default_factory=dict, init=False)
-    _dedupe_index: dict[str, int] = dataclasses.field(default_factory=dict, init=False)
-    _dedupe_key_by_job: dict[int, str] = dataclasses.field(default_factory=dict, init=False)
+    job_table: JobTable = dataclasses.field(init=False)
+    logs: LogBook = dataclasses.field(init=False)
+    schedules: ScheduleTable = dataclasses.field(init=False)
 
-    # Dequeue indexes. Heap entries are never removed eagerly; validity is
-    # re-checked against ``_jobs`` on pop, so entries for jobs that were
-    # cancelled, cleared, or re-queued are skipped as tombstones.
-    _ready_heaps: dict[str, list[tuple[int, int]]] = dataclasses.field(
-        default_factory=dict, init=False
-    )
-    _deferred_heap: list[tuple[datetime, int, str]] = dataclasses.field(
-        default_factory=list, init=False
-    )
-    _picked_ids: set[int] = dataclasses.field(default_factory=set, init=False)
+    def __post_init__(self) -> None:
+        self.qbe = qb.QueryBuilderEnvironment(self.settings)
+        self.qbq = qb.QueryQueueBuilder(self.settings)
+        self.qbs = qb.QuerySchedulerBuilder(self.settings)
+        self.job_table = JobTable()
+        self.logs = LogBook()
+        self.schedules = ScheduleTable()
 
-    _next_job_id: int = dataclasses.field(default=1, init=False)
-    _next_log_id: int = dataclasses.field(default=1, init=False)
-    _next_schedule_id: int = dataclasses.field(default=1, init=False)
-    _next_stats_id: int = dataclasses.field(default=1, init=False)
+    @property
+    def jobs(self) -> dict[int, JobRow]:
+        """Live job rows, keyed by id."""
+        return self.job_table.rows
 
     async def install(self) -> None:
         pass
@@ -156,15 +89,9 @@ class InMemoryQueries:
         pass
 
     async def uninstall(self) -> None:
-        self._jobs.clear()
-        self._log.clear()
-        self._statistics.clear()
-        self._schedules.clear()
-        self._dedupe_index.clear()
-        self._dedupe_key_by_job.clear()
-        self._ready_heaps.clear()
-        self._deferred_heap.clear()
-        self._picked_ids.clear()
+        self.job_table.clear(None)
+        self.logs.wipe()
+        self.schedules.clear()
 
     async def has_table(self, table: str) -> bool:
         return True
@@ -252,10 +179,9 @@ class InMemoryQueries:
         *,
         on_conflict: OnConflict = "raise",
     ) -> list[JobId] | list[JobId | None]:
-        normed = query_helpers.normalize_enqueue_params(
+        normed = normalize_enqueue_params(
             entrypoint, payload, priority, execute_after, dedupe_key, headers, serialize_key
         )
-
         active_tracer = self.tracer or tracing.TRACER.tracer
         if active_tracer:
             normed.headers = list(
@@ -264,195 +190,18 @@ class InMemoryQueries:
                     active_tracer.trace_publish(normed.entrypoint),
                 )
             )
-
-        if on_conflict == "raise":
-            seen = set[str]()
-            for dk in normed.dedupe_key:
-                if dk is None:
-                    continue
-                if dk in self._dedupe_index or dk in seen:
-                    raise errors.DuplicateJobError(normed.dedupe_key)
-                seen.add(dk)
-        elif on_conflict == "skip":
-            pass  # Duplicates resolve per row in the insert loop below.
-        elif on_conflict == "update_priority":
-            query_helpers.reject_repeated_dedupe_keys(normed.dedupe_key)
-        else:
-            assert_never(on_conflict)
-
-        now = utc_now()
-        ids: list[JobId | None] = []
-
-        for i in range(len(normed.entrypoint)):
-            dk = normed.dedupe_key[i]
-            if dk is not None and dk in self._dedupe_index and on_conflict == "update_priority":
-                job = self._jobs[self._dedupe_index[dk]]
-                if normed.priority[i] > job["priority"]:
-                    job["priority"] = normed.priority[i]
-                    if job["status"] == "queued":
-                        # The old heap entry goes stale; dequeue skips it.
-                        self._push_queued_job(job, now)
-                ids.append(JobId(job["id"]))
-                continue
-            if dk is not None and dk in self._dedupe_index:
-                ids.append(None)
-                continue
-
-            job_id = self._next_job_id
-            self._next_job_id += 1
-
-            ea = now + normed.execute_after[i]
-            hdr = to_json(normed.headers[i]).decode()
-
-            job_dict: JobRow = {
-                "id": job_id,
-                "priority": normed.priority[i],
-                "created": now,
-                "updated": now,
-                "heartbeat": now,
-                "execute_after": ea,
-                "status": "queued",
-                "entrypoint": QueueEntrypoint(normed.entrypoint[i]),
-                "payload": normed.payload[i],
-                "attempts": 0,
-                "queue_manager_id": None,
-                "slot": None,
-                "serialize_key": normed.serialize_key[i],
-                "headers": hdr,
-            }
-
-            if dk is not None:
-                self._dedupe_index[dk] = job_id
-                self._dedupe_key_by_job[job_id] = dk
-
-            self._jobs[job_id] = job_dict
-            self._push_queued_job(job_dict, now)
-            ids.append(JobId(job_id))
-
-            self._log.append(
-                {
-                    "id": self._next_log_id,
-                    "created": now,
-                    "job_id": job_id,
-                    "status": "queued",
-                    "priority": normed.priority[i],
-                    "entrypoint": QueueEntrypoint(normed.entrypoint[i]),
-                    "traceback": None,
-                    "aggregated": False,
-                }
+        result = self.job_table.insert(normed, on_conflict, utc_now())
+        for row in result.created:
+            self.logs.append(
+                created=row.created,
+                job_id=row.id,
+                status="queued",
+                priority=row.priority,
+                entrypoint=row.entrypoint,
+                traceback=None,
             )
-            self._next_log_id += 1
-
         await self.emit_table_changed("insert")
-        return ids
-
-    def _push_queued_job(self, job: JobRow, now: datetime) -> None:
-        if job["execute_after"] <= now:
-            heapq.heappush(
-                self._ready_heaps.setdefault(job["entrypoint"], []),
-                (-job["priority"], job["id"]),
-            )
-        else:
-            heapq.heappush(
-                self._deferred_heap,
-                (job["execute_after"], job["id"], job["entrypoint"]),
-            )
-
-    def _promote_due_deferred(self, now: datetime) -> None:
-        while self._deferred_heap and self._deferred_heap[0][0] <= now:
-            _, job_id, ep = heapq.heappop(self._deferred_heap)
-            j = self._jobs.get(job_id)
-            if j is None or j["status"] != "queued":
-                continue
-            if j["execute_after"] > now:
-                # retry_job pushed the job further into the future after this
-                # entry was created; track the current deadline instead.
-                heapq.heappush(self._deferred_heap, (j["execute_after"], job_id, ep))
-            else:
-                heapq.heappush(
-                    self._ready_heaps.setdefault(ep, []),
-                    (-j["priority"], job_id),
-                )
-
-    def _pop_ready_jobs(
-        self,
-        entrypoint: str,
-        limit: int,
-        now: datetime,
-        seen: set[int],
-        serialized: bool,
-    ) -> list[JobRow]:
-        popped: list[JobRow] = []
-        blocked: list[tuple[int, int]] = []
-        heap = self._ready_heaps.get(entrypoint)
-        if heap is None:
-            return popped
-        while heap and len(popped) < limit:
-            _, job_id = heapq.heappop(heap)
-            j = self._jobs.get(job_id)
-            if j is None or j["status"] != "queued" or job_id in seen:
-                continue
-            if j["execute_after"] > now:
-                heapq.heappush(self._deferred_heap, (j["execute_after"], job_id, entrypoint))
-                continue
-            if serialized and self.key_blocked(j, now):
-                blocked.append((-j["priority"], j["id"]))
-                continue
-            seen.add(job_id)
-            popped.append(j)
-        for item in blocked:
-            heapq.heappush(heap, item)
-        return popped
-
-    def _count_picked_jobs(
-        self,
-        queue_manager_id: QueueManagerId,
-        entrypoints: dict[QueueEntrypoint, EntrypointExecutionParameter],
-    ) -> tuple[dict[QueueEntrypoint, int], int]:
-        picked_per_ep: dict[QueueEntrypoint, int] = {}
-        total_picked = 0
-        for job_id in self._picked_ids:
-            j = self._jobs[job_id]
-            if j["queue_manager_id"] == queue_manager_id:
-                total_picked += 1
-            ep = j["entrypoint"]
-            if ep in entrypoints:
-                picked_per_ep[ep] = picked_per_ep.get(ep, 0) + 1
-        return picked_per_ep, total_picked
-
-    def _collect_stale_candidates(
-        self,
-        now: datetime,
-        entrypoints: dict[QueueEntrypoint, EntrypointExecutionParameter],
-        heartbeat_timeout: timedelta,
-    ) -> list[JobRow]:
-        candidates = [
-            j
-            for j in (self._jobs[job_id] for job_id in self._picked_ids)
-            if j["entrypoint"] in entrypoints and now - j["heartbeat"] >= heartbeat_timeout
-        ]
-        candidates.sort(key=lambda j: (-j["priority"], j["id"]))
-        return candidates
-
-    def _write_picked_logs(
-        self,
-        jobs: list[JobRow],
-        now: datetime,
-    ) -> None:
-        for j in jobs:
-            self._log.append(
-                {
-                    "id": self._next_log_id,
-                    "created": now,
-                    "job_id": j["id"],
-                    "status": "picked",
-                    "priority": j["priority"],
-                    "entrypoint": j["entrypoint"],
-                    "traceback": None,
-                    "aggregated": False,
-                }
-            )
-            self._next_log_id += 1
+        return result.ids
 
     async def dequeue(
         self,
@@ -464,81 +213,36 @@ class InMemoryQueries:
     ) -> list[models.Job]:
         if batch_size < 1:
             raise ValueError("Batch size must be greater than or equal to one (1)")
-
         if not entrypoints:
             return []
 
         now = utc_now()
-
-        picked_per_ep, total_picked = self._count_picked_jobs(queue_manager_id, entrypoints)
-
-        if global_concurrency_limit is not None and total_picked >= global_concurrency_limit:
+        picked = self.job_table.picked_counts(queue_manager_id, entrypoints)
+        if global_concurrency_limit is not None and picked.total >= global_concurrency_limit:
             return []
-
         remaining = batch_size
         if global_concurrency_limit is not None:
-            remaining = min(remaining, global_concurrency_limit - total_picked)
-
-        self._promote_due_deferred(now)
-
-        seen = set[int]()
-        queued_candidates: list[JobRow] = []
-        for ep, params in entrypoints.items():
-            cap = remaining
-            if params.concurrency_limit > 0:
-                cap = min(cap, params.concurrency_limit - picked_per_ep.get(ep, 0))
-            if cap > 0:
-                queued_candidates.extend(self._pop_ready_jobs(ep, cap, now, seen, True))
-
-        stale_candidates = self._collect_stale_candidates(now, entrypoints, heartbeat_timeout)
-
-        # One global priority order so recovered stale jobs compete on priority
-        # with fresh work instead of always losing to it (mirrors eligible in
-        # qb.py). Per-entrypoint concurrency is enforced by the capped pops
-        # above; stale rows transfer ownership of an already-counted pick, so
-        # they bypass the gate (mirrors next_stale in qb.py).
-        merged = sorted(
-            queued_candidates + stale_candidates,
-            key=lambda j: (-j["priority"], j["id"]),
+            remaining = min(remaining, global_concurrency_limit - picked.total)
+        selected = self.job_table.take(
+            entrypoints,
+            picked.per_entrypoint,
+            remaining,
+            queue_manager_id,
+            heartbeat_timeout,
+            now,
         )
-        selected: list[JobRow] = []
-        selected_keys: set[tuple[str, str]] = set()
-        for job in merged:
-            if len(selected) >= remaining:
-                break
-            key = job["serialize_key"]
-            if key is not None:
-                if self.key_blocked(job, now) or (job["entrypoint"], key) in selected_keys:
-                    continue
-                selected_keys.add((job["entrypoint"], key))
-            selected.append(job)
-        selected_ids = {j["id"] for j in selected}
-
-        # Popped-but-unselected queued jobs must return to their ready heap,
-        # or they would never be delivered.
-        for j in queued_candidates:
-            if j["id"] not in selected_ids:
-                heapq.heappush(
-                    self._ready_heaps.setdefault(j["entrypoint"], []),
-                    (-j["priority"], j["id"]),
-                )
-
-        for j in selected:
-            j["status"] = "picked"
-            j["queue_manager_id"] = queue_manager_id
-            j["updated"] = now
-            j["heartbeat"] = now
-        self._picked_ids.update(selected_ids)
-
-        self._write_picked_logs(selected, now)
-
-        # Yield to the event loop.  In the PostgreSQL path every dequeue
-        # suspends on real I/O (driver.fetch); without this explicit yield
-        # QueueManager.fetch_jobs can loop indefinitely and starve signals,
-        # timers, and other tasks.
+        for row in selected:
+            self.logs.append(
+                created=now,
+                job_id=row.id,
+                status="picked",
+                priority=row.priority,
+                entrypoint=row.entrypoint,
+                traceback=None,
+            )
+        # Postgres dequeue awaits I/O. Yield so QueueManager.fetch_jobs cannot spin.
         await asyncio.sleep(0)
-
-        return [models.Job.model_validate(j) for j in selected]
+        return [row.to_model() for row in selected]
 
     async def log_jobs(
         self,
@@ -551,34 +255,18 @@ class InMemoryQueries:
         ],
     ) -> None:
         now = utc_now()
-        for job, status, tb in job_status:
-            jid = int(job.id)
-            if status == "failed":
-                j = self._jobs.get(jid)
-                if j is not None:
-                    j["status"] = "failed"
-                    j["updated"] = now
-                    j["queue_manager_id"] = None
-                self._remove_dedupe_for_job(jid)
-            else:
-                self._jobs.pop(jid, None)
-                self._remove_dedupe_for_job(jid)
-            self._picked_ids.discard(jid)
-            self._log.append(
-                {
-                    "id": self._next_log_id,
-                    "created": now,
-                    "job_id": jid,
-                    "status": status,
-                    "priority": job.priority,
-                    "entrypoint": job.entrypoint,
-                    "traceback": tb.model_dump_json() if tb else None,
-                    "aggregated": False,
-                }
+        for job, status, record in job_status:
+            if not self.job_table.finish(job, status, now):
+                continue
+            self.logs.append(
+                created=now,
+                job_id=int(job.id),
+                status=status,
+                priority=job.priority,
+                entrypoint=job.entrypoint,
+                traceback=record.model_dump_json() if record else None,
             )
-            self._next_log_id += 1
-
-        # Postgres runs the DELETE on every call, and its statement trigger always notifies.
+        # The SQL DELETE runs on every call, and its statement trigger always notifies.
         await self.emit_table_changed("delete")
 
     async def retry_job(
@@ -588,234 +276,103 @@ class InMemoryQueries:
         traceback_record: models.TracebackRecord | None,
     ) -> None:
         now = utc_now()
-        jid = int(job.id)
-        j = self._jobs.get(jid)
-        if j is not None:
-            j["status"] = "queued"
-            j["execute_after"] = now + delay
-            j["attempts"] = j["attempts"] + 1
-            j["updated"] = now
-            j["queue_manager_id"] = None
-            self._picked_ids.discard(jid)
-            self._push_queued_job(j, now)
-            self._log.append(
-                {
-                    "id": self._next_log_id,
-                    "created": now,
-                    "job_id": jid,
-                    "status": "queued",
-                    "priority": j["priority"],
-                    "entrypoint": j["entrypoint"],
-                    "traceback": (traceback_record.model_dump_json() if traceback_record else None),
-                    "aggregated": False,
-                }
-            )
-            self._next_log_id += 1
-            await self.emit_table_changed("update")
+        row = self.job_table.retry(job, delay, now)
+        if row is None:
+            return
+        self.logs.append(
+            created=now,
+            job_id=row.id,
+            status="queued",
+            priority=row.priority,
+            entrypoint=row.entrypoint,
+            traceback=traceback_record.model_dump_json() if traceback_record else None,
+        )
+        await self.emit_table_changed("update")
 
     async def requeue_jobs(self, ids: list[JobId], reset_attempts: bool = True) -> None:
+        pending = self.job_table.claim_requeue(
+            ids,
+            f"{self.settings.queue_table}_unique_dedupe_key",
+        )
         now = utc_now()
-        for jid in ids:
-            j = self._jobs.get(int(jid))
-            if j is not None and j["status"] == "failed":
-                j["status"] = "queued"
-                j["execute_after"] = now
-                j["updated"] = now
-                if reset_attempts:
-                    j["attempts"] = 0
-                j["queue_manager_id"] = None
-                self._push_queued_job(j, now)
-                self._log.append(
-                    {
-                        "id": self._next_log_id,
-                        "created": now,
-                        "job_id": int(jid),
-                        "status": "queued",
-                        "priority": j["priority"],
-                        "entrypoint": j["entrypoint"],
-                        "traceback": None,
-                        "aggregated": False,
-                    }
-                )
-                self._next_log_id += 1
-                await self.emit_table_changed("update")
+        for row in pending:
+            self.job_table.apply_requeue(row, now, reset_attempts)
+            self.logs.append(
+                created=now,
+                job_id=row.id,
+                status="queued",
+                priority=row.priority,
+                entrypoint=row.entrypoint,
+                traceback=None,
+            )
+            await self.emit_table_changed("update")
 
     async def list_failed_jobs(
         self,
         limit: int = 100,
         order: SortOrder = "DESC",
     ) -> list[models.Job]:
-        failed = [j for j in self._jobs.values() if j["status"] == "failed"]
-        failed.sort(key=lambda j: j["created"], reverse=(order != "ASC"))
-        return [models.Job.model_validate(j) for j in failed[:limit]]
+        return self.job_table.list_failed(limit, order)
 
     async def mark_job_as_cancelled(self, ids: list[JobId]) -> None:
         now = utc_now()
-        for jid in ids:
-            job_dict = self._jobs.pop(int(jid), None)
-            if job_dict is not None:
-                self._remove_dedupe_for_job(int(jid))
-                self._picked_ids.discard(int(jid))
-                self._log.append(
-                    {
-                        "id": self._next_log_id,
-                        "created": now,
-                        "job_id": int(jid),
-                        "status": "canceled",
-                        "priority": job_dict["priority"],
-                        "entrypoint": job_dict["entrypoint"],
-                        "traceback": None,
-                        "aggregated": False,
-                    }
-                )
-                self._next_log_id += 1
-
+        for row in self.job_table.cancel(ids):
+            self.logs.append(
+                created=now,
+                job_id=row.id,
+                status="canceled",
+                priority=row.priority,
+                entrypoint=row.entrypoint,
+                traceback=None,
+            )
         await self.notify_job_cancellation(ids)
 
     async def clear_queue(self, entrypoint: str | list[str] | None = None) -> None:
-        if entrypoint:
-            eps = [entrypoint] if isinstance(entrypoint, str) else entrypoint
-            now = utc_now()
-            to_remove = [jid for jid, j in self._jobs.items() if j["entrypoint"] in eps]
-            for jid in to_remove:
-                j = self._jobs.pop(jid)
-                self._remove_dedupe_for_job(jid)
-                self._picked_ids.discard(jid)
-                self._log.append(
-                    {
-                        "id": self._next_log_id,
-                        "created": now,
-                        "job_id": jid,
-                        "status": "deleted",
-                        "priority": j["priority"],
-                        "entrypoint": j["entrypoint"],
-                        "traceback": None,
-                        "aggregated": False,
-                    }
-                )
-                self._next_log_id += 1
-        else:
-            # TRUNCATE equivalent — no log entries
-            self._jobs.clear()
-            self._dedupe_index.clear()
-            self._dedupe_key_by_job.clear()
-            self._ready_heaps.clear()
-            self._deferred_heap.clear()
-            self._picked_ids.clear()
+        now = utc_now()
+        # A full clear is TRUNCATE: it returns nothing, so no deleted log rows.
+        for row in self.job_table.clear(entrypoints_of(entrypoint)):
+            self.logs.append(
+                created=now,
+                job_id=row.id,
+                status="deleted",
+                priority=row.priority,
+                entrypoint=row.entrypoint,
+                traceback=None,
+            )
 
     async def queue_size(self) -> list[models.QueueStatistics]:
-        counts: dict[tuple[QueueEntrypoint, int, JOB_STATUS], int] = {}
-        for j in self._jobs.values():
-            key = (j["entrypoint"], j["priority"], j["status"])
-            counts[key] = counts.get(key, 0) + 1
-        return [
-            models.QueueStatistics(
-                count=count,
-                entrypoint=ep,
-                priority=pri,
-                status=st,
-            )
-            for (ep, pri, st), count in sorted(counts.items())
-        ]
+        return self.job_table.queue_size()
 
     async def queued_work(self, entrypoints: list[QueueEntrypoint]) -> int:
-        ep_set = set(entrypoints)
-        return sum(
-            1 for j in self._jobs.values() if j["status"] == "queued" and j["entrypoint"] in ep_set
-        )
+        """1 when any queued job matches these entrypoints, else 0."""
+        return int(self.job_table.has_queued(entrypoints))
 
     async def eligible_queued_work(self, entrypoints: list[QueueEntrypoint]) -> int:
-        """Like ``queued_work`` but counting only jobs whose ``execute_after`` has passed."""
-        now = utc_now()
-        ep_set = set(entrypoints)
-        return sum(
-            1
-            for j in self._jobs.values()
-            if j["status"] == "queued" and j["entrypoint"] in ep_set and j["execute_after"] <= now
-        )
+        """1 when a queued job for these entrypoints is due, else 0."""
+        return int(self.job_table.has_due(entrypoints, utc_now()))
 
     async def queue_log(self) -> list[models.Log]:
-        return [models.Log.model_validate(entry) for entry in self._log]
+        return self.logs.to_models()
 
     async def update_heartbeat(self, job_ids: list[JobId]) -> None:
-        now = utc_now()
-        unique_ids = {int(jid) for jid in job_ids}
-        for jid in unique_ids:
-            if jid in self._jobs:
-                self._jobs[jid]["heartbeat"] = now
+        self.job_table.touch(job_ids, utc_now())
 
     async def job_status(
         self,
         ids: list[JobId],
     ) -> list[tuple[JobId, types.JOB_STATUS]]:
-        id_set = {int(jid) for jid in ids}
-        latest: dict[int, types.JOB_STATUS] = {}
-        for entry in reversed(self._log):
-            jid = entry["job_id"]
-            if jid in id_set and jid not in latest:
-                latest[jid] = entry["status"]
-        return [(JobId(jid), st) for jid, st in latest.items()]
-
-    def aggregate_log_to_statistics(self) -> None:
-        """Roll un-aggregated log rows into per-second statistics buckets."""
-        to_agg: dict[StatisticsBucket, int] = {}
-        for entry in self._log:
-            if entry["aggregated"]:
-                continue
-            created_sec = entry["created"].replace(microsecond=0)
-            key = StatisticsBucket(
-                entry["entrypoint"],
-                entry["priority"],
-                entry["status"],
-                created_sec,
-            )
-            to_agg[key] = to_agg.get(key, 0) + 1
-            entry["aggregated"] = True
-
-        statistics_by_bucket = {
-            StatisticsBucket(row["entrypoint"], row["priority"], row["status"], row["created"]): row
-            for row in self._statistics
-        }
-        for bucket, count in to_agg.items():
-            existing = statistics_by_bucket.get(bucket)
-            if existing is not None:
-                existing["count"] += count
-                continue
-            self._statistics.append(
-                {
-                    "id": self._next_stats_id,
-                    "created": bucket.created,
-                    "count": count,
-                    "entrypoint": bucket.entrypoint,
-                    "priority": bucket.priority,
-                    "status": bucket.status,
-                }
-            )
-            self._next_stats_id += 1
+        return self.logs.job_status(ids)
 
     async def aggregate_logs(self) -> None:
         """Fold unaggregated log rows into per-second statistics buckets."""
-        self.aggregate_log_to_statistics()
+        self.logs.aggregate()
 
     async def log_statistics(
         self,
         limit: int | None,
         last: timedelta | None = None,
     ) -> list[models.LogStatistics]:
-        self.aggregate_log_to_statistics()
-
-        result = list(self._statistics)
-
-        if last is not None:
-            cutoff = utc_now() - last
-            result = [r for r in result if r["created"] > cutoff]
-
-        result.sort(key=lambda r: r["id"], reverse=True)
-
-        if limit is not None:
-            result = result[:limit]
-
-        return [models.LogStatistics.model_validate(r) for r in result]
+        return self.logs.log_statistics(limit, last)
 
     async def notify_job_cancellation(self, ids: list[JobId]) -> None:
         event = models.CancellationEvent(
@@ -839,263 +396,78 @@ class InMemoryQueries:
         self,
         schedules: dict[models.CronExpressionEntrypoint, timedelta],
     ) -> None:
-        now = utc_now()
-        for key, delay in schedules.items():
-            # ON CONFLICT DO NOTHING: skip if expression+entrypoint exists
-            exists = any(
-                s["expression"] == key.expression and s["entrypoint"] == key.entrypoint
-                for s in self._schedules.values()
-            )
-            if exists:
-                continue
-
-            sid = self._next_schedule_id
-            self._next_schedule_id += 1
-            # Truncate next_run to seconds (matching date_trunc('seconds', ...))
-            next_run = (now + delay).replace(microsecond=0)
-            self._schedules[sid] = {
-                "id": sid,
-                "expression": key.expression,
-                "entrypoint": key.entrypoint,
-                "heartbeat": now,
-                "created": now,
-                "updated": now,
-                "next_run": next_run,
-                "last_run": None,
-                "status": "queued",
-            }
+        self.schedules.insert(schedules)
 
     async def fetch_schedule(
         self,
         entrypoints: dict[models.CronExpressionEntrypoint, timedelta],
     ) -> list[models.Schedule]:
-        now = utc_now()
-        selected: list[ScheduleRow] = []
-
-        ep_set = {(k.expression, k.entrypoint): v for k, v in entrypoints.items()}
-
-        for s in self._schedules.values():
-            key = (s["expression"], s["entrypoint"])
-            if key not in ep_set:
-                continue
-
-            # Pick if (queued AND next_run <= now) OR (picked AND heartbeat stale >30s)
-            if s["status"] == "queued" and s["next_run"] <= now:
-                s["status"] = "picked"
-                s["heartbeat"] = now
-                s["updated"] = now
-                selected.append(s)
-            elif s["status"] == "picked" and (now - s["heartbeat"]).total_seconds() > 30:
-                s["heartbeat"] = now
-                s["updated"] = now
-                selected.append(s)
-
-        return [models.Schedule.model_validate(s) for s in selected]
+        return self.schedules.fetch(entrypoints)
 
     async def set_schedule_queued(self, ids: set[ScheduleId]) -> None:
-        now = utc_now()
-        for sid in ids:
-            s = self._schedules.get(int(sid))
-            if s is not None:
-                s["status"] = "queued"
-                s["last_run"] = now
-                s["updated"] = now
+        self.schedules.set_queued(ids)
 
     async def update_schedule_heartbeat(self, ids: set[ScheduleId]) -> None:
-        now = utc_now()
-        for sid in ids:
-            s = self._schedules.get(int(sid))
-            if s is not None:
-                s["heartbeat"] = now
-                s["updated"] = now
+        self.schedules.touch(ids)
 
     async def peek_schedule(self) -> list[models.Schedule]:
-        return [models.Schedule.model_validate(s) for s in self._schedules.values()]
+        return self.schedules.peek()
 
     async def delete_schedule(
         self,
         ids: set[ScheduleId],
         entrypoints: set[CronEntrypoint],
+        *,
+        keep: set[models.CronExpressionEntrypoint] | None = None,
     ) -> None:
-        id_ints = {int(sid) for sid in ids}
-        to_remove = [
-            sid
-            for sid, s in self._schedules.items()
-            if sid in id_ints or s["entrypoint"] in entrypoints
-        ]
-        for sid in to_remove:
-            del self._schedules[sid]
+        self.schedules.delete(ids, entrypoints, keep)
 
     async def clear_schedule(self) -> None:
-        self._schedules.clear()
+        self.schedules.clear()
 
     async def clear_statistics_log(self, entrypoint: str | list[str] | None = None) -> None:
-        if entrypoint:
-            eps = [entrypoint] if isinstance(entrypoint, str) else entrypoint
-            ep_set = set(eps)
-            self._statistics = [s for s in self._statistics if s["entrypoint"] not in ep_set]
-        else:
-            self._statistics.clear()
+        self.logs.clear_statistics(entrypoints_of(entrypoint))
 
     async def clear_queue_log(self, entrypoint: str | list[str] | None = None) -> None:
-        if entrypoint:
-            eps = [entrypoint] if isinstance(entrypoint, str) else entrypoint
-            ep_set = set(eps)
-            self._log = [e for e in self._log if e["entrypoint"] not in ep_set]
-        else:
-            self._log.clear()
+        self.logs.clear_entries(entrypoints_of(entrypoint))
 
     async def next_deferred_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
         """Return time until the soonest deferred job becomes eligible, or None."""
-        now = utc_now()
-        ep_set = set(entrypoints)
-        candidates: list[datetime] = [
-            j["execute_after"]
-            for j in self._jobs.values()
-            if j["status"] == "queued" and j["entrypoint"] in ep_set and j["execute_after"] > now
-        ]
-        if candidates:
-            return min(candidates) - now
-        return None
+        return self.job_table.next_deferred_eta(entrypoints, utc_now())
 
     async def queue_age(self) -> list[models.QueueAgeStats]:
-        now = utc_now()
-        grouped: dict[QueueEntrypoint, list[datetime]] = {}
-        for j in self._jobs.values():
-            if j["status"] == "queued":
-                grouped.setdefault(j["entrypoint"], []).append(j["created"])
-        stats = [
-            models.QueueAgeStats(
-                entrypoint=ep,
-                queued_count=len(createds),
-                oldest_created=min(createds),
-                oldest_age_seconds=(now - min(createds)).total_seconds(),
-                avg_age_seconds=(sum((now - c).total_seconds() for c in createds) / len(createds)),
-            )
-            for ep, createds in grouped.items()
-        ]
-        stats.sort(key=lambda s: s.entrypoint)
-        return stats
+        return self.job_table.queue_age(utc_now())
 
     async def job_duration_percentiles(
         self,
         last: timedelta,
     ) -> list[models.JobDurationStats]:
-        cutoff = utc_now() - last
-        ordered = sorted(
-            (e for e in self._log if e["created"] > cutoff),
-            key=lambda e: (e["job_id"], e["created"], e["id"]),
-        )
-        terminal = {"successful", "exception", "canceled", "failed"}
-        durations: dict[QueueEntrypoint, list[float]] = {}
-        prev: LogRow | None = None
-        for entry in ordered:
-            if (
-                prev is not None
-                and prev["job_id"] == entry["job_id"]
-                and prev["status"] == "picked"
-                and entry["status"] in terminal
-            ):
-                durations.setdefault(entry["entrypoint"], []).append(
-                    (entry["created"] - prev["created"]).total_seconds()
-                )
-            prev = entry
-        stats = [
-            models.JobDurationStats(
-                entrypoint=ep,
-                completed=len(vals),
-                p50_seconds=percentile_cont(vals, 0.5),
-                p95_seconds=percentile_cont(vals, 0.95),
-                p99_seconds=percentile_cont(vals, 0.99),
-                max_seconds=max(vals),
-            )
-            for ep, vals in durations.items()
-        ]
-        stats.sort(key=lambda s: s.p95_seconds, reverse=True)
-        return stats
+        return self.logs.duration_percentiles(last)
 
     async def throughput_summary(
         self,
         last: timedelta | None = None,
     ) -> list[models.ThroughputStats]:
-        self.aggregate_log_to_statistics()
-        cutoff = utc_now() - last if last is not None else None
-        totals: dict[tuple[QueueEntrypoint, JOB_STATUS], int] = {}
-        for r in self._statistics:
-            if cutoff is not None and r["created"] <= cutoff:
-                continue
-            key = (r["entrypoint"], r["status"])
-            totals[key] = totals.get(key, 0) + r["count"]
-        return [
-            models.ThroughputStats(entrypoint=ep, status=st, total_count=count)
-            for (ep, st), count in sorted(totals.items())
-        ]
+        return self.logs.throughput_summary(last)
 
     async def throughput_timeseries(
         self,
         last: timedelta,
     ) -> list[models.ThroughputBucket]:
-        self.aggregate_log_to_statistics()
-        cutoff = utc_now() - last
-        buckets: dict[tuple[datetime, QueueEntrypoint, JOB_STATUS], int] = {}
-        for r in self._statistics:
-            if r["created"] <= cutoff:
-                continue
-            bucket = r["created"].replace(second=0, microsecond=0)
-            key = (bucket, r["entrypoint"], r["status"])
-            buckets[key] = buckets.get(key, 0) + r["count"]
-        return [
-            models.ThroughputBucket(bucket=bucket, entrypoint=ep, status=st, count=count)
-            for (bucket, ep, st), count in sorted(buckets.items())
-        ]
+        return self.logs.throughput_timeseries(last)
 
     async def active_workers(self) -> list[models.ActiveWorker]:
-        grouped: dict[QueueManagerId, list[JobRow]] = {}
-        for j in self._jobs.values():
-            if j["status"] == "picked" and j["queue_manager_id"] is not None:
-                grouped.setdefault(j["queue_manager_id"], []).append(j)
-        workers = [
-            models.ActiveWorker(
-                queue_manager_id=qmid,
-                active_jobs=len(jobs),
-                oldest_heartbeat=min(j["heartbeat"] for j in jobs),
-                newest_heartbeat=max(j["heartbeat"] for j in jobs),
-                entrypoints=sorted({j["entrypoint"] for j in jobs}),
-            )
-            for qmid, jobs in grouped.items()
-        ]
-        workers.sort(key=lambda w: str(w.queue_manager_id))
-        return workers
+        return self.job_table.active_workers()
 
     async def stale_jobs(
         self,
         threshold: timedelta,
         limit: int = 100,
     ) -> list[models.StaleJob]:
-        now = utc_now()
-        stale = [
-            models.StaleJob(
-                id=JobId(j["id"]),
-                priority=j["priority"],
-                queue_manager_id=j["queue_manager_id"],
-                created=j["created"],
-                updated=j["updated"],
-                heartbeat=j["heartbeat"],
-                execute_after=j["execute_after"],
-                status=j["status"],
-                entrypoint=j["entrypoint"],
-                seconds_since_heartbeat=(now - j["heartbeat"]).total_seconds(),
-            )
-            for j in self._jobs.values()
-            if j["status"] == "picked" and j["heartbeat"] < now - threshold
-        ]
-        stale.sort(key=lambda s: s.heartbeat)
-        return stale[:limit]
+        return self.job_table.stale_jobs(threshold, limit, utc_now())
 
     async def exception_logs(self, limit: int = 100) -> list[models.Log]:
-        entries = [e for e in self._log if e["status"] == "exception"]
-        entries.sort(key=lambda e: (e["created"], e["id"]), reverse=True)
-        return [models.Log.model_validate(e) for e in entries[:limit]]
+        return self.logs.exception_logs(limit)
 
     async def browse_queue(
         self,
@@ -1104,38 +476,31 @@ class InMemoryQueries:
         statuses: list[types.JOB_STATUS] | None = None,
         entrypoints: list[str] | None = None,
     ) -> list[models.Job]:
-        rows = [
-            j
-            for j in self._jobs.values()
-            if (statuses is None or j["status"] in statuses)
-            and (entrypoints is None or j["entrypoint"] in entrypoints)
-        ]
-        rows.sort(key=lambda j: (-j["priority"], j["id"]))
-        return [models.Job.model_validate(j) for j in rows[offset : offset + limit]]
+        return self.job_table.browse(limit, offset, statuses, entrypoints)
 
     async def queue_job_by_id(self, id: JobId) -> models.Job | None:
-        j = self._jobs.get(int(id))
-        return models.Job.model_validate(j) if j is not None else None
+        row = self.job_table.rows.get(int(id))
+        if row is None:
+            return None
+        return row.to_model()
 
     async def job_log_history(
         self,
         id: JobId,
         limit: int = 100,
     ) -> list[models.Log]:
-        entries = [e for e in self._log if e["job_id"] == int(id)]
-        entries.sort(key=lambda e: (e["created"], e["id"]))
-        return [models.Log.model_validate(e) for e in entries[:limit]]
+        return self.logs.history(int(id), limit)
 
     async def unaggregated_log_count(self) -> int:
-        return sum(1 for e in self._log if not e["aggregated"])
+        return self.logs.unaggregated_count()
 
     async def schema_info(self) -> list[models.TableInfo]:
-        s = self.qbq.settings
+        names = self.qbq.settings
         tables = [
-            (s.queue_table, len(self._jobs)),
-            (s.queue_table_log, len(self._log)),
-            (s.statistics_table, len(self._statistics)),
-            (s.schedules_table, len(self._schedules)),
+            (names.queue_table, len(self.job_table.rows)),
+            (names.queue_table_log, len(self.logs.rows)),
+            (names.statistics_table, len(self.logs.statistics)),
+            (names.schedules_table, len(self.schedules.rows)),
         ]
         return [
             models.TableInfo(
@@ -1146,11 +511,6 @@ class InMemoryQueries:
             )
             for name, rows in sorted(tables)
         ]
-
-    def _remove_dedupe_for_job(self, job_id: int) -> None:
-        dk = self._dedupe_key_by_job.pop(job_id, None)
-        if dk is not None:
-            self._dedupe_index.pop(dk, None)
 
     async def emit_table_changed(self, operation: types.OPERATIONS) -> None:
         # Same keys as the Postgres trigger; the listener stamps received_at on parse.
@@ -1177,7 +537,13 @@ class InMemoryQueries:
         serialize_key: str | None = None,
     ) -> JobId:
         (job_id,) = await self.enqueue(
-            entrypoint, payload, priority, execute_after, dedupe_key, headers, serialize_key
+            entrypoint,
+            payload,
+            priority,
+            execute_after,
+            dedupe_key,
+            headers,
+            serialize_key,
         )
         return job_id
 
@@ -1192,17 +558,14 @@ class InMemoryQueries:
         dedupe_key: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> JobId | None:
-        # Any queued row blocks, including one deferred into the future: it
-        # will still run and observe current state, so it covers the work.
-        # Picked (running) rows do NOT block: trailing-wake-up semantics.
         if any(
-            job["entrypoint"] == entrypoint
-            and job.get("serialize_key") == serialize_key
-            and job["status"] == "queued"
-            for job in self._jobs.values()
+            row.entrypoint == entrypoint
+            and row.serialize_key == serialize_key
+            and row.status == "queued"
+            for row in self.jobs.values()
         ):
             return None
-        if dedupe_key is not None and dedupe_key in self._dedupe_index:
+        if dedupe_key is not None and self.job_table.dedupe.holder(dedupe_key) is not None:
             raise errors.DuplicateJobError([dedupe_key])
         return await self.insert_single_job(
             entrypoint,
@@ -1227,7 +590,7 @@ class InMemoryQueries:
     ) -> JobId | None:
         deadline = monotonic() + DEDUPE_CONFLICT_RETRY_TIMEOUT.total_seconds()
         while True:
-            if dedupe_key not in self._dedupe_index:
+            if self.job_table.dedupe.holder(dedupe_key) is None:
                 return await self.insert_single_job(
                     entrypoint,
                     payload,
@@ -1237,111 +600,25 @@ class InMemoryQueries:
                     headers=headers,
                     serialize_key=serialize_key,
                 )
-
             status = self.active_dedupe_status(dedupe_key)
             if status == "queued":
                 return None
-
             now = monotonic()
             if now >= deadline:
                 return None
-
             if status == "picked":
                 await asyncio.sleep(
                     min(DEDUPE_CONFLICT_RETRY_INTERVAL.total_seconds(), deadline - now)
                 )
 
     def active_dedupe_status(self, dedupe_key: str) -> str | None:
-        job_id = self._dedupe_index.get(dedupe_key)
-        if job_id is None:
-            return None
-        job = self._jobs.get(job_id)
-        return str(job["status"]) if job is not None else None
-
-    def key_blocked(self, job: JobRow, now: datetime) -> bool:
-        key = job["serialize_key"]
-        if key is None:
-            return False
-        if any(
-            other["id"] != job["id"]
-            and other["status"] == "picked"
-            and other["entrypoint"] == job["entrypoint"]
-            and other["serialize_key"] == key
-            for other in self._jobs.values()
-        ):
-            return True
-        return job["status"] == "queued" and self._has_earlier_queued_peer(
-            job["entrypoint"], key, job["priority"], job["id"], now
-        )
-
-    def _has_earlier_queued_peer(
-        self,
-        entrypoint: str,
-        serialize_key: str,
-        priority: int,
-        job_id: int,
-        now: datetime,
-    ) -> bool:
-        """Return True if some other queued job for the same key precedes this one
-        under the priority-aware FIFO ordering (higher priority first; same priority,
-        lower id first). Future jobs are not blockers until they become eligible."""
-        for other in self._jobs.values():
-            if (
-                other["status"] != "queued"
-                or other["entrypoint"] != entrypoint
-                or other.get("serialize_key") != serialize_key
-                or other["id"] == job_id
-                or other["execute_after"] > now
-            ):
-                continue
-            if other["priority"] > priority:
-                return True
-            if other["priority"] == priority and other["id"] < job_id:
-                return True
-        return False
+        job_id = self.job_table.dedupe.holder(dedupe_key)
+        row = self.jobs.get(job_id) if job_id is not None else None
+        return row.status if row is not None else None
 
     async def list_blocked_keys(
         self,
         entrypoints: list[str] | None = None,
         limit: int = 100,
     ) -> list[models.BlockedKey]:
-        now = utc_now()
-        ep_filter = set(entrypoints) if entrypoints else None
-        # Group eligible queued rows by (entrypoint, serialize_key).
-        queued_groups: dict[tuple[str, str], list[JobRow]] = {}
-        for j in self._jobs.values():
-            if j["status"] != "queued" or j["serialize_key"] is None or j["execute_after"] > now:
-                continue
-            if ep_filter and j["entrypoint"] not in ep_filter:
-                continue
-            queued_groups.setdefault((j["entrypoint"], j["serialize_key"]), []).append(j)
-        # Index picked by (entrypoint, serialize_key)
-        picked_lookup: dict[tuple[str, str], JobRow] = {
-            (j["entrypoint"], j["serialize_key"]): j
-            for j in self._jobs.values()
-            if j["status"] == "picked" and j["serialize_key"] is not None
-        }
-        out: list[models.BlockedKey] = []
-        for (ep, sk), jobs in queued_groups.items():
-            leader = picked_lookup.get((ep, sk))
-            if len(jobs) <= 1 and leader is None:
-                continue
-            oldest = min(jobs, key=lambda j: j["created"])
-            out.append(
-                models.BlockedKey(
-                    entrypoint=ep,
-                    serialize_key=sk,
-                    queued_count=len(jobs),
-                    oldest_queued_created=oldest["created"],
-                    oldest_queued_age_seconds=(now - oldest["created"]).total_seconds(),
-                    leader_id=types.JobId(leader["id"]) if leader is not None else None,
-                    leader_age_seconds=(
-                        (now - leader["updated"]).total_seconds() if leader is not None else None
-                    ),
-                    leader_heartbeat_age_seconds=(
-                        (now - leader["heartbeat"]).total_seconds() if leader is not None else None
-                    ),
-                )
-            )
-        out.sort(key=lambda b: b.oldest_queued_age_seconds, reverse=True)
-        return out[:limit]
+        return self.job_table.list_blocked_keys(entrypoints, limit, utc_now())

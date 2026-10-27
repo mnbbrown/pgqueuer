@@ -4,8 +4,7 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
-
-from typing_extensions import Self
+from typing import Self
 
 from pgqueuer.core import buffers, logconfig
 from pgqueuer.domain import types
@@ -40,14 +39,12 @@ class Heartbeat:
 
     async def send_heartbeat(self) -> None:
         while not self.shutdown.is_set():
-            with suppress(TimeoutError, asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    self.shutdown.wait(),
-                    timeout=self.interval.total_seconds(),
-                )
+            with suppress(TimeoutError):
+                async with asyncio.timeout(self.interval.total_seconds()):
+                    await self.shutdown.wait()
             if self.shutdown.is_set():
                 break
             try:
                 await self.buffer.add(self.job_id)
-            except Exception as e:
-                logconfig.logger.exception("Failed to send heartbeat: %s", e)
+            except Exception:
+                logconfig.logger.exception("Failed to send heartbeat")

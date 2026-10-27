@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Callable
 
 import pytest
 from psycopg import sql
@@ -87,8 +87,27 @@ class FakePsycopgConnection:
         self.executed.append(query.as_string() if isinstance(query, sql.Composable) else query)
 
     async def notifies(self, *, timeout: float, stop_after: int) -> AsyncGenerator[Notify, None]:
-        with suppress(TimeoutError, asyncio.TimeoutError):
+        with suppress(TimeoutError):
             yield await asyncio.wait_for(self.notes.get(), timeout)
+
+
+@dataclass
+class GatedPsycopgConnection(FakePsycopgConnection):
+    """Blocks in notifies() until *gate* is set so tests control watcher progress."""
+
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    gate: asyncio.Event = field(default_factory=asyncio.Event)
+    error: BaseException | None = None
+
+    async def notifies(self, *, timeout: float, stop_after: int) -> AsyncGenerator[Notify, None]:
+        del timeout, stop_after
+        self.started.set()
+        await self.gate.wait()
+        if self.error is not None:
+            raise self.error
+        empty: tuple[Notify, ...] = ()
+        for note in empty:
+            yield note
 
 
 async def test_psycopg_remove_listener_stops_watcher() -> None:
@@ -106,7 +125,7 @@ async def test_psycopg_remove_listener_stops_watcher() -> None:
 
     assert isinstance(driver, ListenerRemover)
     assert received == ["a"]
-    assert not driver.tm.tasks
+    assert not driver._tasks
     assert connection.executed == ['LISTEN "ch"', 'UNLISTEN "ch"']
 
 
@@ -193,3 +212,53 @@ async def test_psycopg_driver_can_be_entered_again() -> None:
 
     assert first == []
     assert second == ["a"]
+
+
+async def test_psycopg_last_exit_waits_for_watcher() -> None:
+    """The last exit waits until the notify watcher finishes."""
+    connection = GatedPsycopgConnection()
+    driver = PsycopgDriver(connection)  # type: ignore[arg-type]
+    async with driver:
+        await driver.add_listener("ch", lambda _: None)
+        await connection.started.wait()
+        watcher = driver._watcher
+        assert watcher is not None
+        assert not watcher.done()
+        connection.gate.set()
+
+    assert watcher.done()
+    assert not driver._tasks
+
+
+async def test_psycopg_aexit_swallows_notifies_error() -> None:
+    """A failed notifies() watcher does not raise from the last exit."""
+    connection = GatedPsycopgConnection(error=RuntimeError("notifies failed"))
+    driver = PsycopgDriver(connection)  # type: ignore[arg-type]
+    async with driver:
+        await driver.add_listener("ch", lambda _: None)
+        await connection.started.wait()
+        watcher = driver._watcher
+        connection.gate.set()
+
+    assert watcher is not None
+    assert watcher.done()
+    assert isinstance(watcher.exception(), RuntimeError)
+    assert not driver._tasks
+
+
+async def test_psycopg_two_channels_share_one_watcher() -> None:
+    """One connection has one notifies() reader; extra LISTENs reuse it."""
+    connection = FakePsycopgConnection()
+    driver = PsycopgDriver(connection)  # type: ignore[arg-type]
+    ignored: list[str | bytes | bytearray] = []
+    await driver.add_listener("a", ignored.append)
+    watcher = driver._watcher
+    await driver.add_listener("b", ignored.append)
+
+    assert watcher is not None
+    assert driver._watcher is watcher
+    assert driver._tasks == {watcher}
+
+    await driver.remove_listener("a", ignored.append)
+    await driver.remove_listener("b", ignored.append)
+    assert not driver._tasks

@@ -1,14 +1,16 @@
 import asyncio
 import inspect
-from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
-from typing import AsyncContextManager, AsyncGenerator, Callable, Iterable
+import uuid
+from collections.abc import AsyncGenerator, Callable, Iterable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import psycopg
 import pytest
 
 from pgqueuer.adapters.persistence.qb import (
+    DBSettings,
     QueryBuilderEnvironment,
     QueryQueueBuilder,
     QuerySchedulerBuilder,
@@ -26,15 +28,17 @@ from pgqueuer.db import (
     SyncDriver,
     SyncPsycopgDriver,
 )
-from pgqueuer.models import TableChangedEvent
-from pgqueuer.types import Channel
+from pgqueuer.models import TableChangedEvent, TracebackRecord
+from pgqueuer.ports.repository import EntrypointExecutionParameter
+from pgqueuer.queries import Queries
+from pgqueuer.types import Channel, QueueEntrypoint, QueueManagerId
 
 
 def get_user_defined_functions(klass: object) -> list[str]:
     return [
         name
         for name, _ in inspect.getmembers(klass, inspect.isfunction)
-        if not name.startswith("__")
+        if name.startswith("build_")
     ]
 
 
@@ -77,7 +81,7 @@ async def psydriver(dsn: str) -> AsyncGenerator[PsycopgDriver, None]:
         yield x
 
 
-def drivers() -> tuple[Callable[..., AsyncContextManager[Driver]], ...]:
+def drivers() -> tuple[Callable[..., AbstractAsyncContextManager[Driver]], ...]:
     return (
         apgdriver,
         psydriver,
@@ -88,7 +92,7 @@ def drivers() -> tuple[Callable[..., AsyncContextManager[Driver]], ...]:
 @pytest.mark.parametrize("driver", drivers())
 async def test_fetch(
     dsn: str,
-    driver: Callable[..., AsyncContextManager[Driver]],
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
 ) -> None:
     async with driver(dsn) as d:
         assert list(await d.fetch("SELECT 1 as one, 2 as two")) == [{"one": 1, "two": 2}]
@@ -97,7 +101,7 @@ async def test_fetch(
 @pytest.mark.parametrize("driver", drivers())
 async def test_execute(
     dsn: str,
-    driver: Callable[..., AsyncContextManager[Driver]],
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
 ) -> None:
     async with driver(dsn) as d:
         assert isinstance(await d.execute("SELECT 1 as one, 2 as two;"), str)
@@ -106,7 +110,7 @@ async def test_execute(
 @pytest.mark.parametrize("driver", drivers())
 async def test_notify(
     dsn: str,
-    driver: Callable[..., AsyncContextManager[Driver]],
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
 ) -> None:
     event = asyncio.Future[str | bytearray | bytes]()
 
@@ -128,7 +132,7 @@ async def test_notify(
 @pytest.mark.parametrize("channel", ["MyChan", "my-app.events", "'; DROP TABLE x --"])
 async def test_notify_channel_needs_quoting(
     dsn: str,
-    driver: Callable[..., AsyncContextManager[Driver]],
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
     channel: str,
 ) -> None:
     """LISTEN must quote the channel so it matches pg_notify's string literal (#947).
@@ -150,15 +154,15 @@ async def test_notify_channel_needs_quoting(
     "query, name",
     (
         [
-            (getattr(QueryQueueBuilder(), name), name)
+            (getattr(QueryQueueBuilder(DBSettings()), name), name)
             for name in get_user_defined_functions(QueryQueueBuilder)
         ]
         + [
-            (getattr(QueryBuilderEnvironment(), name), name)
+            (getattr(QueryBuilderEnvironment(DBSettings()), name), name)
             for name in get_user_defined_functions(QueryBuilderEnvironment)
         ]
         + [
-            (getattr(QuerySchedulerBuilder(), name), name)
+            (getattr(QuerySchedulerBuilder(DBSettings()), name), name)
             for name in get_user_defined_functions(QuerySchedulerBuilder)
         ]
     ),
@@ -167,7 +171,7 @@ async def test_valid_query_syntax(
     dsn: str,
     query: Callable[..., str | Iterable[str]],
     name: str,
-    driver: Callable[..., AsyncContextManager[Driver]],
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
 ) -> None:
     if name == "build_install_query":
         pytest.skip()
@@ -198,7 +202,7 @@ async def test_valid_query_syntax(
 @pytest.mark.parametrize("driver", drivers())
 async def test_event_listener(
     dsn: str,
-    driver: Callable[..., AsyncContextManager[Driver]],
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
 ) -> None:
     async with driver(dsn) as d:
         name = d.__class__.__name__.lower()
@@ -206,7 +210,7 @@ async def test_event_listener(
         payload = TableChangedEvent(
             channel=channel,
             operation="update",
-            sent_at=datetime.now(timezone.utc),
+            sent_at=datetime.now(UTC),
             table="foo",
             type="table_changed_event",
         )
@@ -232,26 +236,56 @@ async def test_event_listener(
 @pytest.mark.parametrize("driver", drivers())
 async def test_recovery_after_failed_sql(
     dsn: str,
-    driver: Callable[..., AsyncContextManager[Driver]],
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
 ) -> None:
     async with driver(dsn) as d:
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="syntax error"):
             await d.execute("SELECT 1 WHERE")
 
         result = await d.fetch("SELECT 1 as one")
         assert result == [{"one": 1}]
 
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="syntax error"):
             await d.fetch("SELECT 1 WHERE")
 
         result = await d.fetch("SELECT 2 as two")
         assert result == [{"two": 2}]
 
 
+@pytest.mark.parametrize("driver", drivers())
+async def test_log_rows_with_a_traceback_read_back(
+    dsn: str,
+    driver: Callable[..., AbstractAsyncContextManager[Driver]],
+) -> None:
+    """Every log read parses the traceback column, whichever form the driver returns jsonb in."""
+    async with driver(dsn) as d:
+        q = Queries(d)
+        await q.clear_queue()
+        await q.clear_queue_log()
+        await q.enqueue("traceback_ep", None)
+        (job,) = await q.dequeue(
+            batch_size=1,
+            entrypoints={QueueEntrypoint("traceback_ep"): EntrypointExecutionParameter(0)},
+            queue_manager_id=QueueManagerId(uuid.uuid4()),
+            global_concurrency_limit=None,
+            heartbeat_timeout=timedelta(seconds=30),
+        )
+        record = TracebackRecord.from_exception(ValueError("boom"), job_id=job.id)
+        await q.log_jobs([(job, "exception", record)])
+
+        (from_queue_log,) = [log for log in await q.queue_log() if log.traceback is not None]
+        (from_exception_logs,) = await q.exception_logs()
+        (from_history,) = [
+            log for log in await q.job_log_history(job.id) if log.traceback is not None
+        ]
+        assert from_queue_log.traceback == from_exception_logs.traceback == record
+        assert from_history.traceback == record
+
+
 async def test_recovery_after_failed_sql_sync(
     pgdriver: SyncDriver,
 ) -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="syntax error"):
         pgdriver.fetch("SELECT 1 WHERE")
 
     result = pgdriver.fetch("SELECT 1 as one")

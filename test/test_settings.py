@@ -1,22 +1,22 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable
+from collections.abc import Callable
 
 import pytest
 from pydantic import ValidationError
 
 from pgqueuer.adapters.cli.cli import AppConfig
 from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
-from pgqueuer.adapters.persistence.queries import Queries
+from pgqueuer.adapters.persistence import qb
+from pgqueuer.adapters.persistence.queries import Queries, SyncQueries
 from pgqueuer.core.applications import PgQueuer
+from pgqueuer.core.completion import CompletionWatcher
 from pgqueuer.core.qm import QueueManager
 from pgqueuer.domain.settings import (
     ConnectionSettings,
     DBSettings,
     QualifiedNames,
-    add_prefix,
-    db_settings,
 )
 from pgqueuer.domain.types import Channel
 
@@ -76,12 +76,6 @@ def test_legacy_statistics_status_type_carries_prefix() -> None:
     )
 
 
-def test_add_prefix_shim_warns_and_concats(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PGQUEUER_PREFIX", "acme_")
-    with pytest.deprecated_call():
-        assert add_prefix("pgqueuer") == "acme_pgqueuer"
-
-
 @pytest.mark.parametrize("bad", ["foo.bar", "foo;drop", "foo bar", "1foo", "foo'"])
 def test_invalid_db_schema_rejected(bad: str) -> None:
     with pytest.raises(ValidationError, match="db_schema"):
@@ -98,6 +92,27 @@ def test_db_schema_lowercase_normalized() -> None:
     settings = DBSettings(db_schema="Billing")
     assert settings.db_schema == "billing"
     assert settings.schema_expr == "'billing'"
+
+
+def test_object_names_lowercase_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unquoted identifiers fold to lowercase; the catalog literals must match."""
+    settings = DBSettings(prefix="Acme_", statistics_table="AcmeStats")
+    assert settings.prefix == "acme_"
+    assert settings.queue_table == "acme_pgqueuer"
+    assert settings.statistics_table == "acmestats"
+    assert settings.qualified.function == "acme_fn_pgqueuer_changed"
+    assert settings.trigger == "acme_tg_pgqueuer_changed"
+    assert settings.channel == "acme_ch_pgqueuer"
+
+    monkeypatch.setenv("PGQUEUER_PREFIX", "Acme_")
+    monkeypatch.setenv("PGQUEUER_QUEUE_TABLE", "AcmeJobs")
+    from_env = DBSettings()
+    assert (from_env.queue_table, from_env.queue_table_log) == ("acmejobs", "acme_pgqueuer_log")
+
+
+def test_explicit_channel_keeps_its_case() -> None:
+    """A channel is a string literal in pg_notify and quoted in LISTEN, so case is kept."""
+    assert DBSettings(channel=Channel("Acme-Events")).channel == "Acme-Events"
 
 
 def test_qualified_names_with_schema() -> None:
@@ -180,23 +195,59 @@ def test_connection_settings_pgqueuer_dsn_wins_over_pgdsn(
     assert ConnectionSettings().dsn == "postgresql://example/pgqueuer"
 
 
-def test_db_settings_reads_the_env_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PGQUEUER_PREFIX", "first_")
-    settings = db_settings()
-    monkeypatch.setenv("PGQUEUER_PREFIX", "second_")
-    assert db_settings() is settings
-    assert settings.prefix == "first_"
-
-    db_settings.cache_clear()
-    assert db_settings().prefix == "second_"
-
-
 @pytest.mark.parametrize("make", [Queries, InMemoryQueries])
 def test_queries_builders_share_one_settings(
     make: Callable[[InMemoryDriver], Queries | InMemoryQueries],
 ) -> None:
     q = make(InMemoryDriver())
-    assert q.qbe.settings is q.qbq.settings is q.qbs.settings is db_settings()
+    assert q.qbe.settings is q.qbq.settings is q.qbs.settings is q.settings
+
+
+@pytest.mark.parametrize("make", [Queries, InMemoryQueries])
+def test_queries_builders_share_passed_settings(
+    make: Callable[..., Queries | InMemoryQueries],
+) -> None:
+    settings = DBSettings(prefix="billing_")
+    q = make(InMemoryDriver(), settings=settings)
+    assert q.settings is q.qbe.settings is q.qbq.settings is q.qbs.settings is settings
+
+
+def test_sync_queries_uses_passed_settings() -> None:
+    settings = DBSettings(prefix="billing_")
+    q = SyncQueries(InMemoryDriver(), settings)  # type: ignore[arg-type]
+    assert q.qbq.settings is settings
+
+
+@pytest.mark.parametrize("make", [Queries, InMemoryQueries])
+def test_builders_are_not_constructor_arguments(make: Callable[..., object]) -> None:
+    """Separate builders could disagree on names; settings= is the one input."""
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        make(InMemoryDriver(), qbe=qb.QueryBuilderEnvironment(DBSettings()))
+
+
+def test_passed_settings_set_the_channel() -> None:
+    """QueueManager and PgQueuer listen where their queries notify."""
+    settings = DBSettings(prefix="billing_")
+    driver = InMemoryDriver()
+    assert QueueManager(InMemoryQueries(driver, settings)).channel == "billing_ch_pgqueuer"
+    assert PgQueuer(driver, settings=settings).channel == "billing_ch_pgqueuer"
+    assert PgQueuer.in_memory(settings=settings).channel == "billing_ch_pgqueuer"
+    assert PgQueuer(driver, Channel("explicit"), settings=settings).channel == "explicit"
+
+
+def test_pgqueuer_rejects_settings_beside_other_queries() -> None:
+    driver = InMemoryDriver()
+    with pytest.raises(ValueError, match="Pass settings to the queries"):
+        PgQueuer(driver, queries=InMemoryQueries(driver), settings=DBSettings(prefix="x_"))
+
+
+async def test_completion_watcher_listens_on_the_queries_channel() -> None:
+    """#938 repro: a prefixed Queries notifies on its channel, so the watcher must listen there."""
+    driver = InMemoryDriver()
+    queries = InMemoryQueries(driver, DBSettings(prefix="billing_"))
+    async with CompletionWatcher(driver, queries=queries, refresh_interval=None):
+        assert driver._listeners["billing_ch_pgqueuer"]
+        assert not driver._listeners["ch_pgqueuer"]
 
 
 def test_channel_default_resolves_at_construction(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,13 +258,28 @@ def test_channel_default_resolves_at_construction(monkeypatch: pytest.MonkeyPatc
     assert PgQueuer(driver).channel == "acme_ch_pgqueuer"
 
 
-def test_cli_setup_env_refreshes_db_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--prefix/--schema reach settings even when they were read before the callback ran."""
-    monkeypatch.delenv("PGQUEUER_PREFIX", raising=False)
-    monkeypatch.delenv("PGQUEUER_SCHEMA", raising=False)
-    assert db_settings().prefix == ""
-    AppConfig(prefix="acme_", schema="billing").setup_env()
-    assert (db_settings().prefix, db_settings().db_schema) == ("acme_", "billing")
+def test_cli_settings_follow_prefix_and_schema() -> None:
+    config = AppConfig(prefix="acme_", schema="billing")
+    settings = config.settings
+    assert config.settings is settings
+    assert (settings.prefix, settings.db_schema) == ("acme_", "billing")
+    assert settings.queue_table == "acme_pgqueuer"
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: PgQueuer(InMemoryDriver()),
+        lambda: PgQueuer(InMemoryDriver(), settings=DBSettings(prefix="billing_")),
+        lambda: PgQueuer(InMemoryDriver(), queries=InMemoryQueries(InMemoryDriver())),
+        PgQueuer.in_memory,
+        lambda: PgQueuer.in_memory(settings=DBSettings(prefix="billing_")),
+    ],
+)
+def test_managers_share_one_queries(make: Callable[[], PgQueuer]) -> None:
+    """Both managers hold the same queries, so they read the same settings."""
+    pgq = make()
+    assert pgq.qm.queries is pgq.sm.queries is pgq.queries
 
 
 # Before #945 only prefix and db_schema were validated, so a name like

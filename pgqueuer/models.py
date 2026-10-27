@@ -1,4 +1,4 @@
-"""Backward-compatibility shim. Canonical: pgqueuer.domain.models"""
+"""Backward-compatibility shim. Canonical: pgqueuer.domain.models."""
 
 from __future__ import annotations
 
@@ -34,6 +34,9 @@ from pgqueuer.domain.types import (
 )
 
 __all__ = [
+    "EVENT_TYPES",
+    "JOB_STATUS",
+    "OPERATIONS",
     "AnyEvent",
     "CancellationEvent",
     "Channel",
@@ -41,16 +44,13 @@ __all__ = [
     "CronEntrypoint",
     "CronExpression",
     "CronExpressionEntrypoint",
-    "EVENT_TYPES",
     "Event",
     "HealthCheckEvent",
-    "JOB_STATUS",
     "HealthCheckId",
     "Job",
     "JobId",
     "Log",
     "LogStatistics",
-    "OPERATIONS",
     "QueueEntrypoint",
     "QueueManagerId",
     "QueueStatistics",

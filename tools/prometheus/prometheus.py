@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncGenerator, Callable, Generator, Iterable
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from itertools import groupby
-from typing import AsyncGenerator, Callable, Generator, Iterable, TypeAlias
+from typing import Annotated, TypeAlias
 
 import asyncpg
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -38,7 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def prometheus_format(
     metric_name: str,
     labels: dict[str, str],
-    value: float | int,
+    value: float,
 ) -> str:
     """Format metric data into a Prometheus-compatible string."""
     label_parts = ",".join(f'{k}="{v}"' for k, v in labels.items())
@@ -68,8 +69,7 @@ def aggregated_queue_statistics(
 def aggregated_log_statistics(
     log_statistics: list[LogStatistics],
 ) -> Generator[str, None, None]:
-    """Generate Prometheus-formatted strings for aggregated log
-    statistics, including time in queue metrics."""
+    """Generate Prometheus lines for aggregated log statistics, incl. time in queue."""
     aggregated_log_statistics = (
         (entrypoint, status, tuple(items))
         for (entrypoint, status), items in groupby(
@@ -100,7 +100,7 @@ def create_metrics_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/metrics", response_class=Response)
-    async def metrics(queries: Queries = Depends(get_queries)) -> Response:
+    async def metrics(queries: Annotated[Queries, Depends(get_queries)]) -> Response:
         queue_statistics = await queries.queue_size()
         log_statistics = await queries.log_statistics(
             limit=None,

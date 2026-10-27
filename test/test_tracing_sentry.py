@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import sentry_sdk
@@ -16,7 +17,7 @@ from pgqueuer.domain.types import JobId, QueueEntrypoint, QueueManagerId
 
 
 def _make_job(headers: dict[str, Any] | None, *, entrypoint: str = "say_hello") -> Job:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Job(
         id=JobId(1),
         priority=0,
@@ -42,7 +43,7 @@ class _RecordingTransport(Transport):
                 self.transactions.append(item.payload.json)
 
 
-@pytest.fixture()
+@pytest.fixture
 def transactions() -> Iterator[list[dict[str, Any]]]:
     transport = _RecordingTransport()
     previous = sentry_sdk.get_global_scope().client

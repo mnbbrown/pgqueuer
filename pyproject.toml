@@ -20,7 +20,7 @@ description = "PostgreSQL-backed background job and task queue for Python."
 authors = [{name = "JeyBee"}]
 license = {text = "MIT License"}
 dynamic = ["version"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 readme = "README.md"
 keywords = ["postgresql", "task-queue", "job-queue", "background-jobs", "asyncio"]
 
@@ -32,7 +32,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Natural Language :: English",
     "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -81,7 +80,6 @@ web = ["fastapi>=0.115.0", "jinja2>=3.1", "uvicorn>=0.30"]
 [dependency-groups]
 test = [
     "pgqueuer[asyncpg,psycopg,logfire,sentry,opentelemetry,fastapi,mcp,web]",
-    "async-timeout>=5.0.1",
     "flask",
     "httpx",
     "pytest",
@@ -126,19 +124,69 @@ dev = [
 line-length = 100
 
 [tool.ruff.lint]
-select = [
-    "C",
-    "E",
-    "F",
-    "I",
-    "PIE",
-    "Q",
-    "RET",
-    "RSE",
-    "SIM",
-    "W",
-    "C90"
+select = ["ALL"]
+# Lets BLE001 accept catch-alls that log the traceback through our logger.
+logger-objects = ["pgqueuer.core.logconfig.logger"]
+# The dashboard shows an en dash for missing values.
+allowed-confusables = ["–"]
+ignore = [
+    "COM812",  # conflicts with ruff format
+    "D1",  # missing docstrings; follow-up, starting with D100/D104
+    "TC001", "TC002", "TC003",  # pydantic and dataclasses need runtime annotations
+    "TRY003", "EM101", "EM102",  # message strings in raise
+    "FBT001", "FBT002", "FBT003",  # boolean args are public API
+    "PLR0913",  # public constructors take many keyword options
+    "PLR2004",  # literal expectations in tests; follow-up for pgqueuer/
+    "ARG002",  # unused args in Protocol/port implementations
+    "S608",  # SQL built from validated identifiers (qb.py); values are bind params
+    "TC006",  # quoted cast types only help with TYPE_CHECKING imports; TC001-TC003 are ignored
 ]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-builtins]
+# `id` keyword arguments are public API.
+ignorelist = ["id"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "typer.Option",
+    "typer.Argument",
+    "pgqueuer.domain.types.Channel",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts, fakes and private access are the point; PT006/PT007 are style-only churn;
+# ASYNC109/ASYNC110 fakes and polling loops; S104/S603/TRY002/TRY301 deliberate literals and raises.
+"test/**" = [
+    "S101",
+    "ARG001",
+    "SLF001",
+    "PLC0415",
+    "INP001",
+    "ANN401",
+    "N803",
+    "N806",
+    "D",
+    "BLE001",
+    "PT006",
+    "PT007",
+    "ASYNC109",
+    "ASYNC110",
+    "S104",
+    "S603",
+    "TRY002",
+    "TRY301",
+]
+"pgqueuer/adapters/cli/**" = ["T201"]
+# Optional extras: importing these at module level would make every install need them.
+"pgqueuer/adapters/connections.py" = ["PLC0415"]
+"pgqueuer/adapters/drivers/psycopg.py" = ["PLC0415"]
+"examples/**" = ["T201", "INP001", "S101"]
+"tools/**" = ["T201", "INP001", "S101"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
@@ -151,7 +199,7 @@ force-single-line = false
 [tool.mypy]
 strict = true
 plugins = ["pydantic.mypy"]
-python_version = "3.10"
+python_version = "3.11"
 exclude = "^(build)"
 ignore_missing_imports = true
 explicit_package_bases = true

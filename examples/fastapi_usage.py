@@ -1,6 +1,7 @@
 import json
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import Annotated
 
 import asyncpg
 from fastapi import Depends, FastAPI, Request, Response
@@ -17,10 +18,7 @@ def get_pgq_queries(request: Request) -> Queries:
 
 
 def create_app() -> FastAPI:
-    """
-    Create and configure a FastAPI app with a lifespan context manager
-    to handle database connection.
-    """
+    """Create a FastAPI app whose lifespan manages the database connection."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -34,7 +32,7 @@ def create_app() -> FastAPI:
     @app.get("/reset_password_email")
     async def reset_password_email(
         user_name: str,
-        queries: Queries = Depends(get_pgq_queries),
+        queries: Annotated[Queries, Depends(get_pgq_queries)],
     ) -> Response:
         """Enqueue a job to reset a user's password, identified by user_name."""
         await queries.enqueue(
@@ -47,15 +45,15 @@ def create_app() -> FastAPI:
     async def enqueue_job(
         entrypoint: str,
         payload: str,
+        queries: Annotated[Queries, Depends(get_pgq_queries)],
         priority: int = 0,
-        queries: Queries = Depends(get_pgq_queries),
     ) -> dict[str, object]:
         ids = await queries.enqueue(entrypoint, payload.encode(), priority)
         return {"job_ids": ids}
 
     @app.get("/queue-size")
     async def get_queue_size(
-        queries: Queries = Depends(get_pgq_queries),
+        queries: Annotated[Queries, Depends(get_pgq_queries)],
     ) -> list[dict[str, object]]:
         stats = await queries.queue_size()
         return [

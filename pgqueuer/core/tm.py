@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-from typing import AsyncGenerator, TypeVar
+from collections.abc import AsyncGenerator
+from typing import Self, TypeVar
 
 from pgqueuer.core import logconfig
 
@@ -72,7 +73,7 @@ class TaskManager:
         )
         return results
 
-    async def __aenter__(self) -> TaskManager:
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *_: object) -> None:

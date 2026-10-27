@@ -16,7 +16,6 @@ Set up the necessary database schema for PgQueuer.
   - `balanced`: Critical tables (`pgqueuer`, `pgqueuer_schedules`) are logged; auxiliary
     tables are unlogged.
   - `durable` *(default)*: All tables are logged: full crash recovery.
-- `--dry-run` *(deprecated)*: Alias for [`pgq sql install`](#sql).
 
 ```bash
 pgq install --durability balanced
@@ -35,10 +34,6 @@ empty database, where it installs everything -- use [`pgq upgrade`](#upgrade).
 ### `uninstall`
 
 Remove the PgQueuer schema from the database.
-
-**Options:**
-
-- `--dry-run` *(deprecated)*: Alias for [`pgq sql uninstall`](#sql).
 
 ```bash
 pgq uninstall
@@ -63,9 +58,6 @@ already current runs nothing and says so.
   [`pgq sql upgrade`](#sql) for the artifact to check in.
 - `--widen-id/--no-widen-id`: Widen legacy `int4` id columns to `BIGINT`. See
   [Upgrading](../getting-started/upgrading.md).
-- `--dry-run` *(deprecated)*: Alias for [`pgq sql upgrade`](#sql).
-- `--durability` *(deprecated)*: Accepted for older scripts, warns, and is
-  ignored. See below.
 
 ```bash
 pgq upgrade --plan          # what would change, nothing applied
@@ -145,7 +137,6 @@ Change the durability level of existing PgQueuer tables **without data loss**.
 **Arguments:**
 
 - `durability` *(required)*: `volatile`, `balanced`, or `durable`.
-- `--dry-run` *(deprecated)*: Alias for [`pgq sql durability`](#sql).
 
 ```bash
 pgq durability durable
@@ -159,7 +150,6 @@ Apply recommended autovacuum settings for PgQueuer tables.
 
 **Options:**
 
-- `--dry-run` *(deprecated)*: Alias for [`pgq sql autovac`](#sql).
 - `--rollback`: Reset autovacuum settings to system defaults.
 
 ```bash
@@ -415,12 +405,12 @@ Start a `QueueManager` to process jobs.
 | `--restart-on-failure` | bool | False | Restart the manager automatically after failures |
 | `--log-level` | str | INFO | Logging level (DEBUG, INFO, WARNING, ERROR) |
 | `--mode` | str | continuous | `continuous` or `drain` |
-| `--max-concurrent-tasks` | int | None | Cap total concurrent tasks (None = unlimited) |
+| `--max-concurrent-tasks` | int | None | Cap total concurrent tasks (None = unlimited). Must be at least twice `--batch-size` |
 | `--shutdown-on-listener-failure` | bool | False | Shut down if the LISTEN channel health check fails |
 
 ```bash
-# Run with a limit of 5 concurrent tasks
-pgq run my_module:my_factory --max-concurrent-tasks 5
+# Run with a limit of 20 concurrent tasks (at least twice --batch-size)
+pgq run my_module:my_factory --max-concurrent-tasks 20
 
 # Drain mode: process all queued jobs then exit
 pgq run my_module:my_factory --mode drain

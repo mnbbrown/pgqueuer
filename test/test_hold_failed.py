@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import timedelta
 
-import async_timeout
 import pytest
 
 from pgqueuer.adapters.inmemory import InMemoryQueries
@@ -131,16 +131,16 @@ async def test_inmemory_requeue_resets_attempts(queries: InMemoryQueries) -> Non
     )
     job = jobs[0]
 
-    # Simulate a few retries then hold
-    await queries.retry_job(job, timedelta(0), None)
-    await queries.retry_job(job, timedelta(0), None)
-    jobs2 = await queries.dequeue(
-        10, {QueueEntrypoint("ep"): EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
-    )
-    assert jobs2[0].attempts == 2
+    # Simulate a few retries then hold; only the worker holding the job can retry it.
+    for _ in range(2):
+        await queries.retry_job(job, timedelta(0), None)
+        (job,) = await queries.dequeue(
+            10, {QueueEntrypoint("ep"): EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
+        )
+    assert job.attempts == 2
 
-    await queries.log_jobs([(jobs2[0], "failed", None)])
-    await queries.requeue_jobs([jobs2[0].id])
+    await queries.log_jobs([(job, "failed", None)])
+    await queries.requeue_jobs([job.id])
 
     jobs3 = await queries.dequeue(
         10, {QueueEntrypoint("ep"): EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
@@ -231,7 +231,7 @@ async def test_hold_keeps_job_in_queue(apgdriver: AsyncpgDriver) -> None:
 
     await queries.enqueue("hold_test", b"precious-payload", priority=1)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     assert len(processed) == 1
@@ -254,7 +254,7 @@ async def test_delete_default_removes_job(apgdriver: AsyncpgDriver) -> None:
 
     await queries.enqueue("delete_test", b"payload", priority=1)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     failed = await queries.list_failed_jobs()
@@ -279,7 +279,7 @@ async def test_hold_full_lifecycle(apgdriver: AsyncpgDriver) -> None:
     await queries.enqueue("lifecycle_test", b"data", priority=1)
 
     # First run: job fails and is held
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     assert call_count == 1
@@ -299,7 +299,7 @@ async def test_hold_full_lifecycle(apgdriver: AsyncpgDriver) -> None:
         nonlocal call_count
         call_count += 1
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq2.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     assert call_count == 2
@@ -318,7 +318,7 @@ async def test_hold_writes_log_entry(apgdriver: AsyncpgDriver) -> None:
 
     await queries.enqueue("log_test", b"payload", priority=1)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     # Check log table has an entry
@@ -346,7 +346,7 @@ async def test_requeue_resets_attempts_postgres(apgdriver: AsyncpgDriver) -> Non
 
     await queries.enqueue("retry_hold_test", b"payload", priority=1)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     failed = await queries.list_failed_jobs()
@@ -364,7 +364,7 @@ async def test_requeue_resets_attempts_postgres(apgdriver: AsyncpgDriver) -> Non
         attempts_seen.append(job.attempts)
         raise RuntimeError("fails again")
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq2.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     assert attempts_seen[0] == 0
@@ -393,7 +393,7 @@ async def test_database_retry_executor_then_hold(apgdriver: AsyncpgDriver) -> No
 
     await queries.enqueue("retry_then_hold", b"payload", priority=1)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     # Should have been called 3 times: attempt 0, 1, 2 (max_attempts=2 means retry twice)
@@ -451,7 +451,7 @@ async def test_pg_failed_releases_dedupe_key(apgdriver: AsyncpgDriver) -> None:
 
     await queries.enqueue("dedupe_hold", b"first", priority=1, dedupe_key="dk1")
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     failed = await queries.list_failed_jobs()
@@ -481,7 +481,10 @@ async def test_inmemory_requeue_preserves_attempts_when_flag_false(
 
     # Two retries, then hold.
     await queries.retry_job(job, timedelta(0), None)
-    await queries.retry_job(job, timedelta(0), None)
+    retried = await queries.dequeue(
+        10, {QueueEntrypoint("ep"): EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
+    )
+    await queries.retry_job(retried[0], timedelta(0), None)
     jobs2 = await queries.dequeue(
         10, {QueueEntrypoint("ep"): EP}, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
     )
@@ -518,7 +521,7 @@ async def test_pg_requeue_preserves_attempts_when_flag_false(
 
     await queries.enqueue("preserve_attempts_test", b"payload", priority=1)
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     failed = await queries.list_failed_jobs()
@@ -544,7 +547,7 @@ async def test_pg_requeue_preserves_attempts_when_flag_false(
         attempts_seen.append(job.attempts)
         raise RuntimeError("fails again")
 
-    async with async_timeout.timeout(10):
+    async with asyncio.timeout(10):
         await pgq2.run(dequeue_timeout=timedelta(seconds=0.1), mode=QueueExecutionMode.drain)
 
     # Re-runs picked up with attempts preserved (not 0)

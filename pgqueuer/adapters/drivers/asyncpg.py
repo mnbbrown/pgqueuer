@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
-from typing_extensions import Self
-
-from pgqueuer.core.tm import TaskManager
 from pgqueuer.ports.driver import Driver, NotifyCallback
 
 if TYPE_CHECKING:
@@ -30,8 +27,7 @@ class Relay:
 
 
 class AsyncpgDriver(Driver):
-    """
-    AsyncPG implementation of the `Driver` protocol.
+    """AsyncPG implementation of the `Driver` protocol.
 
     This driver uses an AsyncPG connection to perform asynchronous database operations
     such as fetching records, executing queries, and listening for notifications.
@@ -89,10 +85,6 @@ class AsyncpgDriver(Driver):
     def shutdown(self) -> asyncio.Event:
         return self._shutdown
 
-    @property
-    def tm(self) -> TaskManager:
-        return TaskManager()
-
     async def __aenter__(self) -> Self:
         return self
 
@@ -100,8 +92,7 @@ class AsyncpgDriver(Driver):
 
 
 class AsyncpgPoolDriver(Driver):
-    """
-    Implements the Driver protocol using AsyncPGPool for PostgreSQL database operations.
+    """Implements the Driver protocol using AsyncPGPool for PostgreSQL database operations.
 
     This class manages asynchronous database operations using a connection pool.
     It ensures thread safety through query locking and supports PostgreSQL LISTEN/NOTIFY
@@ -165,10 +156,6 @@ class AsyncpgPoolDriver(Driver):
     @property
     def shutdown(self) -> asyncio.Event:
         return self._shutdown
-
-    @property
-    def tm(self) -> TaskManager:
-        return TaskManager()
 
     async def __aenter__(self) -> Self:
         self._entered += 1

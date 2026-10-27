@@ -38,7 +38,7 @@ unlimited_claims AS (
                 FROM pgqueuer candidate
                 WHERE candidate.entrypoint = available.entrypoint
                   AND candidate.status = 'queued'
-                  AND candidate.execute_after < NOW()
+                  AND candidate.execute_after <= NOW()
                   AND NOT (
         candidate.entrypoint = ANY($6::text[])
         AND candidate.serialize_key IS NOT NULL
@@ -49,7 +49,7 @@ unlimited_claims AS (
               AND other.id <> candidate.id
               AND (
                 other.status = 'picked'
-                OR (other.status = 'queued' AND other.execute_after < NOW()
+                OR (other.status = 'queued' AND other.execute_after <= NOW()
                     AND (other.priority > candidate.priority
                          OR (other.priority = candidate.priority AND other.id < candidate.id)))
               )
@@ -73,7 +73,7 @@ limited_claims AS (
                     FROM pgqueuer candidate
                     WHERE candidate.entrypoint = available.entrypoint
                       AND candidate.status = 'queued'
-                      AND candidate.execute_after < NOW()
+                      AND candidate.execute_after <= NOW()
                   AND NOT (
         candidate.entrypoint = ANY($6::text[])
         AND candidate.serialize_key IS NOT NULL
@@ -84,7 +84,7 @@ limited_claims AS (
               AND other.id <> candidate.id
               AND (
                 other.status = 'picked'
-                OR (other.status = 'queued' AND other.execute_after < NOW()
+                OR (other.status = 'queued' AND other.execute_after <= NOW()
                     AND (other.priority > candidate.priority
                          OR (other.priority = candidate.priority AND other.id < candidate.id)))
               )
@@ -98,7 +98,7 @@ limited_claims AS (
                     FROM pgqueuer target
                     WHERE target.id = capped.id
                       AND target.status = 'queued'
-                      AND target.execute_after < NOW()
+                      AND target.execute_after <= NOW()
                     FOR UPDATE OF target SKIP LOCKED
                 ) locked
                 ORDER BY locked.priority DESC, locked.id ASC
@@ -126,7 +126,7 @@ next_stale AS (
     WHERE stale.status = 'picked'
       AND stale.entrypoint = ANY($2)
       AND stale.heartbeat < NOW() - $4::interval
-      AND stale.execute_after < NOW()
+      AND stale.execute_after <= NOW()
     ORDER BY stale.priority DESC, stale.id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $1

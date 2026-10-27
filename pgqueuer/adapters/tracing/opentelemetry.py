@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Generator
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, AsyncIterator, Generator
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import opentelemetry
@@ -11,11 +12,11 @@ if TYPE_CHECKING:
     import opentelemetry.trace
 
 try:
-    import opentelemetry  # noqa: F811
-    import opentelemetry.context  # noqa: F811
-    import opentelemetry.propagate  # noqa: F811
-    import opentelemetry.semconv.trace  # noqa: F811
-    import opentelemetry.trace  # noqa: F811
+    import opentelemetry
+    import opentelemetry.context
+    import opentelemetry.propagate
+    import opentelemetry.semconv.trace
+    import opentelemetry.trace
 
     HAS_OTEL = True
 except ImportError:
@@ -153,8 +154,9 @@ class OpenTelemetryTracing(TracingProtocol):
 
     @asynccontextmanager
     async def trace_process(self, job: Job) -> AsyncIterator[None]:
-        """Extract W3C trace context from job headers and wrap execution in a
-        ``CONSUMER`` ``process {destination}`` span.
+        """Run the job inside a ``CONSUMER`` ``process {destination}`` span.
+
+        The W3C trace context is extracted from the job headers.
 
         Uses the message's creation context as the span's parent (valid for
         single-message processing per the OTel spec).  Sets ``STATUS_ERROR``

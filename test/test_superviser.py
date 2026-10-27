@@ -3,42 +3,46 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from functools import partial
-from typing import AsyncIterator
+from typing import Any
 from unittest.mock import ANY, MagicMock, patch
 
-import async_timeout
 import pytest
 
 from pgqueuer import AsyncpgDriver, PgQueuer, QueueManager, SchedulerManager
 from pgqueuer.adapters.cli import supervisor
+from pgqueuer.adapters.cli.supervisor import CarriesUnwrittenJobLogs, UnwrittenJobLogs
+from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
+from pgqueuer.core.buffers import JobLogEntry
 from pgqueuer.errors import FailingListenerError
 from pgqueuer.models import HealthCheckEvent, Job
 from pgqueuer.queries import Queries
 from pgqueuer.types import QueueExecutionMode
+from test.helpers import mocked_job
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 async def queue_manager(apgdriver: AsyncpgDriver) -> QueueManager:
     """Fixture to instantiate QueueManager."""
     return QueueManager(Queries(apgdriver))
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 async def scheduler_manager(apgdriver: AsyncpgDriver) -> SchedulerManager:
     """Fixture to instantiate SchedulerManager."""
     return SchedulerManager(Queries(apgdriver))
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 async def pg_queuer(apgdriver: AsyncpgDriver) -> PgQueuer:
     """Fixture to instantiate PgQueuer."""
     return PgQueuer(connection=apgdriver)
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 def shutdown_event() -> asyncio.Event:
     """Fixture to create a shutdown asyncio.Event."""
     return asyncio.Event()
@@ -76,7 +80,7 @@ async def test_setup_shutdown_handlers_invalid_manager(
     class InvalidManager:
         pass
 
-    with pytest.raises(NotImplementedError, match="Unsupported instance type: .*InvalidManager.*"):
+    with pytest.raises(NotImplementedError, match=r"Unsupported instance type: .*InvalidManager.*"):
         supervisor.setup_shutdown_handlers(InvalidManager(), shutdown_event)
 
 
@@ -126,7 +130,7 @@ async def test_runit_normal_operation(
     await asyncio.sleep(0.2)
 
     # Ensure runit_task is completed
-    async with async_timeout.timeout(1):
+    async with asyncio.timeout(1):
         await runit_task
     assert runit_task.done()
 
@@ -164,7 +168,7 @@ async def test_runit_with_partial_function(
     await asyncio.sleep(0.2)
 
     # Ensure runit_task is completed
-    async with async_timeout.timeout(1):
+    async with asyncio.timeout(1):
         await runit_task
     assert runit_task.done()
 
@@ -208,7 +212,7 @@ async def test_runit_restart_on_failure(
     shutdown_event.set()
 
     # Ensure runit_task is completed
-    async with async_timeout.timeout(1):
+    async with asyncio.timeout(1):
         await runit_task
     assert runit_task.done()
     assert calls > 1
@@ -255,7 +259,7 @@ async def test_runit_restarts_when_pgqueuer_inner_run_fails() -> None:
     assert calls > 1, f"expected multiple restart attempts, got {calls}"
 
     shutdown.set()
-    async with async_timeout.timeout(2):
+    async with asyncio.timeout(2):
         await runit_task
 
 
@@ -284,6 +288,119 @@ async def test_runit_pgqueuer_failure_without_restart_still_raises() -> None:
             max_concurrent_tasks=None,
             shutdown_on_listener_failure=False,
         )
+
+
+def test_pgqueuer_carries_the_queue_managers_unwritten_job_logs() -> None:
+    """PgQueuer exposes the same list the queue manager keeps."""
+    pgq = PgQueuer.in_memory()
+    scheduler = SchedulerManager(InMemoryQueries(driver=InMemoryDriver()))
+
+    assert isinstance(pgq, CarriesUnwrittenJobLogs)
+    assert isinstance(pgq.qm, CarriesUnwrittenJobLogs)
+    assert pgq.unwritten_job_logs is pgq.qm.unwritten_job_logs
+    assert not isinstance(scheduler, CarriesUnwrittenJobLogs)
+
+
+async def test_unwritten_job_logs_stay_held_when_the_write_fails() -> None:
+    """A failed replay does not drop the ends, and does not run the body."""
+    entry: JobLogEntry = (mocked_job(id=1, status="picked"), "successful", None)
+
+    class Carrier:
+        def __init__(self) -> None:
+            self.unwritten_job_logs: list[JobLogEntry] = []
+
+        async def write_job_ends(self, logs: list[JobLogEntry]) -> None:
+            raise RuntimeError("down")
+
+    held = UnwrittenJobLogs()
+    held.entries = [entry]
+    carrier = Carrier()
+    with pytest.raises(RuntimeError, match="down"):
+        async with held.around(carrier):
+            raise AssertionError("body must not run")
+
+    assert held.entries == [entry]
+    assert carrier.unwritten_job_logs == []
+
+
+async def test_unwritten_job_logs_capture_what_the_run_could_not_write() -> None:
+    """Ends left on the manager replace the ones just written."""
+    entry: JobLogEntry = (mocked_job(id=1, status="picked"), "successful", None)
+    fresh: JobLogEntry = (mocked_job(id=2, status="picked"), "exception", None)
+    written: list[JobLogEntry] = []
+
+    class Carrier:
+        def __init__(self) -> None:
+            self.unwritten_job_logs: list[JobLogEntry] = []
+
+        async def write_job_ends(self, logs: list[JobLogEntry]) -> None:
+            written.extend(logs)
+
+    held = UnwrittenJobLogs()
+    held.entries = [entry]
+    carrier = Carrier()
+    async with held.around(carrier):
+        carrier.unwritten_job_logs = [fresh]
+
+    assert written == [entry]
+    assert held.entries == [fresh]
+
+
+async def test_restart_writes_job_end_the_first_run_could_not() -> None:
+    """An in-process restart writes the job end the failed flush kept."""
+    shared = InMemoryQueries(driver=InMemoryDriver())
+    real_log = shared.log_jobs
+    real_dequeue = shared.dequeue
+    cycle = 0
+    polls = 0
+    ran = 0
+
+    async def log_jobs(job_status: list[JobLogEntry]) -> None:
+        if cycle == 1:
+            raise RuntimeError("connection lost")
+        await real_log(job_status)
+
+    async def dequeue(*args: Any, **kwargs: Any) -> list[Job]:
+        nonlocal polls
+        if cycle == 1:
+            polls += 1
+            if polls > 1:
+                raise RuntimeError("poll failed")
+        return await real_dequeue(*args, **kwargs)
+
+    shared.log_jobs = log_jobs
+    shared.dequeue = dequeue
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[QueueManager]:
+        nonlocal cycle
+        cycle += 1
+        qm = QueueManager(shared)
+
+        @qm.entrypoint("work")
+        async def work(job: Job) -> None:
+            nonlocal ran
+            ran += 1
+
+        yield qm
+
+    await shared.enqueue(["work"], [None], [0])
+    await supervisor.runit(
+        factory=factory,
+        dequeue_timeout=timedelta(seconds=0.05),
+        batch_size=10,
+        restart_delay=timedelta(0),
+        restart_on_failure=True,
+        shutdown=asyncio.Event(),
+        mode=QueueExecutionMode.drain,
+        max_concurrent_tasks=None,
+        shutdown_on_listener_failure=False,
+    )
+
+    assert cycle == 2
+    assert ran == 1
+    assert sum(row.count for row in await shared.queue_size()) == 0
+    assert any(log.status == "successful" for log in await shared.queue_log())
 
 
 async def test_runit_drain_exits_once_with_restart_on_failure() -> None:

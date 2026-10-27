@@ -4,13 +4,11 @@ import asyncio
 import dataclasses
 import uuid
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlparse
-
-import async_timeout
 
 from pgqueuer import db
 from pgqueuer.adapters.persistence import qb
@@ -31,13 +29,8 @@ WIDENED_ID_TABLES = [
 
 
 def queries_for(driver: db.Driver, settings: qb.DBSettings) -> Queries:
-    """Queries wired to non-default DBSettings across all three builders."""
-    return Queries(
-        driver,
-        qbe=qb.QueryBuilderEnvironment(settings=settings),
-        qbq=qb.QueryQueueBuilder(settings=settings),
-        qbs=qb.QuerySchedulerBuilder(settings=settings),
-    )
+    """Queries wired to non-default DBSettings."""
+    return Queries(driver, settings)
 
 
 async def id_data_type(driver: db.Driver, table: str, schema: str | None = None) -> str:
@@ -86,7 +79,7 @@ class ShutdownCapable(Protocol):
 
 
 def mocked_job(
-    id: int | count[int] = count(),
+    id: int | count[int] = count(),  # noqa: B008 - one counter shared across calls
     priority: int = 1,
     created: datetime | None = None,
     heartbeat: datetime | None = None,
@@ -98,7 +91,7 @@ def mocked_job(
     queue_manager_id: None | uuid.UUID = None,
     headers: dict[str, object] | None = None,
 ) -> Job:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Job(
         id=JobId(id if isinstance(id, int) else next(id)),
         priority=priority,
@@ -124,7 +117,7 @@ async def wait_until_empty_queue(
     """
     Block until the queue is empty or the timeout elapses, then signal shutdown.
     """
-    async with async_timeout.timeout(timeout_seconds):
+    async with asyncio.timeout(timeout_seconds):
         while sum(result.count for result in await queries.queue_size()) > 0:
             await asyncio.sleep(poll_interval)
 

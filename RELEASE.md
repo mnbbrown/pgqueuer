@@ -12,6 +12,110 @@
 
 ---
 
+## v1.7.0
+
+### Changed
+
+- `Queries`, `SyncQueries`, `InMemoryQueries`, `PgQueuer`, `create_web_app` and
+  `create_mcp_server` read their default `DBSettings` from the `PGQUEUER_*` env
+  vars when they are built. v1.6 read them once per process and kept that
+  value. Building `DBSettings()` takes a few hundred microseconds, so if you
+  create queries per request, build the settings once and pass them in.
+
+### Removed
+
+- `--dry-run` on `pgq install`, `uninstall`, `upgrade`, `durability` and
+  `autovac`. Use `pgq sql install` and its siblings, which print the same SQL.
+- `pgq upgrade --durability` / `-d`. It was already ignored; use
+  `pgq durability` to change durability.
+- `pgqueuer.domain.settings.add_prefix()`. `DBSettings` applies
+  `PGQUEUER_PREFIX` itself; use `DBSettings(prefix=...)` or the environment
+  variable.
+- `Driver.tm` property and `TaskManagerPort` protocol. Drivers manage background
+  tasks privately without exposing a task manager port; `PsycopgDriver` uses an
+  internal task set for its NOTIFY watcher (#892).
+
+### Fixed
+
+- In-memory `job_status` orders rows by `job_id`, matching PostgreSQL.
+  Reverse log order put the later job first.
+- In-memory `requeue_jobs` raises unique violation `23505` when a held job's
+  dedupe key is already on a queued or picked job, matching PostgreSQL. The
+  batch stays `failed`.
+- In-memory `peek_schedule` orders rows by `last_run` ascending, nulls last,
+  matching PostgreSQL. Insert order put a never-run schedule ahead of one
+  that had already run.
+- In-memory `enqueue` advances the job id when a dedupe conflict is skipped,
+  updated, or raised, matching PostgreSQL `nextval`. The next insert gets the
+  same id on both adapters.
+- In-memory `queue_size` orders rows by count, entrypoint, priority, then
+  status enum order, matching PostgreSQL.
+- In-memory `queued_work` and `eligible_queued_work` return 1 when any matching
+  job exists and 0 otherwise, matching the PostgreSQL existence probe.
+- In-memory `requeue_jobs` keeps a held job's dedupe key, matching PostgreSQL.
+  A later enqueue with that key raises `DuplicateJobError`.
+- In-memory `throughput_summary` orders status in enum order, matching
+  PostgreSQL. Text order put `picked` before `queued`.
+- `pgq --prefix foo_ listen` now listens on `foo_ch_pgqueuer`. The default
+  channel was read once at import, before `--prefix` was applied, so it
+  stayed on the unprefixed channel.
+- `clear_queue([])`, `clear_queue_log([])` and `clear_statistics_log([])` now
+  delete nothing. An empty list used to truncate the table, because `[]` is
+  falsy. Only `None`, the default, truncates. `""` is the empty-string
+  entrypoint: `clear_queue("")` deletes those rows and no longer truncates.
+- `InMemoryQueries.fetch_schedule()` now moves a picked schedule's `next_run`
+  to now plus the delay, as PostgreSQL does. It stayed in the past, so the
+  schedule was due again on every poll: under `PgQueuer.in_memory()`, a
+  schedule ran each time `SchedulerManager` woke for any other schedule.
+- `InMemoryQueries.log_jobs()` now writes nothing for a job that is no longer
+  in the queue, as PostgreSQL does. A job cancelled or cleared while it ran got
+  a second log row when its worker finished, so `job_status()` turned a
+  cleared job's `deleted` into `successful`, and a cancelled job was counted
+  as canceled twice.
+- Statistics no longer count a log row twice when two aggregations overlap. A
+  stats read (`log_statistics()`, `throughput_summary()`,
+  `throughput_timeseries()`, so `pgq dashboard`, the web dashboard and
+  Prometheus metrics) aggregates without the advisory lock, so it could run
+  while a worker's periodic aggregation or another read was in flight, and
+  both counted the same rows. Each aggregation now counts only the rows its
+  own update flagged.
+- A mixed-case prefix or object name (`--prefix Billing_`,
+  `PGQUEUER_QUEUE_TABLE=AcmeJobs`) is now lowercased, as `db_schema` already
+  was. PostgreSQL folds the unquoted names in the DDL to lowercase, but the
+  catalog checks looked for the mixed-case spelling, so after `pgq install` a
+  worker refused to start ("The required table 'Billing_pgqueuer' is missing"),
+  `pgq verify --expect present` reported every object missing, and `pgq
+  upgrade` or a second `pgq install` failed on the existing enum. The default
+  channel follows the prefix and is lowercase too; an installation made with a
+  mixed-case prefix needs one `pgq upgrade`, which rewrites the trigger
+  function to notify on it. An explicitly set channel keeps its case.
+- Log rows that carry a traceback now read back through `PsycopgDriver`.
+  psycopg returns the `jsonb` traceback column as a parsed dict, which `Log`
+  rejected, so `queue_log()`, `exception_logs()` and `job_log_history()`
+  raised `TypeError` whenever a row they returned had a traceback (a job that
+  failed, was held or was retried), and the web dashboard's failures and job
+  pages returned 500 when its router was mounted on psycopg queries.
+  `Job.headers` already accepted both forms.
+- `DatabaseRetryEntrypointExecutor` caps a backoff too large for a
+  `timedelta` at `max_delay`. The delay was multiplied out before the cap, so
+  once `initial_delay * backoff_multiplier**attempts` passed timedelta's range
+  (attempt 47 with the defaults, attempt 14 with a multiplier of 10) the
+  executor raised `OverflowError`, and the job ended as `exception` (or
+  `failed` under `on_failure="hold"`) with attempts left in `max_attempts`.
+- The web dashboard's per-entrypoint throughput sparkline ends at the current
+  time. It ended at that entrypoint's latest bucket, so an entrypoint that went
+  quiet 40 minutes ago drew its last jobs in the newest slot, as if they had
+  just run, and rows on the Entrypoints page did not share a time axis.
+- `pgq failed`, `pgq stale`, `pgq workers` and `pgq backlog` print their
+  times in the terminal's local zone with the offset, like `pgq dashboard` and
+  `pgq schedules`. They printed the driver's wall clock with no zone: UTC on
+  asyncpg, the session `TimeZone` on psycopg, so the same row read hours apart
+  depending on the driver. `--json` output is unchanged.
+- A failed `retry_job` write is retried while the worker keeps the job
+  `picked` and heartbeating. Shutdown before the write lands leaves the row
+  `picked` for stale recovery, and `attempts` stays where it was. One dropped
+  statement no longer records the job as `exception` or `failed`.
+
 ## v1.6.0
 
 ### Added

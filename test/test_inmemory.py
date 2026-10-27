@@ -5,14 +5,23 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import time_machine
 
 from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
 from pgqueuer.domain.errors import DuplicateJobError
-from pgqueuer.domain.types import HealthCheckId, OnConflict, QueueEntrypoint, QueueManagerId
+from pgqueuer.domain.models import CronExpressionEntrypoint
+from pgqueuer.domain.types import (
+    JOB_STATUS,
+    CronEntrypoint,
+    CronExpression,
+    HealthCheckId,
+    OnConflict,
+    QueueEntrypoint,
+    QueueManagerId,
+)
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 
 # ---------------------------------------------------------------------------
@@ -46,7 +55,7 @@ async def test_enqueue_batch(queries: InMemoryQueries) -> None:
 async def test_enqueue_rejects_short_payload_without_partial_insert(
     queries: InMemoryQueries, on_conflict: OnConflict
 ) -> None:
-    with pytest.raises(ValueError, match="payload"):
+    with pytest.raises(ValueError, match="payload"):  # noqa: PT012 - one call per branch
         if on_conflict == "skip":
             await queries.enqueue(
                 ["a", "b"], [b"first"], [1, 2], dedupe_key=["a", "b"], on_conflict=on_conflict
@@ -281,6 +290,27 @@ async def test_dequeue_priority_ordering(queries: InMemoryQueries) -> None:
     assert priorities == sorted(priorities, reverse=True)
 
 
+async def test_dequeue_immediate_jobs_pass_a_deferred_head(queries: InMemoryQueries) -> None:
+    """A future job with a lower id stays queued while later jobs run."""
+    params = {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)}
+    qm_id = QueueManagerId(uuid.uuid4())
+    heartbeat = timedelta(seconds=30)
+    (later,) = await queries.enqueue("ep", b"later", execute_after=timedelta(hours=1))
+
+    for _ in range(40):
+        await queries.enqueue("ep", b"now")
+        (job,) = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=heartbeat)
+        assert job.payload == b"now"
+        await queries.log_jobs([(job, "successful", None)])
+
+    lane = queries.job_table.ready[QueueEntrypoint("ep")]
+    assert len(lane.jobs) < 64
+
+    with time_machine.travel(datetime.now(UTC) + timedelta(hours=2)):
+        (job,) = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=heartbeat)
+    assert job.id == later
+
+
 async def test_dequeue_execute_after(queries: InMemoryQueries) -> None:
     await queries.enqueue("ep", None, execute_after=timedelta(hours=1))
     qm_id = QueueManagerId(uuid.uuid4())
@@ -371,9 +401,9 @@ async def test_dequeue_retry_stale_picked(queries: InMemoryQueries) -> None:
 
     # Manually make heartbeat old
     job_id = int(jobs[0].id)
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    queries._jobs[job_id]["heartbeat"] = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    queries.jobs[job_id].heartbeat = datetime(2000, 1, 1, tzinfo=UTC)
 
     # Now dequeue again - should retry the stale job
     jobs2 = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
@@ -391,9 +421,9 @@ async def test_dequeue_stale_priority_beats_fresh_work(queries: InMemoryQueries)
     assert len(picked) == 1
     stale_id = picked[0].id
 
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    queries._jobs[int(stale_id)]["heartbeat"] = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    queries.jobs[int(stale_id)].heartbeat = datetime(2000, 1, 1, tzinfo=UTC)
 
     await queries.enqueue(["ep"] * 3, [b"fresh-lo"] * 3, [0] * 3)
 
@@ -420,7 +450,7 @@ async def test_dequeue_deferred_jobs_delivered_in_priority_order_when_due(
         == []
     )
 
-    with time_machine.travel(datetime.now(timezone.utc) + timedelta(hours=2)):
+    with time_machine.travel(datetime.now(UTC) + timedelta(hours=2)):
         jobs = await queries.dequeue(
             10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30)
         )
@@ -459,7 +489,7 @@ async def test_retry_job_with_delay_defers_redelivery(queries: InMemoryQueries) 
         await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(hours=1)) == []
     )
 
-    with time_machine.travel(datetime.now(timezone.utc) + timedelta(hours=2)):
+    with time_machine.travel(datetime.now(UTC) + timedelta(hours=2)):
         jobs = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(hours=4))
     assert [j.id for j in jobs] == [job.id]
     assert jobs[0].attempts == 1
@@ -483,7 +513,7 @@ async def test_cancelled_deferred_job_not_delivered_when_due(queries: InMemoryQu
     (job_id,) = await queries.enqueue("ep", None, execute_after=timedelta(hours=1))
     await queries.mark_job_as_cancelled([job_id])
 
-    with time_machine.travel(datetime.now(timezone.utc) + timedelta(hours=2)):
+    with time_machine.travel(datetime.now(UTC) + timedelta(hours=2)):
         jobs = await queries.dequeue(
             10,
             {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
@@ -537,7 +567,7 @@ async def test_dequeue_empty_entrypoints(queries: InMemoryQueries) -> None:
 
 
 async def test_dequeue_batch_size_validation(queries: InMemoryQueries) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Batch size"):
         await queries.dequeue(
             0, {}, QueueManagerId(uuid.uuid4()), None, heartbeat_timeout=timedelta(seconds=30)
         )
@@ -581,9 +611,116 @@ async def test_log_jobs_adds_to_log(queries: InMemoryQueries) -> None:
     assert "successful" in statuses
 
 
+@pytest.mark.parametrize("outcome", ["successful", "canceled", "exception", "failed"])
+async def test_log_jobs_skips_job_cleared_while_it_ran(
+    queries: InMemoryQueries,
+    outcome: JOB_STATUS,
+) -> None:
+    """A job cleared while it ran keeps status deleted, as in PostgreSQL."""
+    (jid,) = await queries.enqueue("ep", None)
+    (job,) = await queries.dequeue(
+        10,
+        {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
+        QueueManagerId(uuid.uuid4()),
+        None,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+    await queries.clear_queue("ep")
+
+    await queries.log_jobs([(job, outcome, None)])
+
+    history = await queries.job_log_history(jid)
+    assert [e.status for e in history] == ["queued", "picked", "deleted"]
+    assert await queries.job_status([jid]) == [(jid, "deleted")]
+
+
+async def test_log_jobs_logs_job_still_in_queue(queries: InMemoryQueries) -> None:
+    (jid,) = await queries.enqueue("ep", None)
+    (job,) = await queries.dequeue(
+        10,
+        {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
+        QueueManagerId(uuid.uuid4()),
+        None,
+        heartbeat_timeout=timedelta(seconds=30),
+    )
+
+    await queries.log_jobs([(job, "successful", None)])
+
+    history = await queries.job_log_history(jid)
+    assert [e.status for e in history] == ["queued", "picked", "successful"]
+    assert await queries.job_status([jid]) == [(jid, "successful")]
+
+
 # ---------------------------------------------------------------------------
 # mark_job_as_cancelled
 # ---------------------------------------------------------------------------
+
+
+async def test_cancel_keeps_picked_row_until_worker_logs(queries: InMemoryQueries) -> None:
+    """Cancel of a running job keeps its slot and dedupe key until the worker logs (#1031)."""
+    params = {QueueEntrypoint("serial"): EntrypointExecutionParameter(concurrency_limit=1)}
+    owner = QueueManagerId(uuid.uuid4())
+    timeout = timedelta(seconds=30)
+    (running_id,) = await queries.enqueue("serial", None, dedupe_key="a")
+    (waiting_id,) = await queries.enqueue("serial", None, dedupe_key="b")
+    (queued_id,) = await queries.enqueue("serial", None, dedupe_key="c")
+
+    (running,) = await queries.dequeue(1, params, owner, None, timeout)
+    assert running.id == running_id
+
+    await queries.mark_job_as_cancelled([running_id, queued_id])
+
+    assert await queries.queue_job_by_id(queued_id) is None
+    assert [entry.status for entry in await queries.job_log_history(queued_id)] == [
+        "queued",
+        "canceled",
+    ]
+    held = await queries.queue_job_by_id(running_id)
+    assert held is not None
+    assert held.status == "picked"
+    assert [entry.status for entry in await queries.job_log_history(running_id)] == [
+        "queued",
+        "picked",
+    ]
+    assert await queries.dequeue(1, params, owner, None, timeout) == []
+    with pytest.raises(DuplicateJobError):
+        await queries.enqueue("serial", None, dedupe_key="a")
+
+    await queries.log_jobs([(running, "canceled", None)])
+
+    assert await queries.queue_job_by_id(running_id) is None
+    assert [entry.status for entry in await queries.job_log_history(running_id)] == [
+        "queued",
+        "picked",
+        "canceled",
+    ]
+    (next_job,) = await queries.dequeue(1, params, owner, None, timeout)
+    assert next_job.id == waiting_id
+    (replacement,) = await queries.enqueue("serial", None, dedupe_key="a")
+    assert replacement is not None
+
+
+async def test_cancel_removes_failed_job(queries: InMemoryQueries) -> None:
+    """A held failed job is still removed and logged canceled."""
+    (jid,) = await queries.enqueue("ep", None)
+    (job,) = await queries.dequeue(
+        1,
+        {QueueEntrypoint("ep"): EntrypointExecutionParameter(0)},
+        QueueManagerId(uuid.uuid4()),
+        None,
+        timedelta(seconds=30),
+    )
+    await queries.log_jobs([(job, "failed", None)])
+
+    await queries.mark_job_as_cancelled([jid])
+
+    assert await queries.queue_job_by_id(jid) is None
+    assert [entry.status for entry in await queries.job_log_history(jid)] == [
+        "queued",
+        "picked",
+        "failed",
+        "canceled",
+    ]
 
 
 async def test_mark_job_as_cancelled(queries: InMemoryQueries, driver: InMemoryDriver) -> None:
@@ -632,6 +769,63 @@ async def test_clear_queue_filtered(queries: InMemoryQueries) -> None:
     assert deleted_entries[0].entrypoint == "a"
 
 
+async def test_clear_queue_empty_entrypoint_deletes_nothing(queries: InMemoryQueries) -> None:
+    """An empty entrypoint list matches no jobs; only None truncates."""
+    await queries.enqueue(["a", "b"], [None, None], [0, 0])
+
+    await queries.clear_queue([])
+
+    assert sum(s.count for s in await queries.queue_size()) == 2
+    assert not any(e.status == "deleted" for e in await queries.queue_log())
+
+
+async def test_clear_queue_log_empty_entrypoint_deletes_nothing(queries: InMemoryQueries) -> None:
+    await queries.enqueue(["a", "b"], [None, None], [0, 0])
+
+    await queries.clear_queue_log([])
+
+    assert len(await queries.queue_log()) == 2
+
+
+async def test_clear_statistics_log_empty_entrypoint_deletes_nothing(
+    queries: InMemoryQueries,
+) -> None:
+    await queries.enqueue(["a", "b"], [None, None], [0, 0])
+    before = await queries.log_statistics(limit=None)
+    assert sum(s.count for s in before) == 2
+
+    await queries.clear_statistics_log([])
+
+    assert await queries.log_statistics(limit=None) == before
+
+
+async def test_clear_entrypoint_list_deletes_only_listed(queries: InMemoryQueries) -> None:
+    await queries.enqueue(["a", "b"], [None, None], [0, 0])
+    await queries.log_statistics(limit=None)
+
+    await queries.clear_statistics_log(["a"])
+    await queries.clear_queue(["a"])
+    await queries.clear_queue_log(["a"])
+
+    assert {s.entrypoint for s in await queries.log_statistics(limit=None)} == {"b"}
+    assert {s.entrypoint for s in await queries.queue_size()} == {"b"}
+    assert {e.entrypoint for e in await queries.queue_log()} == {"b"}
+
+
+async def test_clear_empty_string_entrypoint_deletes_only_that(queries: InMemoryQueries) -> None:
+    """A string filter names one entrypoint, including the empty string."""
+    await queries.enqueue(["", "b"], [None, None], [0, 0])
+    await queries.log_statistics(limit=None)
+
+    await queries.clear_statistics_log("")
+    await queries.clear_queue("")
+    await queries.clear_queue_log("")
+
+    assert {s.entrypoint for s in await queries.log_statistics(limit=None)} == {"b"}
+    assert {s.entrypoint for s in await queries.queue_size()} == {"b"}
+    assert {e.entrypoint for e in await queries.queue_log()} == {"b"}
+
+
 # ---------------------------------------------------------------------------
 # update_heartbeat
 # ---------------------------------------------------------------------------
@@ -650,7 +844,7 @@ async def test_update_heartbeat(queries: InMemoryQueries) -> None:
     old_hb = jobs[0].heartbeat
     await asyncio.sleep(0.01)
     await queries.update_heartbeat([jobs[0].id])
-    new_hb = queries._jobs[int(jobs[0].id)]["heartbeat"]
+    new_hb = queries.jobs[int(jobs[0].id)].heartbeat
     assert new_hb > old_hb
 
 
@@ -704,26 +898,28 @@ async def test_log_statistics(queries: InMemoryQueries) -> None:
 async def test_log_statistics_accumulates_existing_bucket(
     queries: InMemoryQueries, aggregate_between: bool
 ) -> None:
-    with time_machine.travel(datetime(2026, 1, 1, tzinfo=timezone.utc), tick=False):
+    with time_machine.travel(datetime(2026, 1, 1, tzinfo=UTC), tick=False):
         await queries.aggregate_logs()
         assert await queries.log_statistics(limit=None) == []
         await queries.enqueue("ep", None)
         first = await queries.log_statistics(limit=1)
-        assert len(first) == 1 and first[0].count == 1
+        assert len(first) == 1
+        assert first[0].count == 1
 
         await queries.enqueue(["ep", "ep"], [None, None], [0, 0])
         if aggregate_between:
             await queries.aggregate_logs()
         stats = await queries.log_statistics(limit=1)
 
-        assert len(stats) == 1 and stats[0].count == 3
+        assert len(stats) == 1
+        assert stats[0].count == 3
         assert await queries.log_statistics(limit=None) == stats
         await queries.aggregate_logs()
         assert await queries.log_statistics(limit=None) == stats
 
 
 async def test_log_statistics_preserves_existing_bucket_order(queries: InMemoryQueries) -> None:
-    with time_machine.travel(datetime(2026, 1, 1, tzinfo=timezone.utc), tick=False):
+    with time_machine.travel(datetime(2026, 1, 1, tzinfo=UTC), tick=False):
         await queries.enqueue("first", None)
         await queries.log_statistics(limit=None)
         await queries.enqueue("second", None)
@@ -733,13 +929,14 @@ async def test_log_statistics_preserves_existing_bucket_order(queries: InMemoryQ
         latest = await queries.log_statistics(limit=1)
         stats = await queries.log_statistics(limit=None)
 
-    assert len(latest) == 1 and latest[0].entrypoint == "second"
+    assert len(latest) == 1
+    assert latest[0].entrypoint == "second"
     assert [row.entrypoint for row in stats] == ["second", "first"]
     assert [row.count for row in stats] == [1, 2]
 
 
 async def test_log_statistics_keeps_distinct_bucket_dimensions(queries: InMemoryQueries) -> None:
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
     with time_machine.travel(start, tick=False):
         ids = await queries.enqueue("ep", None)
         await queries.log_statistics(limit=None)
@@ -762,7 +959,7 @@ async def test_log_statistics_keeps_distinct_bucket_dimensions(queries: InMemory
 async def test_log_statistics_rebuilds_cleared_bucket(
     queries: InMemoryQueries, entrypoint: str | None
 ) -> None:
-    with time_machine.travel(datetime(2026, 1, 1, tzinfo=timezone.utc), tick=False):
+    with time_machine.travel(datetime(2026, 1, 1, tzinfo=UTC), tick=False):
         await queries.enqueue(["ep", "other"], [None, None], [0, 0])
         await queries.log_statistics(limit=None)
         await queries.clear_statistics_log(entrypoint)
@@ -777,7 +974,7 @@ async def test_log_statistics_rebuilds_cleared_bucket(
 
 
 async def test_log_statistics_last_excludes_bucket_at_cutoff(queries: InMemoryQueries) -> None:
-    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
     with time_machine.travel(start, tick=False):
         await queries.enqueue("ep", None)
         await queries.aggregate_logs()
@@ -818,14 +1015,15 @@ async def test_job_status(queries: InMemoryQueries) -> None:
 
 async def test_queued_work(queries: InMemoryQueries) -> None:
     await queries.enqueue(["ep", "ep", "other"], [None, None, None], [0, 0, 0])
-    count = await queries.queued_work([QueueEntrypoint("ep")])
-    assert count == 2
+    assert await queries.queued_work([QueueEntrypoint("ep")]) == 1
+    assert await queries.queued_work([QueueEntrypoint("missing")]) == 0
 
 
 async def test_eligible_queued_work_excludes_deferred(queries: InMemoryQueries) -> None:
-    await queries.enqueue("ep", None, 0)
     await queries.enqueue("ep", None, 0, execute_after=timedelta(seconds=30))
-    assert await queries.queued_work([QueueEntrypoint("ep")]) == 2
+    assert await queries.queued_work([QueueEntrypoint("ep")]) == 1
+    assert await queries.eligible_queued_work([QueueEntrypoint("ep")]) == 0
+    await queries.enqueue("ep", None, 0)
     assert await queries.eligible_queued_work([QueueEntrypoint("ep")]) == 1
 
 
@@ -881,6 +1079,51 @@ async def test_clear_schedule(queries: InMemoryQueries) -> None:
     await queries.clear_schedule()
     schedules = await queries.peek_schedule()
     assert len(schedules) == 0
+
+
+async def test_fetch_schedule_moves_next_run_on(queries: InMemoryQueries) -> None:
+    """A picked schedule's next run moves to now + delay, as in PostgreSQL."""
+    key = CronExpressionEntrypoint(CronEntrypoint("hourly"), CronExpression("0 * * * *"))
+    with time_machine.travel(datetime(2026, 10, 22, 12, 0, 0, 250_000, tzinfo=UTC), tick=False):
+        await queries.insert_schedule({key: timedelta(seconds=0)})
+        (picked,) = await queries.fetch_schedule({key: timedelta(hours=1)})
+        await queries.set_schedule_queued({picked.id})
+
+        assert await queries.fetch_schedule({key: timedelta(hours=1)}) == []
+
+    (schedule,) = await queries.peek_schedule()
+    assert schedule.next_run == datetime(2026, 10, 22, 13, 0, 0, tzinfo=UTC)
+
+
+async def test_fetch_schedule_reclaim_moves_next_run_on(queries: InMemoryQueries) -> None:
+    """Reclaiming a schedule with a stale heartbeat also moves its next run on."""
+    key = CronExpressionEntrypoint(CronEntrypoint("hourly"), CronExpression("0 * * * *"))
+    start = datetime(2026, 10, 22, 12, 0, 0, 250_000, tzinfo=UTC)
+    with time_machine.travel(start, tick=False):
+        await queries.insert_schedule({key: timedelta(seconds=0)})
+        (first,) = await queries.fetch_schedule({key: timedelta(hours=1)})
+
+    with time_machine.travel(start + timedelta(seconds=31), tick=False):
+        (reclaimed,) = await queries.fetch_schedule({key: timedelta(hours=1)})
+
+    assert reclaimed.id == first.id
+    assert reclaimed.next_run == datetime(2026, 10, 22, 13, 0, 31, tzinfo=UTC)
+
+
+async def test_fetch_schedule_picks_again_once_next_run_is_due(
+    queries: InMemoryQueries,
+) -> None:
+    key = CronExpressionEntrypoint(CronEntrypoint("hourly"), CronExpression("0 * * * *"))
+    start = datetime(2026, 10, 22, 12, 0, 0, 250_000, tzinfo=UTC)
+    with time_machine.travel(start, tick=False):
+        await queries.insert_schedule({key: timedelta(seconds=0)})
+        (picked,) = await queries.fetch_schedule({key: timedelta(hours=1)})
+        await queries.set_schedule_queued({picked.id})
+
+    with time_machine.travel(start + timedelta(hours=1), tick=False):
+        (again,) = await queries.fetch_schedule({key: timedelta(hours=1)})
+
+    assert again.id == picked.id
 
 
 # ---------------------------------------------------------------------------

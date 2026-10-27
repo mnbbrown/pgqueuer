@@ -7,6 +7,14 @@ on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
+# A new push to a PR cancels that PR's in-flight run. Pushes to main and
+# scheduled runs fall back to the unique run_id, so they are never cancelled
+# (they publish benchmark results).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+env:
+  UV_VERSION: "0.13.1"
 jobs:
   run-benchmark:
     strategy:
@@ -42,7 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
       - name: Check that JIT is off
@@ -112,7 +122,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
       - name: Set Branch or Tag Name
         id: get_ref
         run: |
@@ -134,15 +146,14 @@ jobs:
       matrix:
         # Sparse matrix: every Python against anchor PG 16,
         # plus every PG against anchor Python 3.12.
-        # Covers the full range of both axes in 10 jobs instead of 30.
+        # Covers the full range of both axes in 9 jobs instead of 25.
         include:
           # All Python versions × PG 16 (anchor)
-          - python-version: "3.10"
-            postgres-version: "16"
           - python-version: "3.11"
             postgres-version: "16"
           - python-version: "3.12"
             postgres-version: "16"
+            asyncio-debug: true
           - python-version: "3.13"
             postgres-version: "16"
           - python-version: "3.14"
@@ -160,8 +171,9 @@ jobs:
             postgres-version: "18"
     env:
       CI: 1
-      PYTHONASYNCIODEBUG: 1
-      PYTHONDEBUG: 1
+      # asyncio debug mode adds runtime checks to every callback; run it on
+      # the anchor job only. An empty value leaves it off.
+      PYTHONASYNCIODEBUG: ${{ matrix.asyncio-debug && '1' || '' }}
       PYTHONFAULTHANDLER: 1
       POSTGRES_VERSION: ${{ matrix.postgres-version }}
       TESTCONTAINERS_RYUK_DISABLED: "true"
@@ -172,13 +184,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
-      - name: Prefetch docker images
-        run: docker pull postgres:${{ matrix.postgres-version }}
-      - name: Set up Python
-        run: uv sync --python ${{ matrix.python-version }} --no-default-groups --group test --frozen
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Prefetch docker image and set up Python
+        run: |
+          docker pull --quiet postgres:${{ matrix.postgres-version }} &
+          pull=$!
+          uv sync --python ${{ matrix.python-version }} --no-default-groups --group test --frozen
+          wait $pull
+      # Runners for public repos have 4 vCPUs; each xdist worker also starts
+      # its own Postgres container. worksteal rebalances the long sleep-bound
+      # tests that otherwise leave one worker running alone at the end.
       - name: Run Full Test Suite
-        run: uv run --no-sync pytest --cov=pgqueuer --cov-report=xml --cov-report=term-missing --durations=15
+        run: uv run --no-sync pytest -n 3 --dist worksteal --cov=pgqueuer --cov-report=xml --cov-report=term-missing --durations=15
   run-windows-tests:
     if: github.event_name != 'schedule'
     runs-on: windows-latest
@@ -189,7 +208,6 @@ jobs:
     env:
       CI: 1
       PYTHONASYNCIODEBUG: 1
-      PYTHONDEBUG: 1
       PYTHONFAULTHANDLER: 1
       PGHOST: localhost
       PGPORT: "5432"
@@ -199,7 +217,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
       - name: Install PGQueuer
@@ -233,7 +253,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
-        uses: astral-sh/setup-uv@v3
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
       - name: Set up Python
         run: uv python install 3.12
       - name: Install Dev Environment

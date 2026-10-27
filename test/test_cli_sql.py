@@ -16,15 +16,6 @@ SQL_COMMANDS = [
     (["sql", "autovac"], "autovacuum_vacuum_scale_factor"),
 ]
 
-DRY_RUN_ALIASES = [
-    (["install", "--dry-run"], ["sql", "install"]),
-    (["uninstall", "--dry-run"], ["sql", "uninstall"]),
-    (["upgrade", "--dry-run"], ["sql", "upgrade"]),
-    (["durability", "volatile", "--dry-run"], ["sql", "durability", "volatile"]),
-    (["autovac", "--dry-run"], ["sql", "autovac"]),
-    (["autovac", "--dry-run", "--rollback"], ["sql", "autovac", "--rollback"]),
-]
-
 
 @pytest.mark.parametrize(("args", "marker"), SQL_COMMANDS)
 def test_sql_commands_emit_sql(args: list[str], marker: str) -> None:
@@ -75,6 +66,24 @@ def test_sql_install_respects_prefix_and_schema(monkeypatch: pytest.MonkeyPatch)
     assert "CREATE SCHEMA" not in no_create.output
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["install"],
+        ["uninstall"],
+        ["upgrade"],
+        ["durability", "volatile"],
+        ["autovac"],
+        ["autovac", "--rollback"],
+    ],
+)
+def test_sql_commands_respect_prefix(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> None:
+    monkeypatch.delenv("PGQUEUER_PREFIX", raising=False)
+    result = CliRunner().invoke(app, ["--prefix", "foo_", "sql", *args])
+    assert result.exit_code == 0, result.output
+    assert "foo_pgqueuer" in result.output
+
+
 @pytest.mark.parametrize("command", ["install", "upgrade"])
 def test_sql_install_durability_option(command: str) -> None:
     result = CliRunner().invoke(app, ["sql", command, "-d", "volatile"])
@@ -114,7 +123,7 @@ def test_sql_autovac_rollback_option() -> None:
 
 @pytest.mark.parametrize(
     "args",
-    [alias for alias, _ in DRY_RUN_ALIASES] + [sql for _, sql in DRY_RUN_ALIASES],
+    [args for args, _ in SQL_COMMANDS] + [["sql", "autovac", "--rollback"]],
 )
 def test_sql_commands_never_connect(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> None:
     def raiser(*args: object) -> None:
@@ -125,21 +134,20 @@ def test_sql_commands_never_connect(monkeypatch: pytest.MonkeyPatch, args: list[
     assert result.exit_code == 0, result.output
 
 
-@pytest.mark.parametrize(("alias_args", "sql_args"), DRY_RUN_ALIASES)
-def test_dry_run_alias_matches_sql_command(alias_args: list[str], sql_args: list[str]) -> None:
-    alias = CliRunner().invoke(app, alias_args)
-    sql = CliRunner().invoke(app, sql_args)
-    assert alias.exit_code == 0
-    assert alias.stdout == sql.stdout
-    assert "--dry-run is deprecated" in alias.stderr
-    assert f"pgq sql {alias_args[0]}" in alias.stderr
-
-
-@pytest.mark.parametrize("command", ["install", "uninstall", "upgrade", "durability", "autovac"])
-def test_dry_run_hidden_from_help(command: str) -> None:
-    result = CliRunner().invoke(app, [command, "--help"])
-    assert result.exit_code == 0
-    assert "--dry-run" not in result.output
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["install", "--dry-run"],
+        ["uninstall", "--dry-run"],
+        ["upgrade", "--dry-run"],
+        ["durability", "volatile", "--dry-run"],
+        ["autovac", "--dry-run"],
+    ],
+)
+def test_dry_run_is_rejected(args: list[str]) -> None:
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 2
+    assert "No such option" in result.output
 
 
 @pytest.mark.parametrize(

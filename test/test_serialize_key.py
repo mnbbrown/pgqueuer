@@ -143,10 +143,12 @@ async def test_inmemory_priority_ordering_within_key(queries: InMemoryQueries) -
         QueueEntrypoint("ep"): EntrypointExecutionParameter(0, serialize_dispatch_per_key=True)
     }
     first = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
-    assert len(first) == 1 and int(first[0].id) == int(high)
+    assert len(first) == 1
+    assert int(first[0].id) == int(high)
     await queries.log_jobs([(first[0], "successful", None)])
     second = await queries.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
-    assert len(second) == 1 and int(second[0].id) == int(low)
+    assert len(second) == 1
+    assert int(second[0].id) == int(low)
 
 
 @pytest.mark.asyncio
@@ -270,10 +272,12 @@ async def test_pg_priority_ordering_within_key(apgdriver: Driver) -> None:
     }
 
     first = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
-    assert len(first) == 1 and int(first[0].id) == int(high)
+    assert len(first) == 1
+    assert int(first[0].id) == int(high)
     await q.log_jobs([(first[0], "successful", None)])
     second = await q.dequeue(10, params, qm_id, None, heartbeat_timeout=timedelta(seconds=30))
-    assert len(second) == 1 and int(second[0].id) == int(low)
+    assert len(second) == 1
+    assert int(second[0].id) == int(low)
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,7 @@ fail, the job is held instead of lost:
 ```python
 from datetime import timedelta
 from pgqueuer.executors import DatabaseRetryEntrypointExecutor
+from pgqueuer.models import Job
 
 @pgq.entrypoint(
     "sync_inventory",
@@ -136,6 +137,8 @@ await queries.requeue_jobs([JobId(42), JobId(43)])
 - `attempts` is reset to `0`: a fresh start.
 - A log entry with `status='queued'` is written for auditability.
 - Any worker can pick up the re-queued job.
+- If its `dedupe_key` is already on a queued or picked job, requeue raises
+  unique violation `23505` and every id in the call stays `failed`.
 - If `DatabaseRetryEntrypointExecutor` is configured, the job gets a full new set of retry
   attempts.
 
@@ -145,5 +148,6 @@ await queries.requeue_jobs([JobId(42), JobId(43)])
 |----------|--------------------------------|---------------------|
 | Handler raises exception | Job deleted, logged as `exception` | Job kept with `status='failed'` |
 | Handler raises `RetryRequested` | Re-queued with delay (both modes) | Re-queued with delay (both modes) |
+| Retry write fails until shutdown | Job stays `picked` for stale recovery | Job stays `picked` for stale recovery |
 | Handler completes | Job deleted, logged as `successful` | Job deleted, logged as `successful` |
 | `DatabaseRetryEntrypointExecutor` exhausted | Job deleted | Job held with `status='failed'` |

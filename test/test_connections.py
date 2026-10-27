@@ -6,11 +6,12 @@ absent (not None), so DSN parameters and libpq env vars keep full control.
 
 from __future__ import annotations
 
+from typing import Self
+
 import pytest
 
 from pgqueuer.adapters import connections
 from pgqueuer.adapters.cli.cli import AppConfig, create_default_queries_factory
-from pgqueuer.adapters.persistence.qb import DBSettings
 from pgqueuer.domain.settings import ConnectionSettings
 
 pytestmark = pytest.mark.usefixtures("clean_connection_env")
@@ -74,7 +75,7 @@ class TestCreateAsyncpgPoolForwarding:
         captured: dict[str, object] = {}
 
         class FakePool:
-            async def __aenter__(self) -> FakePool:
+            async def __aenter__(self) -> Self:
                 return self
 
             async def __aexit__(self, *exc: object) -> None:
@@ -118,7 +119,7 @@ async def run_cli_factory_capturing(
         return FakeConnection()  # AsyncpgDriver only stores the connection at init.
 
     monkeypatch.setattr(asyncpg, "connect", fake_connect)
-    factory = create_default_queries_factory(config, DBSettings())
+    factory = create_default_queries_factory(config)
     async with factory():
         pass
     return captured
@@ -173,7 +174,8 @@ class TestPsycopgPoolIntegration:
             assert conn.autocommit
             cursor = await conn.execute("SELECT 1")
             row = await cursor.fetchone()
-            assert row is not None and row[0] == 1
+            assert row is not None
+            assert row[0] == 1
 
     async def test_application_name_applied_when_set(self, dsn: str) -> None:
         settings = ConnectionSettings(application_name="pgq-psycopg-test")
@@ -183,7 +185,8 @@ class TestPsycopgPoolIntegration:
         ):
             cursor = await conn.execute("SELECT current_setting('application_name')")
             row = await cursor.fetchone()
-        assert row is not None and row[0] == "pgq-psycopg-test"
+        assert row is not None
+        assert row[0] == "pgq-psycopg-test"
 
     async def test_dsn_application_name_not_clobbered(self, dsn: str) -> None:
         async with (
@@ -194,12 +197,14 @@ class TestPsycopgPoolIntegration:
         ):
             cursor = await conn.execute("SELECT current_setting('application_name')")
             row = await cursor.fetchone()
-        assert row is not None and row[0] == "weird"
+        assert row is not None
+        assert row[0] == "weird"
 
     async def test_single_connection_via_connect_psycopg(self, dsn: str) -> None:
         async with connections.connect_psycopg(dsn=dsn) as connection:
             assert connection.autocommit  # PsycopgDriver requires autocommit.
             cursor = await connection.execute("SELECT 1")
             row = await cursor.fetchone()
-            assert row is not None and row[0] == 1
+            assert row is not None
+            assert row[0] == 1
         assert connection.closed

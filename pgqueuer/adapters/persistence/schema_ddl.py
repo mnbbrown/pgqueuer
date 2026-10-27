@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Generator
-
-from typing_extensions import assert_never
+from collections.abc import Generator
+from typing import assert_never
 
 from pgqueuer.domain.schema.declaration import retired, target
 from pgqueuer.domain.schema.model import (
@@ -22,7 +21,7 @@ from pgqueuer.domain.settings import DBSettings
 from pgqueuer.domain.types import IndexName, TableName
 
 try:
-    from pgqueuer._version import version as VERSION
+    from pgqueuer._version import version as VERSION  # noqa: N812 - module constant
 except ImportError:  # Source checkout without a build; the header says so.
     VERSION = "0.0.0"
 

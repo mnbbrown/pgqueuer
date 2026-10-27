@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from typing import Callable
-
-from typing_extensions import Self
-
-from pgqueuer.core.tm import TaskManager
+from collections.abc import Callable
+from typing import Self
 
 
 class InMemoryDriver:
@@ -20,7 +17,6 @@ class InMemoryDriver:
 
     def __init__(self) -> None:
         self._shutdown = asyncio.Event()
-        self._tm = TaskManager()
         self._listeners: dict[str, list[Callable[[str], None]]] = defaultdict(list)
 
     async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
@@ -43,10 +39,6 @@ class InMemoryDriver:
     @property
     def shutdown(self) -> asyncio.Event:
         return self._shutdown
-
-    @property
-    def tm(self) -> TaskManager:
-        return self._tm
 
     async def __aenter__(self) -> Self:
         return self

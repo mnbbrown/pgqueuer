@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
-from typing import Callable, TypeAlias
+from typing import Protocol, TypeAlias, runtime_checkable
 
 from pgqueuer.adapters.cli import factories
-from pgqueuer.core import applications, logconfig, qm, sm, tm
+from pgqueuer.core import applications, buffers, logconfig, qm, sm, tm
 from pgqueuer.domain import types
 
 Manager: TypeAlias = qm.QueueManager | sm.SchedulerManager | applications.PgQueuer
@@ -16,7 +17,6 @@ ManagerFactory: TypeAlias = Callable[[], object]
 
 def setup_shutdown_handlers(manager: object, shutdown: asyncio.Event) -> Manager:
     """Wire *shutdown* into *manager* so cancellation propagates to inner managers."""
-
     if isinstance(manager, qm.QueueManager | sm.SchedulerManager):
         manager.shutdown = shutdown
     elif isinstance(manager, applications.PgQueuer):
@@ -55,6 +55,39 @@ async def forward_shutdown(source: asyncio.Event, target: asyncio.Event) -> None
     target.set()
 
 
+@runtime_checkable
+class CarriesUnwrittenJobLogs(Protocol):
+    """A manager that can still hold job ends from a failed flush."""
+
+    unwritten_job_logs: list[buffers.JobLogEntry]
+
+    async def write_job_ends(self, logs: list[buffers.JobLogEntry]) -> None: ...
+
+
+class UnwrittenJobLogs:
+    """Job ends a failed flush left in this process.
+
+    ``around`` writes them before the body runs, then keeps whatever that
+    run could not write. A failed write, or a manager with no queue, leaves
+    the held ends in place.
+    """
+
+    def __init__(self) -> None:
+        self.entries: list[buffers.JobLogEntry] = []
+
+    @asynccontextmanager
+    async def around(self, manager: object) -> AsyncIterator[None]:
+        carrier = manager if isinstance(manager, CarriesUnwrittenJobLogs) else None
+        if self.entries and carrier is not None:
+            await carrier.write_job_ends(self.entries)
+            self.entries = []
+        try:
+            yield
+        finally:
+            if carrier is not None and carrier.unwritten_job_logs:
+                self.entries = list(carrier.unwritten_job_logs)
+
+
 async def runit(
     factory: ManagerFactory,
     dequeue_timeout: timedelta,
@@ -83,6 +116,7 @@ async def runit(
     if handle_signals:
         setup_signal_handlers(shutdown)
 
+    unwritten = UnwrittenJobLogs()
     while not shutdown.is_set():
         cycle_shutdown = asyncio.Event()
         forward_task = asyncio.create_task(forward_shutdown(shutdown, cycle_shutdown))
@@ -90,15 +124,16 @@ async def runit(
         try:
             async with factories.validate_factory_result(factory()) as entered:
                 manager = setup_shutdown_handlers(entered, cycle_shutdown)
-                await run_manager(
-                    manager,
-                    dequeue_timeout,
-                    batch_size,
-                    mode,
-                    max_concurrent_tasks,
-                    shutdown_on_listener_failure,
-                    heartbeat_timeout,
-                )
+                async with unwritten.around(manager):
+                    await run_manager(
+                        manager,
+                        dequeue_timeout,
+                        batch_size,
+                        mode,
+                        max_concurrent_tasks,
+                        shutdown_on_listener_failure,
+                        heartbeat_timeout,
+                    )
         except Exception as exc:
             if not restart_on_failure:
                 raise
@@ -199,8 +234,9 @@ async def await_shutdown_or_timeout(
     """Wait for *shutdown* or up to *restart_delay*, whichever comes first."""
     logconfig.logger.info("Waiting %r before restarting.", restart_delay)
 
-    with suppress(TimeoutError, asyncio.TimeoutError):
-        await asyncio.wait_for(shutdown.wait(), timeout=restart_delay.total_seconds())
+    with suppress(TimeoutError):
+        async with asyncio.timeout(restart_delay.total_seconds()):
+            await shutdown.wait()
 
     if not shutdown.is_set():
         logconfig.logger.info("Attempting to restart...")

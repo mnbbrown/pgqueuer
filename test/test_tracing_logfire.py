@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from datetime import UTC, datetime
+from typing import Any
 
 import logfire
 import pytest
@@ -17,7 +17,7 @@ from pgqueuer.domain.types import JobId, QueueEntrypoint, QueueManagerId
 
 
 def _make_job(headers: dict[str, Any] | None, *, entrypoint: str = "say_hello") -> Job:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return Job(
         id=JobId(7),
         priority=0,
@@ -33,14 +33,14 @@ def _make_job(headers: dict[str, Any] | None, *, entrypoint: str = "say_hello") 
     )
 
 
-@pytest.fixture()
-def exporter() -> Iterator[TestExporter]:
+@pytest.fixture
+def exporter() -> TestExporter:
     exp = TestExporter()
     logfire.configure(
         send_to_logfire=False,
         additional_span_processors=[SimpleSpanProcessor(exp)],
     )
-    yield exp
+    return exp
 
 
 def _spans(exporter: TestExporter) -> list[dict[str, Any]]:

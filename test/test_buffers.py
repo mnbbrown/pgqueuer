@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from itertools import count
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import pytest
 
@@ -24,8 +25,8 @@ class _FakeJobLogSink:
 
 
 def job_faker(
-    cnt: count[int] = count(),
-    queue_manager_id: uuid.UUID = uuid.uuid4(),
+    cnt: count[int] = count(),  # noqa: B008 - one counter shared across calls
+    queue_manager_id: uuid.UUID = uuid.uuid4(),  # noqa: B008 - one id shared across calls
 ) -> Job:
     return mocked_job(
         id=next(cnt),
@@ -282,8 +283,8 @@ async def test_job_buffer_callback_exception_during_teardown() -> None:
         for item in items:
             await buffer.add(item)
 
-    # Was uanble to flush at exit, buffer should have all elements.
-    assert buffer.events.qsize() == N
+    # Was unable to flush at exit, so every item is handed back as unwritten.
+    assert buffer.unwritten == items
 
 
 async def test_job_buffer_flush_returns_when_lock_held() -> None:

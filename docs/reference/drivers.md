@@ -73,8 +73,7 @@ Built on psycopg's async connection API.
 import psycopg
 from pgqueuer.db import PsycopgDriver
 
-conn = await psycopg.AsyncConnection.connect(dsn)
-conn.autocommit = True
+conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
 driver = PsycopgDriver(conn)
 ```
 
@@ -101,8 +100,7 @@ driver = PsycopgDriver(conn)
     asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
     ```
 
-    On 3.11 use `asyncio.Runner(loop_factory=asyncio.SelectorEventLoop)`;
-    on 3.10 set `WindowsSelectorEventLoopPolicy` before `asyncio.run`.
+    On 3.11 use `asyncio.Runner(loop_factory=asyncio.SelectorEventLoop)`.
     The `pgq` CLI handles this automatically. See the
     [psycopg async docs](https://www.psycopg.org/psycopg3/docs/advanced/async.html).
 
@@ -177,7 +175,8 @@ All classmethods accept:
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `connection` / `pool` | Yes | The database connection or pool |
-| `channel` | No | Custom `Channel` configuration. Defaults to `ch_pgqueuer` with `PGQUEUER_PREFIX` prepended |
+| `channel` | No | Custom `Channel` configuration. Defaults to the channel in `settings` |
+| `settings` | No | `DBSettings` with table, channel and schema names. Defaults to the `PGQUEUER_*` environment variables |
 | `resources` | No | Mutable mapping for shared resources. Defaults to `{}` |
 
 ## Recommendations
