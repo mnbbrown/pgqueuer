@@ -7,19 +7,36 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pgqueuer import PgQueuer
+from pgqueuer.adapters.drivers.asyncpg import AsyncpgDriver
 from pgqueuer.adapters.inmemory import InMemoryQueries
+from pgqueuer.adapters.persistence.queries import Queries
 from pgqueuer.core import listeners
-from pgqueuer.domain.models import Job, TableChangedEvent
+from pgqueuer.domain.models import AnyEvent, Job, TableChangedEvent, utc_now
 from pgqueuer.domain.types import QueueEntrypoint, QueueManagerId
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 
 
+@pytest.mark.parametrize("postgres", [False, True])
 async def test_notification_burst_requires_one_queue_recheck(
     monkeypatch: pytest.MonkeyPatch,
     queries: InMemoryQueries,
+    apgdriver: AsyncpgDriver,
+    postgres: bool,
 ) -> None:
     """A burst while dequeue is in flight must not cause one poll per notification."""
-    queue = PgQueuer(queries.driver, queries=queries)
+    repository = Queries(apgdriver) if postgres else queries
+    queue = PgQueuer(repository.driver, queries=repository)
+    received = 0
+    delivered = asyncio.Event()
+
+    def observe(payload: str | bytes | bytearray) -> None:
+        nonlocal received
+        if isinstance(AnyEvent.model_validate_json(payload).root, TableChangedEvent):
+            received += 1
+            if received == 100:
+                delivered.set()
+
+    await repository.driver.add_listener(repository.settings.channel, observe)
     started = asyncio.Event()
     release = asyncio.Event()
     original_dequeue = queue.qm.queries.dequeue
@@ -62,8 +79,17 @@ async def test_notification_burst_requires_one_queue_recheck(
 
     async def notify() -> None:
         await started.wait()
-        for _ in range(100):
-            await queries.emit_table_changed("insert")
+        now = utc_now()
+        for index in range(100):
+            event = TableChangedEvent(
+                channel=repository.settings.channel,
+                type="table_changed_event",
+                operation="insert",
+                table="pgqueuer",
+                sent_at=now + timedelta(microseconds=index),
+            )
+            await repository.driver.notify(repository.settings.channel, event.model_dump_json())
+        await delivered.wait()
         release.set()
 
     async with asyncio.timeout(2):
@@ -72,6 +98,7 @@ async def test_notification_burst_requires_one_queue_recheck(
             notify(),
         )
 
+    assert received == 100
     assert dequeue.await_count == 2
 
 
