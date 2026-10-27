@@ -23,6 +23,23 @@ from pgqueuer.domain.types import Channel
 pytestmark = pytest.mark.usefixtures("clean_connection_env")
 
 
+@pytest.mark.parametrize(
+    "builder_type", [qb.QueryBuilderEnvironment, qb.QueryQueueBuilder, qb.QuerySchedulerBuilder]
+)
+def test_query_builders_keep_no_argument_constructors(
+    monkeypatch: pytest.MonkeyPatch,
+    builder_type: type[
+        qb.QueryBuilderEnvironment | qb.QueryQueueBuilder | qb.QuerySchedulerBuilder
+    ],
+) -> None:
+    """Existing callers can omit settings without sharing mutable configuration."""
+    monkeypatch.setenv("PGQUEUER_PREFIX", "legacy_")
+    first = builder_type()
+    second = builder_type()
+    assert first.settings.queue_table == "legacy_pgqueuer"
+    assert first.settings is not second.settings
+
+
 def test_statistics_table_status_type_removed() -> None:
     """statistics_table_status_type was removed in v0.27.0."""
     assert "statistics_table_status_type" not in DBSettings.model_fields

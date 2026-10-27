@@ -119,3 +119,26 @@ uv run lint-imports
 uv run mypy .
 uv run pytest -v
 ```
+
+## Worker benchmarks
+
+Use `tools/benchmark.py` with a dedicated database. The script clears the queue
+before each run. The `throughput`, `drain`, and `serialize-drain` strategies
+report job rates, dequeue counts, and dequeue latency percentiles in JSON.
+
+To include heartbeat writes, give each job a simulated I/O duration that exceeds
+the heartbeat interval:
+
+```bash
+python tools/benchmark.py --driver apg --strategy drain --jobs 52 \
+  --dequeue 6 --job-duration 4 --heartbeat-timeout 1 \
+  --statement-cache-size 0 --output-json heartbeat.json
+```
+
+`--job-duration` defaults to zero seconds. `--heartbeat-timeout` defaults to
+30 seconds. These options change the benchmark workload only. Use the same
+values for every version in a comparison. No-op jobs do not measure heartbeat
+update costs.
+
+`--statement-cache-size` sets the asyncpg connection cache size. It defaults to
+100 entries. Use zero to measure workers that disable prepared-statement caching.

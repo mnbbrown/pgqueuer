@@ -17,7 +17,7 @@ import asyncpg
 import psycopg
 import typer
 import uvloop
-from pydantic import AwareDatetime, BaseModel
+from pydantic import AwareDatetime, BaseModel, Field
 from tabulate import tabulate
 from tqdm.asyncio import tqdm
 
@@ -75,6 +75,9 @@ class BenchmarkResult(BaseModel):
     queued: int
     rate: float
     steps: int
+    job_duration: timedelta = timedelta(0)
+    heartbeat_timeout: timedelta = timedelta(seconds=30)
+    statement_cache_size: int = 100
     dequeue_calls: int = 0
     dequeue_p50_ms: float | None = None
     dequeue_p95_ms: float | None = None
@@ -138,6 +141,9 @@ class ThroughputSettings(BaseModel):
         10,
         help="Batch size for enqueue tasks.",
     )
+    statement_cache_size: int = Field(default=100, ge=0)
+    job_duration: timedelta = Field(default=timedelta(0), ge=timedelta(0))
+    heartbeat_timeout: timedelta = Field(default=timedelta(seconds=30), gt=timedelta(0))
     output_json: Path | None = typer.Option(
         None,
         help="Output JSON file for benchmark metrics.",
@@ -154,6 +160,9 @@ class ThroughputSettings(BaseModel):
                     ["Dequeue Batch Size", self.dequeue_batch_size],
                     ["Enqueue Tasks", self.enqueue],
                     ["Enqueue Batch Size", self.enqueue_batch_size],
+                    ["Job Duration (s)", self.job_duration.total_seconds()],
+                    ["Heartbeat Timeout (s)", self.heartbeat_timeout.total_seconds()],
+                    ["Asyncpg Statement Cache", self.statement_cache_size],
                     ["Output JSON", self.output_json or "None"],
                 ],
                 headers=["Field", "Value"],
@@ -184,6 +193,9 @@ class DrainSettings(BaseModel):
         10,
         help="Batch size for dequeue tasks.",
     )
+    statement_cache_size: int = Field(default=100, ge=0)
+    job_duration: timedelta = Field(default=timedelta(0), ge=timedelta(0))
+    heartbeat_timeout: timedelta = Field(default=timedelta(seconds=30), gt=timedelta(0))
     output_json: Path | None = typer.Option(
         None,
         help="Output JSON file for benchmark metrics.",
@@ -198,6 +210,9 @@ class DrainSettings(BaseModel):
                     ["Jobs", self.jobs],
                     ["Dequeue Tasks", self.dequeue],
                     ["Dequeue Batch Size", self.dequeue_batch_size],
+                    ["Job Duration (s)", self.job_duration.total_seconds()],
+                    ["Heartbeat Timeout (s)", self.heartbeat_timeout.total_seconds()],
+                    ["Asyncpg Statement Cache", self.statement_cache_size],
                     ["Output JSON", self.output_json or "None"],
                 ],
                 headers=["Field", "Value"],
@@ -240,6 +255,9 @@ class SerializeDrainSettings(BaseModel):
         10,
         help="Batch size for dequeue tasks.",
     )
+    statement_cache_size: int = Field(default=100, ge=0)
+    job_duration: timedelta = Field(default=timedelta(0), ge=timedelta(0))
+    heartbeat_timeout: timedelta = Field(default=timedelta(seconds=30), gt=timedelta(0))
     output_json: Path | None = typer.Option(
         None,
         help="Output JSON file for benchmark metrics.",
@@ -257,6 +275,9 @@ class SerializeDrainSettings(BaseModel):
                     ["Serialize Dispatch Per Key", self.serialize_dispatch_per_key],
                     ["Dequeue Tasks", self.dequeue],
                     ["Dequeue Batch Size", self.dequeue_batch_size],
+                    ["Job Duration (s)", self.job_duration.total_seconds()],
+                    ["Heartbeat Timeout (s)", self.heartbeat_timeout.total_seconds()],
+                    ["Asyncpg Statement Cache", self.statement_cache_size],
                     ["Output JSON", self.output_json or "None"],
                 ],
                 headers=["Field", "Value"],
@@ -269,13 +290,21 @@ class SerializeDrainSettings(BaseModel):
 _shared_inmem: RepositoryPort | None = None
 
 
-async def make_queries(driver: DriverEnum, conninfo: str = "") -> RepositoryPort:
+async def make_queries(
+    driver: DriverEnum, conninfo: str = "", statement_cache_size: int = 100
+) -> RepositoryPort:
     global _shared_inmem  # noqa: PLW0603 - in-memory store shared by producer and consumer
     match driver:
         case "apg":
-            return Queries(AsyncpgDriver(await asyncpg.connect(dsn=conninfo)))
+            return Queries(
+                AsyncpgDriver(
+                    await asyncpg.connect(dsn=conninfo, statement_cache_size=statement_cache_size)
+                )
+            )
         case "apgpool":
-            pool = await asyncpg.create_pool(dsn=conninfo)
+            pool = await asyncpg.create_pool(
+                dsn=conninfo, statement_cache_size=statement_cache_size
+            )
             assert pool is not None
             return Queries(AsyncpgPoolDriver(pool))
         case "psy":
@@ -299,6 +328,8 @@ class Consumer:
     mode: types.QueueExecutionMode = types.QueueExecutionMode.continuous
     serialize_dispatch_per_key: bool = False
     dequeue_durations: list[float] | None = None
+    job_duration: timedelta = timedelta(0)
+    heartbeat_timeout: timedelta = timedelta(seconds=30)
 
     async def run(self) -> None:
         if self.dequeue_durations is not None:
@@ -307,9 +338,13 @@ class Consumer:
 
         @self.pgq.entrypoint("fetch", serialize_dispatch_per_key=self.serialize_dispatch_per_key)
         async def fetch(_job: Job) -> None:
+            if self.job_duration:
+                await asyncio.sleep(self.job_duration.total_seconds())
             self.bar.update()
 
-        await self.pgq.run(batch_size=self.batch_size, mode=self.mode)
+        await self.pgq.run(
+            batch_size=self.batch_size, mode=self.mode, heartbeat_timeout=self.heartbeat_timeout
+        )
 
 
 @dataclass
@@ -362,22 +397,39 @@ class ThroughputStrategy:
         init=False,
     )
 
+    dequeue_durations: list[float] = dataclass_field(default_factory=list, init=False)
+
     async def run_enqueuers(self) -> None:
         cnt = count()
         tasks = []
         for _ in range(self.settings.enqueue):
-            q = await make_queries(self.settings.driver)
+            q = await make_queries(
+                self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+            )
             p = Producer(self.shutdown, q, self.settings.enqueue_batch_size, cnt)
             tasks.append(p.run())
         await asyncio.gather(*tasks)
 
     async def run_dequeuers(self) -> None:
-        queries = [await make_queries(self.settings.driver) for _ in range(self.settings.dequeue)]
+        queries = [
+            await make_queries(
+                self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+            )
+            for _ in range(self.settings.dequeue)
+        ]
         for q in queries:
             self.pgqs.append(PgQueuer(q.driver, queries=q))
         with job_progress_bar() as bar:
             tasks = [
-                Consumer(pgq, self.settings.dequeue_batch_size, bar).run() for pgq in self.pgqs
+                Consumer(
+                    pgq=pgq,
+                    batch_size=self.settings.dequeue_batch_size,
+                    bar=bar,
+                    dequeue_durations=self.dequeue_durations,
+                    job_duration=self.settings.job_duration,
+                    heartbeat_timeout=self.settings.heartbeat_timeout,
+                ).run()
+                for pgq in self.pgqs
             ]
             await asyncio.gather(*tasks)
             self.tqdm_format_dict.update(bar.format_dict)
@@ -395,7 +447,9 @@ class ThroughputStrategy:
         loop.add_signal_handler(signal.SIGTERM, self.graceful_shutdown)
 
         self.settings.pretty_print()
-        queries = await make_queries(self.settings.driver)
+        queries = await make_queries(
+            self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+        )
         await queries.clear_statistics_log()
         await queries.clear_queue()
 
@@ -424,17 +478,29 @@ class ThroughputStrategy:
             if not task.cancelled() and (exc := task.exception()):
                 raise exc
 
-        qsize = await (await make_queries(self.settings.driver)).queue_size()
+        qsize = await (
+            await make_queries(
+                self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+            )
+        ).queue_size()
+        p50, p95, p99 = dequeue_latency_summary(self.dequeue_durations)
         return BenchmarkResult(
             created_at=datetime.now(UTC),
             driver=self.settings.driver,
             strategy=StrategyEnum.throughput,
             elapsed=timedelta(seconds=float(self.tqdm_format_dict.get("elapsed", 0))),
             github_ref_name=os.environ.get("REF_NAME", ""),
+            job_duration=self.settings.job_duration,
+            heartbeat_timeout=self.settings.heartbeat_timeout,
+            statement_cache_size=self.settings.statement_cache_size,
             queued=sum(x.count for x in qsize),
             rate=float(self.tqdm_format_dict.get("n", 0))
             / max(float(self.tqdm_format_dict.get("elapsed", 1)), 1),
             steps=int(self.tqdm_format_dict.get("n", 0)),
+            dequeue_calls=len(self.dequeue_durations),
+            dequeue_p50_ms=p50,
+            dequeue_p95_ms=p95,
+            dequeue_p99_ms=p99,
         )
 
     async def teardown(self) -> None:  # pragma: no cover - nothing to clean up
@@ -449,13 +515,17 @@ class DrainStrategy:
     pgqs: list[PgQueuer] = dataclass_field(default_factory=list, init=False)
     tqdm_format_dict: dict[str, str] = dataclass_field(default_factory=dict, init=False)
 
+    dequeue_durations: list[float] = dataclass_field(default_factory=list, init=False)
+
     async def setup(self) -> None:
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.graceful_shutdown)
 
         self.settings.pretty_print()
-        queries = await make_queries(self.settings.driver)
+        queries = await make_queries(
+            self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+        )
         await queries.clear_statistics_log()
         await queries.clear_queue()
 
@@ -470,7 +540,12 @@ class DrainStrategy:
             qm.shutdown.set()
 
     async def run(self) -> BenchmarkResult:
-        queries = [await make_queries(self.settings.driver) for _ in range(self.settings.dequeue)]
+        queries = [
+            await make_queries(
+                self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+            )
+            for _ in range(self.settings.dequeue)
+        ]
         for q in queries:
             self.pgqs.append(PgQueuer(q.driver, queries=q))
 
@@ -482,21 +557,32 @@ class DrainStrategy:
                     self.settings.dequeue_batch_size,
                     bar,
                     types.QueueExecutionMode.drain,
+                    dequeue_durations=self.dequeue_durations,
+                    job_duration=self.settings.job_duration,
+                    heartbeat_timeout=self.settings.heartbeat_timeout,
                 ).run()
                 for pgq in self.pgqs
             ]
             await asyncio.gather(*tasks)
             self.tqdm_format_dict.update(bar.format_dict)
         elapsed = datetime.now(UTC) - start
+        p50, p95, p99 = dequeue_latency_summary(self.dequeue_durations)
         return BenchmarkResult(
             created_at=datetime.now(UTC),
             driver=self.settings.driver,
             strategy=StrategyEnum.drain,
             elapsed=elapsed,
             github_ref_name=os.environ.get("REF_NAME", ""),
+            job_duration=self.settings.job_duration,
+            heartbeat_timeout=self.settings.heartbeat_timeout,
+            statement_cache_size=self.settings.statement_cache_size,
             queued=0,
             rate=self.settings.jobs / elapsed.total_seconds(),
             steps=self.settings.jobs,
+            dequeue_calls=len(self.dequeue_durations),
+            dequeue_p50_ms=p50,
+            dequeue_p95_ms=p95,
+            dequeue_p99_ms=p99,
         )
 
     async def teardown(self) -> None:  # pragma: no cover - nothing to clean up
@@ -544,7 +630,9 @@ class SerializeDrainStrategy:
             loop.add_signal_handler(sig, self.graceful_shutdown)
 
         self.settings.pretty_print()
-        queries = await make_queries(self.settings.driver)
+        queries = await make_queries(
+            self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+        )
         await queries.clear_statistics_log()
         await queries.clear_queue()
 
@@ -562,7 +650,12 @@ class SerializeDrainStrategy:
             qm.shutdown.set()
 
     async def run(self) -> BenchmarkResult:
-        queries = [await make_queries(self.settings.driver) for _ in range(self.settings.dequeue)]
+        queries = [
+            await make_queries(
+                self.settings.driver, statement_cache_size=self.settings.statement_cache_size
+            )
+            for _ in range(self.settings.dequeue)
+        ]
         for q in queries:
             self.pgqs.append(PgQueuer(q.driver, queries=q))
 
@@ -576,6 +669,8 @@ class SerializeDrainStrategy:
                     types.QueueExecutionMode.drain,
                     self.settings.serialize_dispatch_per_key,
                     self.dequeue_durations,
+                    job_duration=self.settings.job_duration,
+                    heartbeat_timeout=self.settings.heartbeat_timeout,
                 ).run()
                 for pgq in self.pgqs
             ]
@@ -589,6 +684,9 @@ class SerializeDrainStrategy:
             strategy=StrategyEnum.serialize_drain,
             elapsed=elapsed,
             github_ref_name=os.environ.get("REF_NAME", ""),
+            job_duration=self.settings.job_duration,
+            heartbeat_timeout=self.settings.heartbeat_timeout,
+            statement_cache_size=self.settings.statement_cache_size,
             queued=0,
             rate=self.settings.jobs / elapsed.total_seconds(),
             steps=self.settings.jobs,
@@ -636,6 +734,11 @@ def main(
         True,
         help="Enable per-key dispatch serialization for serialize-drain.",
     ),
+    statement_cache_size: int = typer.Option(100, min=0, help="Asyncpg statement cache entries."),
+    job_duration: float = typer.Option(0.0, min=0, help="Simulated I/O seconds per job."),
+    heartbeat_timeout: float = typer.Option(
+        30.0, min=0.01, help="Worker heartbeat timeout seconds."
+    ),
     output_json: Path | None = typer.Option(None),
     strategy: StrategyEnum = typer.Option(StrategyEnum.throughput, "-s", "--strategy"),
 ) -> None:
@@ -647,6 +750,9 @@ def main(
             dequeue=dequeue,
             dequeue_batch_size=dequeue_batch_size,
             output_json=output_json,
+            statement_cache_size=statement_cache_size,
+            job_duration=timedelta(seconds=job_duration),
+            heartbeat_timeout=timedelta(seconds=heartbeat_timeout),
         )
         strategy_impl: BenchmarkStrategy = DrainStrategy(drain_settings)
     elif strategy is StrategyEnum.serialize_drain:
@@ -660,6 +766,9 @@ def main(
             dequeue=dequeue,
             dequeue_batch_size=dequeue_batch_size,
             output_json=output_json,
+            statement_cache_size=statement_cache_size,
+            job_duration=timedelta(seconds=job_duration),
+            heartbeat_timeout=timedelta(seconds=heartbeat_timeout),
         )
         strategy_impl = SerializeDrainStrategy(serialize_settings)
     else:
@@ -672,6 +781,9 @@ def main(
             enqueue=enqueue,
             enqueue_batch_size=enqueue_batch_size,
             output_json=output_json,
+            statement_cache_size=statement_cache_size,
+            job_duration=timedelta(seconds=job_duration),
+            heartbeat_timeout=timedelta(seconds=heartbeat_timeout),
         )
         strategy_impl = ThroughputStrategy(tp_settings)
     runner = BenchmarkRunner(strategy=strategy_impl, output_json=output_json)

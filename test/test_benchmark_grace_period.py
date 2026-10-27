@@ -8,15 +8,70 @@ tasks can be cancelled and cleaned up properly.
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
+import pytest
+
+from pgqueuer import PgQueuer
+from pgqueuer.adapters.drivers.asyncpg import AsyncpgDriver
+from pgqueuer.adapters.inmemory import InMemoryDriver, InMemoryQueries
+from pgqueuer.domain.types import QueueExecutionMode
 from tools.benchmark import (
+    Consumer,
     DriverEnum,
     SerializeDrainSettings,
     SerializeKeyMode,
     StrategyEnum,
     dequeue_latency_summary,
+    job_progress_bar,
+    make_queries,
     serialize_keys_for,
 )
+
+
+@pytest.mark.parametrize("cache_size", [0, 100])
+async def test_benchmark_statement_cache_matches_configuration(dsn: str, cache_size: int) -> None:
+    repository = await make_queries(
+        driver=DriverEnum.apg, conninfo=dsn, statement_cache_size=cache_size
+    )
+    assert isinstance(repository.driver, AsyncpgDriver)
+    try:
+        await repository.driver.fetch("SELECT $1::integer AS value", 1)
+        prepared = await repository.driver.fetch("SELECT name FROM pg_prepared_statements")
+        assert bool(prepared) == bool(cache_size)
+    finally:
+        await repository.driver._connection.close()
+
+
+async def test_delayed_benchmark_job_writes_heartbeats() -> None:
+    queries = InMemoryQueries(driver=InMemoryDriver())
+    queue = PgQueuer(connection=queries.driver, queries=queries)
+    ids = await queue.qm.queries.enqueue("fetch", None)
+    picked = asyncio.Event()
+    queue.qm.on_dispatch = lambda _active, _maximum: picked.set()
+    with job_progress_bar(total=1) as bar:
+        consumer = Consumer(
+            pgq=queue,
+            batch_size=1,
+            bar=bar,
+            mode=QueueExecutionMode.drain,
+            job_duration=timedelta(seconds=1),
+            heartbeat_timeout=timedelta(milliseconds=200),
+        )
+        async with asyncio.timeout(3):
+            task = asyncio.create_task(consumer.run())
+            try:
+                await picked.wait()
+                original = queries.jobs[int(ids[0])].heartbeat
+                while queries.jobs[int(ids[0])].heartbeat == original:
+                    await asyncio.sleep(0.01)
+                assert not task.done()
+                await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        assert bar.n == 1
 
 
 def test_serialize_drain_key_modes() -> None:
