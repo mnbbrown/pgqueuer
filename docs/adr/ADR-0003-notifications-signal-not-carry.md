@@ -24,6 +24,11 @@ wake-up the worker always goes back to the queue table and claims work
 through the ordinary query (ADR-0002). A periodic poll runs regardless,
 so a worker that never hears a notification still finds the work.
 
+Each worker keeps at most one pending table-change notification. It consumes
+that hint before checking the queue. A change received during the check stays
+pending and causes another check. Cancellation and health-check messages are
+handled separately and are not coalesced.
+
 ## Consequences
 
 ### Positive consequences
@@ -40,8 +45,8 @@ so a worker that never hears a notification still finds the work.
   then the worker queries for the actual work.
 - Worst-case pickup latency for a missed notification is the poll
   interval, not zero.
-- A burst of enqueues produces a burst of notifications that all trigger
-  the same query; debouncing is needed to avoid redundant round-trips.
+- Workers still receive every notification on the shared channel, but coalesce
+  pending table changes to avoid a separate queue check for each one.
 
 ## Alternatives considered
 
