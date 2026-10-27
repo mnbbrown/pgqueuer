@@ -489,6 +489,7 @@ class QueueManager:
                 # flush; see docs/guides/heartbeat.md.
                 timeout=heartbeat_timeout / 8,
                 repository=self.queries,
+                queue_manager_id=self.queue_manager_id,
             ) as hbuff,
             self.queries.driver,
             # Inside the driver so draining jobs can still receive cancel NOTIFYs.
