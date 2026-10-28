@@ -45,3 +45,13 @@ Deferred jobs participate in the normal priority queue once their `execute_after
 # High priority but deferred: will jump the queue once eligible
 await queries.enqueue("urgent_task", b"data", priority=10, execute_after=timedelta(hours=1))
 ```
+
+## Deferred-job lookup
+
+Workers find the next deadline with one indexed lookup per registered entrypoint.
+Each lookup reads the earliest future queued job through the existing
+`(entrypoint, execute_after)` partial index. The query takes the minimum of these
+candidates. It does not scan and sort the full future backlog.
+
+The readiness checks, notification handling, and claiming rules do not change.
+No schema migration is required when the entrypoint/time index is installed.
