@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import get_args
 
 from pgqueuer.domain.schema.model import ColumnRef, EnumType, Retired, Schema
-from pgqueuer.domain.schema.notify import notify_function, notify_trigger
+from pgqueuer.domain.schema.notify import (
+    notify_function,
+    notify_trigger,
+    routed_notify_function,
+    routed_notify_triggers,
+)
 from pgqueuer.domain.schema.queue import queue_indexes, queue_table
 from pgqueuer.domain.schema.queue_log import queue_log_indexes, queue_log_table
 from pgqueuer.domain.schema.schedules import schedules_table
@@ -39,8 +44,18 @@ def target(settings: DBSettings) -> Schema:
         ),
         tables=tuple(sorted(tables, key=lambda table: table.name)),
         indexes=tuple(sorted(indexes, key=lambda entry: entry.name)),
-        functions=(notify_function(settings),),
-        triggers=(notify_trigger(settings),),
+        functions=tuple(
+            sorted(
+                (notify_function(settings), routed_notify_function(settings)),
+                key=lambda entry: entry.name,
+            )
+        ),
+        triggers=tuple(
+            sorted(
+                (notify_trigger(settings), *routed_notify_triggers(settings)),
+                key=lambda entry: entry.name,
+            )
+        ),
     )
 
 

@@ -91,6 +91,14 @@ class Trigger:
     name: TriggerName
     table: TableName
     function: FunctionName
+    events: tuple[Literal["INSERT", "UPDATE", "DELETE", "TRUNCATE"], ...] = (
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "TRUNCATE",
+    )
+    old_table: str | None = None
+    new_table: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)

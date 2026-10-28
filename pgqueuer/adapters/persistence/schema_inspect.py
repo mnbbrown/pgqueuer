@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel
 
@@ -72,6 +72,9 @@ class TriggerRow(BaseModel):
     name: str
     tbl: str
     function: str
+    events: tuple[Literal["INSERT", "UPDATE", "DELETE", "TRUNCATE"], ...]
+    old_table: str | None
+    new_table: str | None
 
 
 class FunctionRow(BaseModel):
@@ -162,7 +165,14 @@ class CatalogQueries:
 
     def triggers(self) -> str:
         return f"""
-        SELECT tg.tgname AS name, tbl.relname AS tbl, fn.proname AS function
+        SELECT tg.tgname AS name, tbl.relname AS tbl, fn.proname AS function,
+               array_remove(ARRAY[
+                   CASE WHEN tg.tgtype & 4 != 0 THEN 'INSERT' END,
+                   CASE WHEN tg.tgtype & 16 != 0 THEN 'UPDATE' END,
+                   CASE WHEN tg.tgtype & 8 != 0 THEN 'DELETE' END,
+                   CASE WHEN tg.tgtype & 32 != 0 THEN 'TRUNCATE' END
+               ], NULL) AS events,
+               tg.tgoldtable::text AS old_table, tg.tgnewtable::text AS new_table
         FROM pg_trigger tg
         JOIN pg_class tbl ON tbl.oid = tg.tgrelid
         JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
@@ -236,9 +246,11 @@ async def inspect(driver: Driver, settings: DBSettings) -> Schema:
     constraints = await rows_of(driver, ConstraintRow, queries.constraints(), table_names)
     sequences = await rows_of(driver, SequenceRow, queries.sequences(), table_names)
     enums = await rows_of(driver, EnumRow, queries.enums(), type_names)
-    triggers = await rows_of(driver, TriggerRow, queries.triggers(), [declared.triggers[0].name])
+    triggers = await rows_of(
+        driver, TriggerRow, queries.triggers(), [entry.name for entry in declared.triggers]
+    )
     functions = await rows_of(
-        driver, FunctionRow, queries.functions(), [declared.functions[0].name]
+        driver, FunctionRow, queries.functions(), [entry.name for entry in declared.functions]
     )
 
     return Schema(
@@ -251,6 +263,9 @@ async def inspect(driver: Driver, settings: DBSettings) -> Schema:
                 name=TriggerName(row.name),
                 table=TableName(row.tbl),
                 function=FunctionName(row.function),
+                events=row.events,
+                old_table=row.old_table,
+                new_table=row.new_table,
             )
             for row in triggers
             if row.tbl in table_names

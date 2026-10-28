@@ -279,3 +279,16 @@ PGQUEUER_SCHEMA=pgq pgq run my_app:main
 - [ ] Supervisor configured to restart workers on exit
 - [ ] `pgq upgrade` included in the deploy pipeline before rolling out new workers
 - [ ] `terminationGracePeriodSeconds` (or equivalent) set to cover longest expected job runtime
+
+## Task-scoped notifications
+
+The routing schema adds insert and delete statement triggers with transition
+tables. It retains the existing trigger name for TRUNCATE. Run `pgq upgrade`
+before starting new workers. Applications that own the schema must apply the
+equivalent DDL through their migration system instead.
+
+Old workers accept the added `entrypoints` field. New workers accept old hints
+without that field and wake all registered tasks. This permits a rolling deploy
+and a code rollback without a schema rollback. Cancellation and health checks
+use the existing shared channel. Fallback polling still discovers jobs if a hint
+is lost. Claims and heartbeats do not send notifications.

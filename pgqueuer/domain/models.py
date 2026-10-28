@@ -56,6 +56,16 @@ class TableChangedEvent(Event):
     type: Literal["table_changed_event"]
     operation: OPERATIONS
     table: str
+    entrypoints: list[QueueEntrypoint] | None = None
+
+    def notification_payload(self) -> str:
+        """Fall back to an unscoped hint if routing exceeds PostgreSQL's payload budget."""
+        payload = self.model_dump_json(exclude={"received_at"})
+        if len(payload.encode()) >= 7900 and self.entrypoints is not None:
+            return self.model_copy(update={"entrypoints": None}).model_dump_json(
+                exclude={"received_at"}
+            )
+        return payload
 
 
 class CancellationEvent(Event):

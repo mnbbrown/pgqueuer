@@ -29,6 +29,20 @@ that hint before checking the queue. A change received during the check stays
 pending and causes another check. Cancellation and health-check messages are
 handled separately and are not coalesced.
 
+Insert and delete statement triggers collect distinct task names from transition
+tables. Workers ignore scoped hints for tasks they do not register. A missing or
+null `entrypoints` field means broadcast, so old triggers and old workers remain
+compatible. A hint that would exceed the notification payload budget falls back
+to broadcast. Empty statements keep their legacy broadcast hint. This preserves
+capacity-release wakeups from old workers that hold failed jobs.
+
+Claims and heartbeats stay silent: there is no UPDATE trigger. Retry and requeue
+methods send explicit scoped hints after a successful update. Holding a failed
+job keeps the empty-delete broadcast because it releases capacity without deleting
+a row. TRUNCATE sends a
+broadcast hint. The legacy trigger function accepts its previous trigger shape
+during upgrades; its dead `OLD`/`NEW` comparison has been removed.
+
 ## Consequences
 
 ### Positive consequences
@@ -45,8 +59,8 @@ handled separately and are not coalesced.
   then the worker queries for the actual work.
 - Worst-case pickup latency for a missed notification is the poll
   interval, not zero.
-- Workers still receive every notification on the shared channel, but coalesce
-  pending table changes to avoid a separate queue check for each one.
+- Workers still receive every notification on the shared channel, but only
+  relevant hints wake the dequeue loop. Pending hints are coalesced.
 
 ## Alternatives considered
 

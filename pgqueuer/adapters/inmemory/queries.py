@@ -8,8 +8,6 @@ from datetime import timedelta
 from time import monotonic
 from typing import Literal, overload
 
-from pydantic_core import to_json
-
 from pgqueuer.adapters.inmemory.driver import InMemoryDriver
 from pgqueuer.adapters.inmemory.jobs import JobRow, JobTable
 from pgqueuer.adapters.inmemory.logs import LogBook
@@ -200,7 +198,7 @@ class InMemoryQueries:
                 entrypoint=row.entrypoint,
                 traceback=None,
             )
-        await self.emit_table_changed("insert")
+        await self.emit_table_changed("insert", sorted({row.entrypoint for row in result.created}))
         return result.ids
 
     async def dequeue(
@@ -255,9 +253,11 @@ class InMemoryQueries:
         ],
     ) -> None:
         now = utc_now()
+        changed: set[QueueEntrypoint] = set()
         for job, status, record in job_status:
             if not self.job_table.finish(job, status, now):
                 continue
+            changed.add(job.entrypoint)
             self.logs.append(
                 created=now,
                 job_id=int(job.id),
@@ -266,8 +266,7 @@ class InMemoryQueries:
                 entrypoint=job.entrypoint,
                 traceback=record.model_dump_json() if record else None,
             )
-        # The SQL DELETE runs on every call, and its statement trigger always notifies.
-        await self.emit_table_changed("delete")
+        await self.emit_table_changed("delete", sorted(changed))
 
     async def retry_job(
         self,
@@ -287,7 +286,7 @@ class InMemoryQueries:
             entrypoint=row.entrypoint,
             traceback=traceback_record.model_dump_json() if traceback_record else None,
         )
-        await self.emit_table_changed("update")
+        await self.emit_table_changed("update", [row.entrypoint])
 
     async def requeue_jobs(self, ids: list[JobId], reset_attempts: bool = True) -> None:
         pending = self.job_table.claim_requeue(
@@ -305,7 +304,7 @@ class InMemoryQueries:
                 entrypoint=row.entrypoint,
                 traceback=None,
             )
-            await self.emit_table_changed("update")
+            await self.emit_table_changed("update", [row.entrypoint])
 
     async def list_failed_jobs(
         self,
@@ -514,18 +513,20 @@ class InMemoryQueries:
             for name, rows in sorted(tables)
         ]
 
-    async def emit_table_changed(self, operation: types.OPERATIONS) -> None:
-        # Same keys as the Postgres trigger; the listener stamps received_at on parse.
-        payload = to_json(
-            {
-                "channel": self.qbq.settings.channel,
-                "operation": operation,
-                "sent_at": utc_now(),
-                "table": self.qbe.settings.queue_table,
-                "type": "table_changed_event",
-            }
-        ).decode()
-        await self.driver.notify(self.qbq.settings.channel, payload)
+    async def emit_table_changed(
+        self,
+        operation: types.OPERATIONS,
+        entrypoints: list[QueueEntrypoint] | None = None,
+    ) -> None:
+        event = models.TableChangedEvent(
+            channel=self.qbq.settings.channel,
+            operation=operation,
+            sent_at=utc_now(),
+            table=self.qbe.settings.queue_table,
+            type="table_changed_event",
+            entrypoints=entrypoints or None,
+        )
+        await self.driver.notify(self.qbq.settings.channel, event.notification_payload())
 
     async def insert_single_job(
         self,

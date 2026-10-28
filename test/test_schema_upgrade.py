@@ -131,7 +131,8 @@ async def test_two_installations_do_not_block_each_other(apgdriver: AsyncpgDrive
             False,
             (
                 "CREATE TRIGGER tg_pgqueuer_changed\n"
-                "AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON pgqueuer\n"
+                "AFTER TRUNCATE ON pgqueuer\n"
+                "FOR EACH STATEMENT\n"
                 "EXECUTE FUNCTION fn_pgqueuer_changed();",
             ),
             id="ours-missing",

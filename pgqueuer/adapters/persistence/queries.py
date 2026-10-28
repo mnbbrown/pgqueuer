@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 from time import monotonic, sleep
@@ -486,7 +486,7 @@ class Queries:
             job.queue_manager_id,
         )
         if retried:
-            await self.notify_table_changed("update")
+            await self.notify_table_changed("update", entrypoints=[job.entrypoint])
 
     async def requeue_jobs(self, ids: list[types.JobId], reset_attempts: bool = True) -> None:
         """Move failed jobs back to queued status for reprocessing.
@@ -497,9 +497,14 @@ class Queries:
         requeued = await self.driver.fetch(
             self.qbq.build_requeue_jobs_query(reset_attempts=reset_attempts), ids
         )
-        # The statement-level trigger cannot tell UPDATEs apart, so it stays silent on them.
+        # Claims and heartbeats stay silent; requeue explicitly wakes the affected tasks.
         if requeued:
-            await self.notify_table_changed("update")
+            await self.notify_table_changed(
+                "update",
+                entrypoints=sorted(
+                    {query_helpers.cell(row, "entrypoint", str) for row in requeued}
+                ),
+            )
 
     async def list_failed_jobs(
         self,
@@ -568,7 +573,11 @@ class Queries:
             ).model_dump_json(),
         )
 
-    async def notify_table_changed(self, operation: types.OPERATIONS) -> None:
+    async def notify_table_changed(
+        self,
+        operation: types.OPERATIONS,
+        entrypoints: Sequence[str] | None = None,
+    ) -> None:
         """Emit a ``table_changed_event`` NOTIFY, as the queue table trigger does."""
         await self.driver.notify(
             self.qbq.settings.channel,
@@ -578,7 +587,10 @@ class Queries:
                 type="table_changed_event",
                 operation=operation,
                 table=self.qbq.settings.queue_table,
-            ).model_dump_json(),
+                entrypoints=None
+                if entrypoints is None
+                else [types.QueueEntrypoint(name) for name in entrypoints],
+            ).notification_payload(),
         )
 
     async def notify_health_check(self, health_check_event_id: HealthCheckId) -> None:
@@ -782,7 +794,7 @@ class Queries:
         limit: int = 50,
         offset: int = 0,
         statuses: list[types.JOB_STATUS] | None = None,
-        entrypoints: list[str] | None = None,
+        entrypoints: Sequence[str] | None = None,
     ) -> list[models.Job]:
         """Paginated queue rows, optionally filtered by status and entrypoint."""
         rows = await self.driver.fetch(
@@ -915,7 +927,7 @@ class Queries:
 
     async def list_blocked_keys(
         self,
-        entrypoints: list[str] | None = None,
+        entrypoints: Sequence[str] | None = None,
         limit: int = 100,
     ) -> list[models.BlockedKey]:
         """List ``serialize_key``s with eligible queued jobs currently blocked.
