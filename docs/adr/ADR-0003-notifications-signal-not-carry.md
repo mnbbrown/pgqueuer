@@ -33,11 +33,13 @@ Insert and delete statement triggers collect distinct task names from transition
 tables. Workers ignore scoped hints for tasks they do not register. A missing or
 null `entrypoints` field means broadcast, so old triggers and old workers remain
 compatible. A hint that would exceed the notification payload budget falls back
-to broadcast. Empty statements emit no hint.
+to broadcast. Empty statements keep their legacy broadcast hint. This preserves
+capacity-release wakeups from old workers that hold failed jobs.
 
 Claims and heartbeats stay silent: there is no UPDATE trigger. Retry and requeue
 methods send explicit scoped hints after a successful update. Holding a failed
-job sends a scoped hint because it releases capacity without deleting a row. TRUNCATE sends a
+job keeps the empty-delete broadcast because it releases capacity without deleting
+a row. TRUNCATE sends a
 broadcast hint. The legacy trigger function accepts its previous trigger shape
 during upgrades; its dead `OLD`/`NEW` comparison has been removed.
 

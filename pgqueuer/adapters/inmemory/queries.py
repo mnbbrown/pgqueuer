@@ -518,15 +518,13 @@ class InMemoryQueries:
         operation: types.OPERATIONS,
         entrypoints: list[QueueEntrypoint] | None = None,
     ) -> None:
-        if entrypoints == []:
-            return
         event = models.TableChangedEvent(
             channel=self.qbq.settings.channel,
             operation=operation,
             sent_at=utc_now(),
             table=self.qbe.settings.queue_table,
             type="table_changed_event",
-            entrypoints=entrypoints,
+            entrypoints=entrypoints or None,
         )
         await self.driver.notify(self.qbq.settings.channel, event.notification_payload())
 

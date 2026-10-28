@@ -128,12 +128,13 @@ async def test_large_routing_envelope_falls_back_to_broadcast(apgdriver: Asyncpg
     assert events[0].entrypoints is None
 
 
-async def test_zero_row_changes_do_not_wake_workers(apgdriver: AsyncpgDriver) -> None:
+async def test_zero_row_changes_keep_legacy_broadcast(apgdriver: AsyncpgDriver) -> None:
     queries = Queries(apgdriver)
     events = await table_changes(queries)
     await apgdriver.execute("DELETE FROM pgqueuer WHERE false")
     await asyncio.sleep(0.02)
-    assert events == []
+    assert len(events) == 1
+    assert events[0].entrypoints is None
 
 
 async def test_legacy_trigger_still_works_with_replaced_function(apgdriver: AsyncpgDriver) -> None:
@@ -268,7 +269,7 @@ async def test_held_failure_notifies_workers_after_releasing_capacity(
     await queries.log_jobs([(first[0], "failed", None)])
     await asyncio.sleep(0.02)
     assert len(events) == 1
-    assert events[0].entrypoints == ["ours"]
+    assert events[0].entrypoints is None
     remaining = await queries.dequeue(
         batch_size=1,
         entrypoints=parameters,

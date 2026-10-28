@@ -465,10 +465,6 @@ class Queries:
             [tb.model_dump_json() if tb else None for _, _, tb in job_status],
             [job.queue_manager_id for job, _, _ in job_status],
         )
-        held = sorted({job.entrypoint for job, status, _ in job_status if status == "failed"})
-        if held:
-            # Holding a failure frees capacity without deleting a queue row.
-            await self.notify_table_changed("update", entrypoints=held)
 
     async def retry_job(
         self,

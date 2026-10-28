@@ -57,9 +57,6 @@ def routed_notify_function(settings: DBSettings) -> Function:
             BEGIN
                 SELECT array_agg(entrypoint ORDER BY entrypoint) INTO entrypoints
                 FROM (SELECT DISTINCT entrypoint FROM pgqueuer_changed_rows) AS changed;
-                IF entrypoints IS NULL THEN
-                    RETURN NULL;
-                END IF;
                 payload := json_build_object(
                     'channel', '{settings.channel}',
                     'operation', lower(TG_OP),
