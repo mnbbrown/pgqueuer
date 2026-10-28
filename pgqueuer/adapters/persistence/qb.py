@@ -1004,14 +1004,27 @@ class QueryQueueBuilder:
         ORDER  BY job_id, created DESC, id DESC;
         """
 
-    def build_next_deferred_eta_query(self) -> str:
-        return f"""SELECT execute_after - NOW() AS eta
-        FROM {self.qualified.queue_table}
-        WHERE status = 'queued'
-          AND NOT ({self.due()})
-          AND entrypoint = ANY($1)
-        ORDER BY execute_after
-        LIMIT 1
+    def build_next_deferred_eta_query(self, *, single_entrypoint: bool = False) -> str:
+        if single_entrypoint:
+            return f"""SELECT execute_after - NOW() AS eta
+            FROM {self.qualified.queue_table}
+            WHERE status = 'queued'
+              AND NOT ({self.due()})
+              AND entrypoint = $1
+            ORDER BY execute_after
+            LIMIT 1
+            """
+        return f"""SELECT min(candidate.execute_after) - NOW() AS eta
+        FROM unnest($1::text[]) AS registered(entrypoint)
+        CROSS JOIN LATERAL (
+            SELECT execute_after
+            FROM {self.qualified.queue_table}
+            WHERE status = 'queued'
+              AND NOT ({self.due()})
+              AND entrypoint = registered.entrypoint
+            ORDER BY execute_after
+            LIMIT 1
+        ) AS candidate
         """
 
     def build_job_duration_percentiles_query(self) -> str:

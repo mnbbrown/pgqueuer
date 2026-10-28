@@ -150,6 +150,25 @@ async def test_next_deferred_eta_returns_soonest_of_many(apgdriver: Driver) -> N
     assert 20 < eta.total_seconds() <= 30
 
 
+async def test_next_deferred_eta_filters_each_entrypoint_before_taking_minimum(
+    apgdriver: Driver,
+) -> None:
+    q = Queries(apgdriver)
+    await q.enqueue(
+        ["foo", "foo", "bar", "other"],
+        [None] * 4,
+        [0] * 4,
+        [timedelta(seconds=delay) for delay in (-1, 60, 30, 1)],
+    )
+    eta = await q.next_deferred_eta([QueueEntrypoint("foo"), QueueEntrypoint("bar")])
+    assert eta is not None
+    assert 25 < eta.total_seconds() <= 30
+    duplicate = await q.next_deferred_eta([QueueEntrypoint("foo")] * 2)
+    assert duplicate is not None
+    assert 55 < duplicate.total_seconds() <= 60
+    assert await q.next_deferred_eta([]) is None
+
+
 async def test_next_deferred_eta_inmemory(queries: InMemoryQueries) -> None:
     await queries.enqueue("ep", None, 0, timedelta(seconds=10))
     eta = await queries.next_deferred_eta([QueueEntrypoint("ep")])

@@ -691,7 +691,11 @@ class Queries:
 
     async def next_deferred_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
         """Return time until the soonest deferred job becomes eligible, or None."""
-        rows = await self.driver.fetch(self.qbq.build_next_deferred_eta_query(), entrypoints)
+        single_entrypoint = len(entrypoints) == 1
+        rows = await self.driver.fetch(
+            self.qbq.build_next_deferred_eta_query(single_entrypoint=single_entrypoint),
+            entrypoints[0] if single_entrypoint else entrypoints,
+        )
         if not rows or rows[0]["eta"] is None:
             return None
         return cell(rows[0], "eta", timedelta)
