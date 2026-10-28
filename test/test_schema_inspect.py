@@ -33,6 +33,10 @@ async def test_durability_round_trips(apgdriver: AsyncpgDriver, durability: str)
     [
         pytest.param(DBSettings(prefix="acme_", db_schema="billing"), id="scoped"),
         pytest.param(
+            DBSettings(db_schema="long_names", function="f" * 63, trigger="t" * 63),
+            id="long-routine-names",
+        ),
+        pytest.param(
             DBSettings(prefix="acme_", db_schema="billing", queue_status_type="status"),
             id="enum-named-like-its-column",
         ),

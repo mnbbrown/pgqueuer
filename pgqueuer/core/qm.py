@@ -518,6 +518,7 @@ class QueueManager:
                     notice_event_queue=notice_event_listener,
                     canceled=self.job_context,
                     pending_health_check=self.pending_health_check,
+                    entrypoints=self.entrypoint_registry.keys(),
                 ),
             )
 

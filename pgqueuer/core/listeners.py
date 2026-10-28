@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, MutableMapping, Set as AbstractSet
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import assert_never
@@ -45,10 +45,17 @@ def default_event_router(
     pending_health_check: MutableMapping[
         types.HealthCheckId, asyncio.Future[models.HealthCheckEvent]
     ],
+    entrypoints: AbstractSet[types.QueueEntrypoint] | None = None,
 ) -> EventRouter:
     """Return an `EventRouter` wired with handlers for all known event types."""
 
     def on_table_changed(evt: models.TableChangedEvent) -> None:
+        if (
+            entrypoints is not None
+            and evt.entrypoints is not None
+            and entrypoints.isdisjoint(evt.entrypoints)
+        ):
+            return
         if notice_event_queue.empty():
             notice_event_queue.put_nowait(evt)
 

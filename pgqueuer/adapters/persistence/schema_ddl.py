@@ -94,9 +94,16 @@ def render_function(entry: Function, settings: DBSettings, *, replace: bool = Fa
 
 def render_trigger(entry: Trigger, settings: DBSettings, *, replace: bool = False) -> str:
     create = "CREATE OR REPLACE TRIGGER" if replace else "CREATE TRIGGER"
+    references = []
+    if entry.old_table is not None:
+        references.append(f"OLD TABLE AS {entry.old_table}")
+    if entry.new_table is not None:
+        references.append(f"NEW TABLE AS {entry.new_table}")
+    referencing = f"REFERENCING {' '.join(references)}\n" if references else ""
     return (
         f"{create} {entry.name}\n"
-        f"AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON {settings.qualify(entry.table)}\n"
+        f"AFTER {' OR '.join(entry.events)} ON {settings.qualify(entry.table)}\n"
+        f"{referencing}FOR EACH STATEMENT\n"
         f"EXECUTE FUNCTION {settings.qualify(entry.function)}();"
     )
 

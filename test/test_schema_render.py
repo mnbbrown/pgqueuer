@@ -56,7 +56,7 @@ def test_uninstall_drops_dependents_first_and_the_retired_type() -> None:
     lines = render_uninstall(DBSettings()).splitlines()
     assert all(line.startswith("DROP ") for line in lines)
     kinds = [line.split()[1] for line in lines]
-    assert kinds == ["TRIGGER", "FUNCTION"] + ["TABLE"] * 4 + ["TYPE"] * 2
+    assert kinds == ["TRIGGER"] * 3 + ["FUNCTION"] * 2 + ["TABLE"] * 4 + ["TYPE"] * 2
     assert "DROP TYPE IF EXISTS pgqueuer_statistics_status;" in lines
 
 

@@ -882,7 +882,7 @@ class QueryQueueBuilder:
         )
         INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority, traceback)
         SELECT id, 'queued', entrypoint, priority, $3::JSONB FROM retry
-        RETURNING job_id
+        RETURNING job_id, entrypoint
         """  # noqa: E501
 
     def build_requeue_jobs_query(self, reset_attempts: bool = True) -> str:
@@ -896,7 +896,7 @@ class QueryQueueBuilder:
         )
         INSERT INTO {self.qualified.queue_table_log} (job_id, status, entrypoint, priority)
         SELECT id, 'queued', entrypoint, priority FROM requeued
-        RETURNING job_id
+        RETURNING job_id, entrypoint
         """
 
     def build_list_failed_jobs_query(self, order: SortOrder = "DESC") -> str:

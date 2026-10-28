@@ -1138,7 +1138,14 @@ async def test_table_changed_notification(queries: InMemoryQueries, driver: InMe
     await queries.enqueue("ep", None)
     assert any("table_changed_event" in n for n in notifications)
     # Same keys as the Postgres trigger, so received_at is stamped by the listener.
-    assert {*json.loads(notifications[-1])} == {"channel", "operation", "sent_at", "table", "type"}
+    assert {*json.loads(notifications[-1])} == {
+        "channel",
+        "operation",
+        "sent_at",
+        "table",
+        "type",
+        "entrypoints",
+    }
 
 
 async def test_health_check_notification(queries: InMemoryQueries, driver: InMemoryDriver) -> None:

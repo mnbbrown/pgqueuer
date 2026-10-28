@@ -63,8 +63,8 @@ def test_empty_database_plans_every_object() -> None:
     assert sum(one.startswith("CREATE TYPE") for one in statements) == len(schema.enums)
     assert sum("CREATE TABLE" in one for one in statements) == len(schema.tables)
     assert sum("INDEX" in one for one in statements) == len(schema.indexes)
-    assert sum(one.startswith("CREATE FUNCTION") for one in statements) == 1
-    assert sum(one.startswith("CREATE TRIGGER") for one in statements) == 1
+    assert sum(one.startswith("CREATE FUNCTION") for one in statements) == len(schema.functions)
+    assert sum(one.startswith("CREATE TRIGGER") for one in statements) == len(schema.triggers)
 
 
 def test_objects_are_created_in_dependency_order() -> None:
@@ -552,8 +552,8 @@ def test_a_changed_function_body_is_replaced_not_recreated() -> None:
     )
 
     statements = plan(live, schema, settings).statements
-    assert len(statements) == 1
-    assert statements[0].startswith("CREATE OR REPLACE FUNCTION")
+    assert len(statements) == len(schema.functions)
+    assert all(statement.startswith("CREATE OR REPLACE FUNCTION") for statement in statements)
 
 
 def test_a_changed_trigger_is_replaced_not_recreated() -> None:
@@ -568,8 +568,8 @@ def test_a_changed_trigger_is_replaced_not_recreated() -> None:
     )
 
     statements = plan(live, schema, settings).statements
-    assert len(statements) == 1
-    assert statements[0].startswith("CREATE OR REPLACE TRIGGER")
+    assert len(statements) == len(schema.triggers)
+    assert all(statement.startswith("CREATE OR REPLACE TRIGGER") for statement in statements)
 
 
 def test_function_bodies_compare_on_tokens_not_indentation() -> None:
