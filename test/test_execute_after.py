@@ -220,7 +220,7 @@ async def test_effective_dequeue_timeout_toctou_fallback() -> None:
     with patch.object(
         pq.qm.queries, "next_deferred_eta", new_callable=AsyncMock, return_value=None
     ):
-        timeout = await pq.qm._effective_dequeue_timeout(full_timeout)
+        timeout = await pq.qm.legacy_dequeue_timeout([QueueEntrypoint("ep")], full_timeout)
 
     # With the fix, queued_work > 0 triggers a short timeout.
     # Without the fix, the full 30s would be returned.
@@ -248,7 +248,7 @@ async def test_effective_dequeue_timeout_deferred_job_crossing_eligibility() -> 
         patch.object(pq.qm.queries, "eligible_queued_work", new_callable=AsyncMock, return_value=0),
         patch.object(pq.qm.queries, "next_deferred_eta", new_callable=AsyncMock, return_value=None),
     ):
-        timeout = await pq.qm._effective_dequeue_timeout(timedelta(seconds=30))
+        timeout = await pq.qm.legacy_dequeue_timeout([QueueEntrypoint("ep")], timedelta(seconds=30))
 
     assert timeout == pq.qm.min_dequeue_poll_interval, (
         f"Expected fast re-poll for job crossing eligibility, got {timeout}"

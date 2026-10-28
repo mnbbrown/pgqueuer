@@ -25,7 +25,7 @@ from pgqueuer.core import (
 )
 from pgqueuer.domain import errors, models, types
 from pgqueuer.ports import RepositoryPort, tracing
-from pgqueuer.ports.repository import EntrypointExecutionParameter
+from pgqueuer.ports.repository import EntrypointExecutionParameter, QueueWakeupPort
 
 
 @dataclasses.dataclass
@@ -423,20 +423,35 @@ class QueueManager:
             await periodic_health_check_task
 
     async def _effective_dequeue_timeout(self, dequeue_timeout: timedelta) -> timedelta:
-        """Return a potentially shortened timeout if work is ready or a deferred job is due soon."""
-        entrypoints = list(self.entrypoint_registry.keys())
-        # A job may have become eligible between the preceding dequeue and this
-        # check (TOCTOU), and its notification may already have been consumed by
-        # the per-dispatch drain. Eligible work always warrants a fast re-poll,
-        # even when deferred jobs exist.
+        """Return the next retry delay without splitting readiness and timer snapshots."""
+        entrypoints = list(self.entrypoint_registry)
+        if not entrypoints:
+            return dequeue_timeout
+        if not isinstance(self.queries, QueueWakeupPort):
+            return await self.legacy_dequeue_timeout(entrypoints, dequeue_timeout)
+        started = perf_counter()
+        eta = await self.queries.next_queued_eta(entrypoints)
+        if eta is None:
+            return dequeue_timeout
+        eta -= timedelta(seconds=perf_counter() - started)
+        if eta <= timedelta(0):
+            return self.min_dequeue_poll_interval
+        return (
+            max(eta, self.min_dequeue_poll_interval) if eta < dequeue_timeout else dequeue_timeout
+        )
+
+    async def legacy_dequeue_timeout(
+        self,
+        entrypoints: list[types.QueueEntrypoint],
+        dequeue_timeout: timedelta,
+    ) -> timedelta:
+        """Preserve the existing probes for repositories without QueueWakeupPort."""
         if await self.queries.eligible_queued_work(entrypoints) > 0:
             return self.min_dequeue_poll_interval
         eta = await self.queries.next_deferred_eta(entrypoints)
         if eta is not None and eta < dequeue_timeout:
             return max(eta, self.min_dequeue_poll_interval)
-        # A deferred job can cross its execute_after between the two probes
-        # above: the eligibility probe still saw it as deferred, the eta probe
-        # no longer sees it as future. queued_work counts both, closing the gap.
+        # Eligibility can change between the preceding two snapshots.
         if eta is None and await self.queries.queued_work(entrypoints) > 0:
             return self.min_dequeue_poll_interval
         return dequeue_timeout

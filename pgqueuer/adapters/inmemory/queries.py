@@ -433,6 +433,9 @@ class InMemoryQueries:
     async def clear_queue_log(self, entrypoint: str | list[str] | None = None) -> None:
         self.logs.clear_entries(entrypoints_of(entrypoint))
 
+    async def next_queued_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
+        return self.job_table.next_queued_eta(entrypoints, utc_now())
+
     async def next_deferred_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
         """Return time until the soonest deferred job becomes eligible, or None."""
         return self.job_table.next_deferred_eta(entrypoints, utc_now())

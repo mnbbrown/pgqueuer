@@ -1004,6 +1004,18 @@ class QueryQueueBuilder:
         ORDER  BY job_id, created DESC, id DESC;
         """
 
+    def build_next_queued_eta_query(self) -> str:
+        return f"""SELECT min(candidate.execute_after) - NOW() AS eta
+        FROM unnest($1::text[]) AS registered(entrypoint)
+        CROSS JOIN LATERAL (
+            SELECT execute_after
+            FROM {self.qualified.queue_table}
+            WHERE status = 'queued' AND entrypoint = registered.entrypoint
+            ORDER BY execute_after
+            LIMIT 1
+        ) AS candidate
+        """
+
     def build_next_deferred_eta_query(self) -> str:
         return f"""SELECT execute_after - NOW() AS eta
         FROM {self.qualified.queue_table}

@@ -159,6 +159,18 @@ async def test_next_deferred_eta_uses_execute_after_index(apgdriver: db.Driver) 
     assert any(n.get("Node Type") == "Limit" for n in nodes), "eta lost its LIMIT shape"
 
 
+async def test_queued_eta_reads_one_row_per_entrypoint(apgdriver: db.Driver) -> None:
+    """A large future backlog must not be scanned and sorted just to find its first deadline."""
+    await _bulk_seed(apgdriver, rows=BULK_ROWS, n_eps=BULK_EPS)
+    await apgdriver.execute(f"UPDATE {QUEUE_TABLE} SET execute_after = NOW() + interval '1 hour'")
+    q = queries.Queries(apgdriver)
+    entrypoints = [QueueEntrypoint(f"ep_{i}") for i in range(BULK_EPS)]
+    nodes = await _analyze_nodes(apgdriver, q.qbq.build_next_queued_eta_query(), entrypoints)
+    assert _rows_scanned(nodes) <= BULK_EPS, _scan_summary(nodes)
+    assert not any(node["Node Type"] == "Sort" for node in nodes)
+    assert any(node.get("Index Name") == EP_EA_IDX for node in nodes)
+
+
 async def test_has_queued_work_is_existence_probe(apgdriver: db.Driver) -> None:
     """has_queued_work keeps its LIMIT 1 existence shape, not a full COUNT(*) (#668)."""
     q = await _seed(apgdriver)

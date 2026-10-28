@@ -596,6 +596,22 @@ class JobTable:
             for job in self.rows.values()
         )
 
+    def next_queued_eta(
+        self,
+        entrypoints: list[QueueEntrypoint],
+        now: datetime,
+    ) -> timedelta | None:
+        wanted = set(entrypoints)
+        earliest = min(
+            (
+                row.execute_after
+                for row in self.rows.values()
+                if row.status == "queued" and row.entrypoint in wanted
+            ),
+            default=None,
+        )
+        return None if earliest is None else earliest - now
+
     def next_deferred_eta(
         self,
         entrypoints: list[QueueEntrypoint],

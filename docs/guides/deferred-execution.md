@@ -45,3 +45,21 @@ Deferred jobs participate in the normal priority queue once their `execute_after
 # High priority but deferred: will jump the queue once eligible
 await queries.enqueue("urgent_task", b"data", priority=10, execute_after=timedelta(hours=1))
 ```
+
+## Worker wakeup queries
+
+After an empty dequeue, built-in repositories read the earliest queued timestamp
+for each registered entrypoint through the `(entrypoint, execute_after)` partial
+index. The minimum of those timestamps covers both ready and future work in one
+snapshot. Each entrypoint contributes at most one candidate, regardless of its
+future backlog. This query does not claim jobs or change their priority.
+
+The worker subtracts probe duration from the returned ETA, retains the minimum
+retry delay for ready work,
+and caps its sleep at the configured fallback interval. Notifications received
+during a query stay pending and interrupt the wait.
+
+`QueueWakeupPort.next_queued_eta` is optional. Custom repositories without it
+retain the existing readiness and deferred-ETA probes. The existing
+`next_deferred_eta` method still returns future work only. No schema migration
+is required when the entrypoint/time index is already installed.

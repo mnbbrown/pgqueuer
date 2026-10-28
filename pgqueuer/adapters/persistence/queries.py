@@ -689,6 +689,11 @@ class Queries:
             for row in (models.JobStatusRow.model_validate(r) for r in rows)
         ]
 
+    async def next_queued_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
+        """Return the earliest queued ETA, including ready work, in one snapshot."""
+        rows = await self.driver.fetch(self.qbq.build_next_queued_eta_query(), entrypoints)
+        return None if rows[0]["eta"] is None else cell(rows[0], "eta", timedelta)
+
     async def next_deferred_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
         """Return time until the soonest deferred job becomes eligible, or None."""
         rows = await self.driver.fetch(self.qbq.build_next_deferred_eta_query(), entrypoints)

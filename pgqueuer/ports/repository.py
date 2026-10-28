@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import timedelta
-from typing import Literal, Protocol, overload
+from typing import Literal, Protocol, overload, runtime_checkable
 
 from pgqueuer.domain import models, types
 from pgqueuer.domain.settings import DBSettings
@@ -31,6 +31,15 @@ class EntrypointExecutionParameter:
 
     concurrency_limit: int
     serialize_dispatch_per_key: bool = False
+
+
+@runtime_checkable
+class QueueWakeupPort(Protocol):
+    """Optional single-snapshot wakeup probe for queue repositories."""
+
+    async def next_queued_eta(self, entrypoints: list[QueueEntrypoint]) -> timedelta | None:
+        """Return the earliest queued ETA, including zero/past ETAs, or None."""
+        ...
 
 
 class QueueRepositoryPort(Protocol):
