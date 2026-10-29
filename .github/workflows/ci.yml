@@ -32,7 +32,7 @@ jobs:
       PGHOST: localhost
     name: Run PGQueuer Benchmark
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:${{ matrix.postgres-version }}

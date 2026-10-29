@@ -9,7 +9,7 @@ from itertools import chain
 import pytest
 
 from pgqueuer.db import Driver
-from pgqueuer.domain.types import QueueEntrypoint, QueueManagerId
+from pgqueuer.domain.types import QueueEntrypoint, QueueExecutionMode, QueueManagerId
 from pgqueuer.models import Job
 from pgqueuer.qm import QueueManager
 from pgqueuer.queries import EntrypointExecutionParameter, Queries
@@ -23,6 +23,8 @@ async def raises(lock: asyncio.Lock) -> None:
 async def consumer(
     qm: QueueManager,
     lock: asyncio.Lock,
+    *,
+    mode: QueueExecutionMode = QueueExecutionMode.continuous,
 ) -> defaultdict[str, list[Job]]:
     consumed = defaultdict[str, list[Job]](list)
 
@@ -37,7 +39,7 @@ async def consumer(
         consumed["serialized_dispatch_false"].append(job)
         await asyncio.sleep(0.1)
 
-    await qm.run(dequeue_timeout=timedelta(seconds=0))
+    await qm.run(dequeue_timeout=timedelta(seconds=0), mode=mode)
     return consumed
 
 
@@ -204,24 +206,11 @@ async def test_single_consumer_serialized_behavior(
     apgdriver: Driver,
 ) -> None:
     n_tasks = 50
-    wait = 10
-    n_consumers = 1
     lock = asyncio.Lock()
     await enqueue(Queries(apgdriver), size=n_tasks)
-    qms = [QueueManager(Queries(apgdriver)) for _ in range(n_consumers)]
+    qm = QueueManager(Queries(apgdriver))
 
-    async def dequeue() -> list[defaultdict[str, list[Job]]]:
-        consumers = [consumer(q, lock) for q in qms]
-        return await asyncio.gather(*consumers)
+    async with asyncio.timeout(15):
+        consumed = await consumer(qm=qm, lock=lock, mode=QueueExecutionMode.drain)
 
-    async def timer() -> None:
-        await asyncio.sleep(wait)
-        for q in qms:
-            q.shutdown.set()
-
-    _, consumed = await asyncio.gather(timer(), dequeue())
-    serialized_dispatch_true = list(
-        chain.from_iterable(x["serialized_dispatch_true"] for x in consumed)
-    )
-    # Verify that all jobs were processed sequentially by a single consumer
-    assert len(serialized_dispatch_true) == n_tasks
+    assert len(consumed["serialized_dispatch_true"]) == n_tasks

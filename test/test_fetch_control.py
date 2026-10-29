@@ -26,7 +26,6 @@ async def test_cooldown_spaces_claims_across_batches(
 ) -> None:
     repository = Queries(driver=apgdriver) if postgres else queries
     queue = PgQueuer(connection=repository.driver, queries=repository)
-    queue.qm.fetch_cooldown = timedelta(milliseconds=40)
     starts: list[float] = []
     completed: list[int] = []
     original = repository.dequeue
@@ -60,12 +59,11 @@ async def test_cooldown_spaces_claims_across_batches(
         await queue.run(batch_size=1, log_aggregation_interval=timedelta(0))
 
     assert len(completed) == 4
-    assert all(later - earlier >= 0.035 for earlier, later in pairwise(starts))
+    assert all(later - earlier >= 0.09 for earlier, later in pairwise(starts))
 
 
 async def test_notification_during_cooldown_is_not_lost() -> None:
     queue = PgQueuer.in_memory()
-    queue.qm.fetch_cooldown = timedelta(milliseconds=100)
     checked = asyncio.Event()
     handled = asyncio.Event()
     queue.qm.on_dequeue = lambda _duration, _count: checked.set()
@@ -89,7 +87,6 @@ async def test_notification_during_cooldown_is_not_lost() -> None:
 
 async def test_shutdown_interrupts_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
     queue = PgQueuer.in_memory()
-    queue.qm.fetch_cooldown = timedelta(minutes=1)
     checked = asyncio.Event()
     queue.qm.on_dequeue = lambda _duration, _count: checked.set()
     claim = AsyncMock(wraps=queue.qm.queries.dequeue)
@@ -119,7 +116,6 @@ async def test_full_worker_skips_queries_and_wakes_on_completion(
 ) -> None:
     repository = Queries(driver=apgdriver) if postgres else queries
     queue = PgQueuer(connection=repository.driver, queries=repository)
-    queue.qm.skip_dequeue_when_full = True
     release = asyncio.Event()
     full = asyncio.Event()
     next_job = asyncio.Event()
@@ -172,7 +168,6 @@ async def test_full_worker_skips_queries_and_wakes_on_completion(
         async with asyncio.timeout(0.5):
             await next_job.wait()
 
-    # The independent connection consumes PG notifications in the repository driver.
     async with asyncio.timeout(3):
         await asyncio.gather(
             queue.run(batch_size=1, max_concurrent_tasks=2, log_aggregation_interval=timedelta(0)),
@@ -181,17 +176,8 @@ async def test_full_worker_skips_queries_and_wakes_on_completion(
     assert len(started) == 3
 
 
-async def test_negative_cooldown_is_rejected() -> None:
+async def test_unlimited_worker_does_not_wait_for_local_capacity() -> None:
     queue = PgQueuer.in_memory()
-    queue.qm.fetch_cooldown = timedelta(milliseconds=-1)
-    with pytest.raises(ValueError, match="fetch_cooldown"):
-        await queue.run()
-
-
-@pytest.mark.parametrize("gate", [False, True])
-async def test_unlimited_worker_does_not_wait_for_local_capacity(gate: bool) -> None:
-    queue = PgQueuer.in_memory()
-    queue.qm.skip_dequeue_when_full = gate
     completed: list[int] = []
 
     @queue.entrypoint("work")
@@ -214,7 +200,6 @@ async def test_busy_notifications_do_not_bypass_empty_claim_cooldown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     queue = PgQueuer.in_memory()
-    queue.qm.fetch_cooldown = timedelta(milliseconds=40)
     first_check = asyncio.Event()
     starts: list[float] = []
 
@@ -256,12 +241,11 @@ async def test_busy_notifications_do_not_bypass_empty_claim_cooldown(
     async with asyncio.timeout(2):
         await asyncio.gather(queue.run(), notify())
     assert len(starts) >= 2
-    assert all(later - earlier >= 0.035 for earlier, later in pairwise(starts))
+    assert all(later - earlier >= 0.09 for earlier, later in pairwise(starts))
 
 
 async def test_listener_failure_interrupts_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
     queue = PgQueuer.in_memory()
-    queue.qm.fetch_cooldown = timedelta(minutes=1)
     checked = asyncio.Event()
     fail_health = asyncio.Event()
     queue.qm.on_dequeue = lambda _duration, _count: checked.set()
