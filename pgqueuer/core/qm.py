@@ -603,6 +603,8 @@ class QueueManager:
         job: models.Job,
         delay: timedelta,
         traceback_record: models.TracebackRecord,
+        *,
+        increment_attempts: bool = True,
     ) -> None:
         """Persist a requested retry until the write succeeds.
 
@@ -613,7 +615,16 @@ class QueueManager:
         cap = timedelta(seconds=1)
         while True:
             try:
-                await self.queries.retry_job(job, delay, traceback_record)
+                # Preserve the legacy call shape for repositories overriding retry_job.
+                if increment_attempts:
+                    await self.queries.retry_job(job, delay, traceback_record)
+                else:
+                    await self.queries.retry_job(
+                        job,
+                        delay,
+                        traceback_record,
+                        increment_attempts=False,
+                    )
             except Exception:
                 logconfig.logger.exception(
                     "Retry write failed for entrypoint/job-id: %s/%s",
@@ -687,7 +698,10 @@ class QueueManager:
                 )
                 # Release before re-queueing, or our own dequeue skips the re-picked row.
                 self.job_context.pop(job.id, None)
-                await self.write_retry(job, retry_exc.delay, tbr)
+                if isinstance(retry_exc, errors.DelayRequested):
+                    await self.write_retry(job, retry_exc.delay, tbr, increment_attempts=False)
+                else:
+                    await self.write_retry(job, retry_exc.delay, tbr)
             except asyncio.CancelledError:
                 logconfig.logger.debug(
                     "Job canceled mid-flight for entrypoint/id: %s/%s",

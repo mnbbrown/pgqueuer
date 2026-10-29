@@ -273,9 +273,11 @@ class InMemoryQueries:
         job: models.Job,
         delay: timedelta,
         traceback_record: models.TracebackRecord | None,
+        *,
+        increment_attempts: bool = True,
     ) -> None:
         now = utc_now()
-        row = self.job_table.retry(job, delay, now)
+        row = self.job_table.retry(job, delay, now, increment_attempts=increment_attempts)
         if row is None:
             return
         self.logs.append(

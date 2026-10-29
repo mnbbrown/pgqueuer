@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pgqueuer.domain.errors import (
+    DelayRequested,
     DuplicateJobError,
     FailingListenerError,
     NonRetryableError,
@@ -12,6 +13,7 @@ from pgqueuer.domain.errors import (
 )
 
 __all__ = [
+    "DelayRequested",
     "DuplicateJobError",
     "FailingListenerError",
     "NonRetryableError",
