@@ -27,6 +27,8 @@ from pgqueuer.domain import errors, models, types
 from pgqueuer.ports import RepositoryPort, tracing
 from pgqueuer.ports.repository import EntrypointExecutionParameter
 
+FETCH_COOLDOWN_SECONDS = 0.1
+
 
 @dataclasses.dataclass
 class QueueManager:
@@ -38,8 +40,6 @@ class QueueManager:
     """
 
     queries: RepositoryPort
-    fetch_cooldown: timedelta = dataclasses.field(default=timedelta(0), kw_only=True)
-    skip_dequeue_when_full: bool = dataclasses.field(default=False, kw_only=True)
     last_dequeue_started: float | None = dataclasses.field(default=None, init=False)
     job_finished: asyncio.Event = dataclasses.field(default_factory=asyncio.Event, init=False)
     # Empty: listen on ``queries.qbe.settings.channel``, where the queries notify.
@@ -288,11 +288,7 @@ class QueueManager:
         return set(self.entrypoint_registry)
 
     def local_capacity_available(self, max_concurrent_tasks: int | None) -> bool:
-        return (
-            not self.skip_dequeue_when_full
-            or not max_concurrent_tasks
-            or len(self.job_context) < max_concurrent_tasks
-        )
+        return not max_concurrent_tasks or len(self.job_context) < max_concurrent_tasks
 
     async def wait_for_fetch_cooldown(
         self,
@@ -300,9 +296,7 @@ class QueueManager:
     ) -> None:
         if self.last_dequeue_started is None:
             return
-        remaining = self.fetch_cooldown.total_seconds() - (
-            perf_counter() - self.last_dequeue_started
-        )
+        remaining = FETCH_COOLDOWN_SECONDS - (perf_counter() - self.last_dequeue_started)
         if remaining > 0:
             async with tm.cancel_on_exit(asyncio.create_task(self.shutdown.wait())) as stopped:
                 wake_on: set[asyncio.Task[object]] = {stopped}
@@ -328,7 +322,7 @@ class QueueManager:
             if self.shutdown.is_set():
                 break
             fetch_size = batch_size
-            if self.skip_dequeue_when_full and global_concurrency_limit:
+            if global_concurrency_limit:
                 fetch_size = min(batch_size, global_concurrency_limit - len(self.job_context))
             entrypoints = {
                 x: EntrypointExecutionParameter(
@@ -507,8 +501,6 @@ class QueueManager:
         """
         # Drop the previous run's ends before anything here can raise.
         self.unwritten_job_logs = []
-        if self.fetch_cooldown < timedelta(0):
-            raise ValueError("fetch_cooldown must not be negative")
         self.last_dequeue_started = None
         self.job_finished.clear()
         await self.verify_structure()
@@ -642,7 +634,7 @@ class QueueManager:
             tm.cancel_on_exit(event_task) as waiting,
             (
                 tm.cancel_on_exit(asyncio.create_task(self.job_finished.wait()))
-                if self.skip_dequeue_when_full and max_concurrent_tasks
+                if max_concurrent_tasks
                 else nullcontext(None)
             ) as completed,
         ):

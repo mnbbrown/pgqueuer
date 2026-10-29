@@ -320,29 +320,19 @@ await pgq.run(log_aggregation_interval=timedelta(seconds=30))
 | Audit trail | `pgqueuer_log` for all terminal states |
 | Up-to-date statistics | periodic `log_aggregation_interval` |
 
-### Limit claim frequency and skip full workers
+### Claim frequency and full workers
 
-Set the queue manager options before you start the worker:
-
-```python
-pgq.qm.fetch_cooldown = timedelta(milliseconds=100)
-pgq.qm.skip_dequeue_when_full = True
-await pgq.run(batch_size=10, max_concurrent_tasks=20)
-```
-
-`fetch_cooldown` sets the minimum time between claim starts. It applies to
+The worker waits at least 100 ms between claim starts. This applies to
 notifications, polling, and successive batches. The first claim starts at once.
-The default is zero, which keeps the previous behavior. A negative value is invalid.
-Shutdown interrupts the cooldown. Heartbeats and cancellation remain active.
+Shutdown interrupts the wait. Heartbeats and cancellation remain active.
 
-`skip_dequeue_when_full` defaults to `False`. When enabled, a worker with no local
-capacity waits for a task to finish or for shutdown. It does not run claim or
-queue-eligibility queries while full. Task completion wakes the worker even if
-its database notification is lost. This option requires a finite
-`max_concurrent_tasks`; it has no effect when that limit is unset or zero.
-The claim batch is also bounded by the remaining local capacity.
+When `max_concurrent_tasks` is finite, a full worker waits for a task to finish
+or for shutdown. It does not run claim or queue-eligibility queries while full.
+Task completion wakes the worker even if its database notification is lost.
+The claim batch is bounded by the remaining local capacity. An unset or zero
+`max_concurrent_tasks` remains unlimited.
 
 The database still enforces worker limits, task limits, and serialization keys.
 A task can finish locally before its buffered completion reaches the database.
 The local capacity check does not replace those database checks. Stale-job
-recovery and stored job formats do not change.
+recovery and stored job formats do not change. No additional configuration is needed.
