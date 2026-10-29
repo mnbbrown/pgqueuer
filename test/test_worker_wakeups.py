@@ -25,7 +25,7 @@ async def test_notification_burst_requires_one_queue_recheck(
 ) -> None:
     """A burst while dequeue is in flight must not cause one poll per notification."""
     repository = Queries(apgdriver) if postgres else queries
-    queue = PgQueuer(repository.driver, queries=repository)
+    pgq = PgQueuer(repository.driver, queries=repository)
     received = 0
     delivered = asyncio.Event()
 
@@ -39,11 +39,11 @@ async def test_notification_burst_requires_one_queue_recheck(
     await repository.driver.add_listener(repository.settings.channel, observe)
     started = asyncio.Event()
     release = asyncio.Event()
-    original_dequeue = queue.qm.queries.dequeue
+    original_dequeue = pgq.qm.queries.dequeue
     dequeue = AsyncMock(wraps=original_dequeue)
     original_wait = listeners.wait_for_notice_event
 
-    @queue.entrypoint("work")
+    @pgq.entrypoint("work")
     async def work(job: Job) -> None:
         pytest.fail("The queue is empty")
 
@@ -66,15 +66,15 @@ async def test_notification_burst_requires_one_queue_recheck(
         )
 
     def stop_when_idle(
-        notices: listeners.PGNoticeEventListener,
+        queue: listeners.PGNoticeEventListener,
         timeout: timedelta,
     ) -> asyncio.Task[TableChangedEvent | None]:
-        if notices.empty():
-            queue.qm.shutdown.set()
-        return original_wait(notices, timeout)
+        if queue.empty():
+            pgq.qm.shutdown.set()
+        return original_wait(queue=queue, timeout=timeout)
 
     dequeue.side_effect = hold_first_dequeue
-    monkeypatch.setattr(queue.qm.queries, "dequeue", dequeue)
+    monkeypatch.setattr(pgq.qm.queries, "dequeue", dequeue)
     monkeypatch.setattr(listeners, "wait_for_notice_event", stop_when_idle)
 
     async def notify() -> None:
@@ -94,7 +94,7 @@ async def test_notification_burst_requires_one_queue_recheck(
 
     async with asyncio.timeout(2):
         await asyncio.gather(
-            queue.qm.run(log_aggregation_interval=timedelta(0)),
+            pgq.qm.run(log_aggregation_interval=timedelta(0)),
             notify(),
         )
 
