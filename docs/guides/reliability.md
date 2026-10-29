@@ -34,8 +34,9 @@ PgQueuer provides three complementary retry mechanisms.
 
 Raise `RetryRequested` from your handler to re-queue the job in the database. The job row is
 updated in-place: the `id`, `payload`, and all metadata are preserved. Any worker can pick
-up the retried job. If the re-queue write itself fails, the job is recorded as failed like
-any other handler error, following the entrypoint's `on_failure`.
+up the retried job. `RetryRequested` increments `attempts`. If the re-queue write
+fails, the worker keeps the job picked and heartbeating while it retries the write.
+Shutdown leaves the row picked so heartbeat recovery can run it again.
 
 ```python
 from datetime import timedelta
@@ -108,6 +109,26 @@ or re-queue a job the new worker is running.
 !!! warning "Design for re-execution"
     A recovered job **will run again from the start**. Ensure your job functions are
     idempotent, or checkpoint progress externally so a restart is safe.
+
+### Delay pending work without consuming retries
+
+Raise `DelayRequested` when the job must wait for capacity or an external result.
+It reschedules the same row and retains its payload, keys, and current `attempts`.
+Unlike `RetryRequested`, it does not increment `attempts`, so expected delays do
+not exhaust retries for a later failure. Use an overall expiry where work must
+stop waiting after a fixed period.
+
+```python
+from datetime import timedelta
+from pgqueuer import DelayRequested
+
+raise DelayRequested(delay=timedelta(seconds=30), reason="rate limited")
+```
+
+Both signals use the same ownership fencing, heartbeat protection, durable
+retry-write recovery, logging, and notification path. PostgreSQL and in-memory
+queues have the same behaviour. In a group containing both signals, a normal
+retry consumes an attempt and the longest requested delay is retained.
 
 ## Idempotency
 

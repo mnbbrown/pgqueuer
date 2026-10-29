@@ -108,14 +108,22 @@ async def test_stale_worker_cannot_resolve_a_job_another_worker_holds(
     assert await log_statuses(queries, takeover.current) == ["picked", "picked", "queued"]
 
 
+@pytest.mark.parametrize("increment_attempts", [True, False])
 async def test_stale_worker_cannot_requeue_a_job_another_worker_holds(
     apgdriver: AsyncpgDriver,
+    *,
+    increment_attempts: bool,
 ) -> None:
     """A's late retry leaves B's claim, so a third worker cannot pick the job."""
     queries = Queries(apgdriver)
     takeover = await take_over_in_postgres(queries, apgdriver)
 
-    await queries.retry_job(takeover.stale, timedelta(0), None)
+    await queries.retry_job(
+        takeover.stale,
+        timedelta(0),
+        None,
+        increment_attempts=increment_attempts,
+    )
 
     assert await queue_rows(queries, apgdriver, takeover.current) == [
         {"status": "picked", "queue_manager_id": takeover.current.queue_manager_id}

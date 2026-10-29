@@ -492,14 +492,22 @@ class JobTable:
             self.dedupe.forget(job_id)
         return True
 
-    def retry(self, job: models.Job, delay: timedelta, now: datetime) -> JobRow | None:
+    def retry(
+        self,
+        job: models.Job,
+        delay: timedelta,
+        now: datetime,
+        *,
+        increment_attempts: bool = True,
+    ) -> JobRow | None:
         row = self.rows.get(int(job.id))
         if row is None or not self.owned_by(job):
             return None
         self.release(row)
         row.status = "queued"
         row.execute_after = now + delay
-        row.attempts += 1
+        if increment_attempts:
+            row.attempts += 1
         row.updated = now
         row.queue_manager_id = None
         self.lane(row.entrypoint).add(row)

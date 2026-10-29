@@ -867,13 +867,14 @@ class QueryQueueBuilder:
             count = {stats}.count + EXCLUDED.count
         """
 
-    def build_retry_job_query(self) -> str:
+    def build_retry_job_query(self, *, increment_attempts: bool = True) -> str:
+        attempts_clause = "attempts = attempts + 1," if increment_attempts else ""
         return f"""WITH retry AS (
             UPDATE {self.qualified.queue_table}
             SET
                 status = 'queued',
                 execute_after = NOW() + $2::interval,
-                attempts = attempts + 1,
+                {attempts_clause}
                 updated = NOW(),
                 queue_manager_id = NULL
             WHERE id = $1::bigint

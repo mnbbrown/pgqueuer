@@ -34,6 +34,18 @@ class RetryRequested(RetryException):
         self.reason = reason
 
 
+class DelayRequested(RetryRequested):
+    """Reschedule the same job without incrementing its failure attempts.
+
+    Existing attempts, payload and queue keys are retained. Normal retries
+    still increment attempts. Set an overall expiry where pending work needs one.
+
+    Usage example::
+
+        raise DelayRequested(delay=timedelta(seconds=30), reason="Rate limited")
+    """
+
+
 class NonRetryableError(PgqException):
     """Raise inside a job handler to skip retry and fail terminally.
 
@@ -56,7 +68,12 @@ def retry_request(exc: BaseException) -> RetryRequested | None:
         found = [retry_request(inner) for inner in exc.exceptions]
         retries = [retry for retry in found if retry is not None]
         if retries and len(retries) == len(found):
-            return max(retries, key=lambda retry: retry.delay)
+            longest = max(retries, key=lambda retry: retry.delay)
+            if isinstance(longest, DelayRequested) and any(
+                not isinstance(retry, DelayRequested) for retry in retries
+            ):
+                return RetryRequested(delay=longest.delay, reason=longest.reason)
+            return longest
     return None
 
 

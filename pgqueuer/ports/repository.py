@@ -130,6 +130,8 @@ class QueueRepositoryPort(Protocol):
         job: models.Job,
         delay: timedelta,
         traceback_record: models.TracebackRecord | None,
+        *,
+        increment_attempts: bool = True,
     ) -> None: ...
 
     async def requeue_jobs(self, ids: list[types.JobId], reset_attempts: bool = True) -> None: ...

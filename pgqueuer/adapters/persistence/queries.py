@@ -471,15 +471,17 @@ class Queries:
         job: models.Job,
         delay: timedelta,
         traceback_record: models.TracebackRecord | None,
+        *,
+        increment_attempts: bool = True,
     ) -> None:
         """Re-queue a job for retry with the given delay.
 
         Atomically updates the job in-place (status → queued, execute_after
-        bumped, attempts incremented) and writes a log entry recording the
+        bumped, attempts optionally incremented) and writes a log entry recording the
         retry event.  A no-op when another worker has re-picked the job.
         """
         retried = await self.driver.fetch(
-            self.qbq.build_retry_job_query(),
+            self.qbq.build_retry_job_query(increment_attempts=increment_attempts),
             job.id,
             delay,
             traceback_record.model_dump_json() if traceback_record else None,
