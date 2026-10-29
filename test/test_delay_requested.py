@@ -14,13 +14,15 @@ from pgqueuer.executors import DatabaseRetryEntrypointExecutor
 from pgqueuer.types import QueueExecutionMode
 
 
-@pytest.mark.parametrize("postgres", [False, True])
-async def test_delays_preserve_attempts_for_later_failure(
-    apgdriver: AsyncpgDriver,
-    *,
-    postgres: bool,
-) -> None:
-    pq = PgQueuer(apgdriver) if postgres else PgQueuer.in_memory()
+async def test_delays_preserve_attempts_in_memory() -> None:
+    await assert_delays_preserve_failure_budget(pq=PgQueuer.in_memory())
+
+
+async def test_delays_preserve_attempts_in_postgres(apgdriver: AsyncpgDriver) -> None:
+    await assert_delays_preserve_failure_budget(pq=PgQueuer(apgdriver))
+
+
+async def assert_delays_preserve_failure_budget(pq: PgQueuer) -> None:
     seen: list[int] = []
 
     @pq.entrypoint(

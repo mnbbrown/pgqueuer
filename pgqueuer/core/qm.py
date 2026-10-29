@@ -615,6 +615,7 @@ class QueueManager:
         cap = timedelta(seconds=1)
         while True:
             try:
+                # Preserve the legacy call shape for repositories overriding retry_job.
                 if increment_attempts:
                     await self.queries.retry_job(job, delay, traceback_record)
                 else:

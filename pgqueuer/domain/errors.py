@@ -59,8 +59,9 @@ class NonRetryableError(PgqException):
 def retry_request(exc: BaseException) -> RetryRequested | None:
     """Return the retry *exc* asks for, or ``None``.
 
-    That is *exc* itself, or, for an exception group made only of retries (such as
-    a TaskGroup whose children raised RetryRequested), the one with the longest delay.
+    A group made only of retry signals retains the longest requested delay.
+    It remains a delay only if every member requests a delay; a normal retry
+    consumes an attempt even when another member requests a longer delay.
     """
     if isinstance(exc, RetryRequested):
         return exc
