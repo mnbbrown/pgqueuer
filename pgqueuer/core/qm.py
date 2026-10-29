@@ -38,6 +38,10 @@ class QueueManager:
     """
 
     queries: RepositoryPort
+    fetch_cooldown: timedelta = dataclasses.field(default=timedelta(0), kw_only=True)
+    skip_dequeue_when_full: bool = dataclasses.field(default=False, kw_only=True)
+    last_dequeue_started: float | None = dataclasses.field(default=None, init=False)
+    job_finished: asyncio.Event = dataclasses.field(default_factory=asyncio.Event, init=False)
     # Empty: listen on ``queries.qbe.settings.channel``, where the queries notify.
     channel: types.Channel = types.Channel("")
 
@@ -179,6 +183,7 @@ class QueueManager:
         """
         if self.job_context.get(job_id) is context:
             del self.job_context[job_id]
+        self.job_finished.set()
 
     def register_executor(
         self,
@@ -282,14 +287,49 @@ class QueueManager:
         """All registered entrypoints; per-entrypoint limits are enforced in SQL."""
         return set(self.entrypoint_registry)
 
+    def local_capacity_available(self, max_concurrent_tasks: int | None) -> bool:
+        return (
+            not self.skip_dequeue_when_full
+            or not max_concurrent_tasks
+            or len(self.job_context) < max_concurrent_tasks
+        )
+
+    async def wait_for_fetch_cooldown(
+        self,
+        health_check_task: asyncio.Task[None] | None,
+    ) -> None:
+        if self.last_dequeue_started is None:
+            return
+        remaining = self.fetch_cooldown.total_seconds() - (
+            perf_counter() - self.last_dequeue_started
+        )
+        if remaining > 0:
+            async with tm.cancel_on_exit(asyncio.create_task(self.shutdown.wait())) as stopped:
+                wake_on: set[asyncio.Task[object]] = {stopped}
+                if health_check_task is not None:
+                    wake_on.add(health_check_task)
+                await asyncio.wait(wake_on, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+
     async def fetch_jobs(
         self,
         batch_size: int,
         global_concurrency_limit: int | None,
         heartbeat_timeout: timedelta,
+        *,
+        health_check_task: asyncio.Task[None] | None = None,
     ) -> AsyncGenerator[models.Job, None]:
         """Yield ready jobs one at a time, respecting per-entrypoint and global limits."""
         while not self.shutdown.is_set():
+            if not self.local_capacity_available(global_concurrency_limit):
+                break
+            await self.wait_for_fetch_cooldown(health_check_task=health_check_task)
+            if health_check_task is not None and health_check_task.done():
+                await health_check_task
+            if self.shutdown.is_set():
+                break
+            fetch_size = batch_size
+            if self.skip_dequeue_when_full and global_concurrency_limit:
+                fetch_size = min(batch_size, global_concurrency_limit - len(self.job_context))
             entrypoints = {
                 x: EntrypointExecutionParameter(
                     concurrency_limit=self.entrypoint_registry[x].parameters.concurrency_limit,
@@ -301,8 +341,9 @@ class QueueManager:
             }
 
             start = perf_counter()
+            self.last_dequeue_started = start
             jobs = await self.queries.dequeue(
-                batch_size=batch_size,
+                batch_size=fetch_size,
                 entrypoints=entrypoints,
                 queue_manager_id=self.queue_manager_id,
                 global_concurrency_limit=global_concurrency_limit,
@@ -466,6 +507,10 @@ class QueueManager:
         """
         # Drop the previous run's ends before anything here can raise.
         self.unwritten_job_logs = []
+        if self.fetch_cooldown < timedelta(0):
+            raise ValueError("fetch_cooldown must not be negative")
+        self.last_dequeue_started = None
+        self.job_finished.clear()
         await self.verify_structure()
 
         # 0 has always meant unlimited; keep unlimited as None all the way to
@@ -523,11 +568,20 @@ class QueueManager:
             )
 
             while not self.shutdown.is_set():
+                self.job_finished.clear()
                 # Changes during dequeue must remain pending for the next queue check.
                 with contextlib.suppress(asyncio.QueueEmpty):
                     notice_event_listener.get_nowait()
                 async for job in self.fetch_jobs(
-                    batch_size, max_concurrent_tasks, heartbeat_timeout
+                    batch_size,
+                    max_concurrent_tasks,
+                    heartbeat_timeout,
+                    health_check_task=(
+                        periodic_health_check_task
+                        if shutdown_on_listener_failure
+                        and mode is not types.QueueExecutionMode.drain
+                        else None
+                    ),
                 ):
                     # A late heartbeat lets our own dequeue re-pick a job still running here.
                     if job.id in self.job_context:
@@ -556,16 +610,48 @@ class QueueManager:
                 wake_on_listener_failure = (
                     shutdown_on_listener_failure and mode is not types.QueueExecutionMode.drain
                 )
-                async with tm.cancel_on_exit(
-                    listeners.wait_for_notice_event(
-                        notice_event_listener,
-                        await self._effective_dequeue_timeout(dequeue_timeout),
-                    )
-                ) as event_task:
-                    wake_on: set[asyncio.Task[object]] = {shutdown_task, event_task}
-                    if wake_on_listener_failure:
-                        wake_on.add(periodic_health_check_task)
-                    await asyncio.wait(wake_on, return_when=asyncio.FIRST_COMPLETED)
+                await self.wait_for_work(
+                    notices=notice_event_listener,
+                    dequeue_timeout=dequeue_timeout,
+                    max_concurrent_tasks=max_concurrent_tasks,
+                    shutdown_task=shutdown_task,
+                    health_check_task=periodic_health_check_task,
+                    wake_on_listener_failure=wake_on_listener_failure,
+                )
+
+    async def wait_for_work(
+        self,
+        *,
+        notices: listeners.PGNoticeEventListener,
+        dequeue_timeout: timedelta,
+        max_concurrent_tasks: int | None,
+        shutdown_task: asyncio.Task[bool],
+        health_check_task: asyncio.Task[None],
+        wake_on_listener_failure: bool,
+    ) -> None:
+        full = not self.local_capacity_available(max_concurrent_tasks)
+        event_task: asyncio.Task[object]
+        if full:
+            event_task = asyncio.create_task(asyncio.sleep(dequeue_timeout.total_seconds()))
+        else:
+            event_task = listeners.wait_for_notice_event(
+                queue=notices,
+                timeout=await self._effective_dequeue_timeout(dequeue_timeout),
+            )
+        async with (
+            tm.cancel_on_exit(event_task) as waiting,
+            (
+                tm.cancel_on_exit(asyncio.create_task(self.job_finished.wait()))
+                if self.skip_dequeue_when_full and max_concurrent_tasks
+                else nullcontext(None)
+            ) as completed,
+        ):
+            wake_on: set[asyncio.Task[object]] = {shutdown_task, waiting}
+            if completed is not None:
+                wake_on.add(completed)
+            if wake_on_listener_failure:
+                wake_on.add(health_check_task)
+            await asyncio.wait(wake_on, return_when=asyncio.FIRST_COMPLETED)
 
     async def write_job_ends(self, logs: list[buffers.JobLogEntry]) -> None:
         """Write *logs* through this manager's queries."""
